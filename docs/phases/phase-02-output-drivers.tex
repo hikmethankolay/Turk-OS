@@ -1,0 +1,394 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{turkos}
+
+\begin{document}
+\phaseheader{2}{Getting to C: Screen, Serial and kprintf}{Give the kernel a stack, jump into C, and build the two output channels you will debug with for the rest of the project}{10}{16}
+
+\ataglance{1--2 weeks}{2}{Phase 1: a Multiboot kernel that boots, a Makefile, GDB workflow}{A kernel written mostly in C that
+prints a coloured banner and the machine's memory size on the VGA text screen, mirrors every message to the serial
+port (so it appears in your terminal), and has \code{kprintf}, \code{panic} and \code{ASSERT}.}
+
+\section{Why this phase}
+
+From now on, most of Turk-OS is written in C. Getting there takes one small piece of assembly (a stack) and a few
+compiler flags. Right after that comes the most important debugging tool you will build: a way to print. With no
+operating system under you, \code{printf} does not exist, so you will write the drivers it would normally sit on.
+
+You will build two output channels. The \textbf{VGA text screen} is what a user sees. The \textbf{serial port} is
+what a developer needs: QEMU can redirect it to your terminal or a log file, where messages can be scrolled back,
+searched, and kept after a crash. When something goes wrong in Phase 6 or Phase 8, the serial log is usually your
+only witness. Both drivers also introduce the two ways a CPU talks to devices, memory-mapped I/O and port I/O, which
+you will use in every driver from here on.
+
+\section{Concepts you need}
+
+\subsection{What C needs before \texorpdfstring{\code{kmain}}{kmain} can run}
+
+A C function expects three things from its environment. It expects a \textbf{valid stack}, because every call
+pushes a return address and locals live there; Multiboot leaves ESP undefined, so the loader must reserve memory for
+a stack and point ESP at its top. It expects \textbf{zeroed \code{.bss}}, because the C standard says globals without
+an initialiser start at zero; GRUB and QEMU load ELF kernels by their program headers and zero-fill the part of each
+segment beyond the file contents, so \code{.bss} is handled for you, but it is worth confirming once in GDB. And it
+expects \textbf{the calling convention}: arguments on the stack, so the loader can pass the Multiboot magic and
+information pointer to \code{kmain} by pushing them.
+
+\subsection{Two ways to talk to a device}
+
+\textbf{Memory-mapped I/O} places a device's memory or registers at ordinary physical addresses. The VGA text buffer
+lives at \code{0xB8000}: write a byte there and a character appears on screen. You use normal pointer accesses,
+marked \code{volatile} so the compiler can't optimise them away. \textbf{Port-mapped I/O} uses a separate 64\,K
+address space reachable only through the \code{in} and \code{out} instructions. The VGA cursor and the serial port
+are controlled this way. \MOS\,\S5.1.3 compares the two designs and explains why x86 has both.
+
+\subsection{The VGA text buffer}
+
+In text mode the screen is 80 columns by 25 rows. Each cell is two bytes: the character (in code page 437, which
+extends ASCII) and an attribute byte whose low four bits are the foreground colour and whose high four bits are the
+background (Figure~\ref{fig:vgacell}). Cell $(row, col)$ is at index $row \times 80 + col$. The blinking hardware
+cursor is separate: you position it by writing a 16-bit cell index to the CRT controller through ports
+\code{0x3D4} (register select) and \code{0x3D5} (data), register 14 for the high byte and 15 for the low byte.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[x=0.55cm, y=1cm]
+  \draw[draw=tkNavy!70, fill=tkBlue!10] (0,0) rectangle (4,0.7);
+  \draw[draw=tkNavy!70, fill=tkGreen!10] (4,0) rectangle (8,0.7);
+  \draw[draw=tkNavy!70, fill=tkAmber!12] (8,0) rectangle (16,0.7);
+  \node[font=\sffamily\scriptsize] at (2,0.35) {background};
+  \node[font=\sffamily\scriptsize] at (6,0.35) {foreground};
+  \node[font=\sffamily\scriptsize] at (12,0.35) {character (code page 437)};
+  \foreach \x/\b in {0.5/15, 3.5/12, 4.5/11, 7.5/8, 8.5/7, 15.5/0}
+    \node[font=\sffamily\scriptsize, text=tkGray] at (\x,0.95) {\b};
+  \draw[decorate, decoration={brace, amplitude=5pt, mirror}, tkNavy] (0,-0.1) -- (8,-0.1)
+    node[midway, below=5pt, font=\sffamily\scriptsize\bfseries] {attribute byte (high)};
+  \draw[decorate, decoration={brace, amplitude=5pt, mirror}, tkNavy] (8,-0.1) -- (16,-0.1)
+    node[midway, below=5pt, font=\sffamily\scriptsize\bfseries] {character byte (low)};
+\end{tikzpicture}
+\caption{One 16-bit VGA text cell. White on blue is attribute \code{0x1F}; the cell for ``A'' is then \code{0x1F41}.}
+\label{fig:vgacell}
+\end{figure}
+
+\subsection{The serial port}
+
+A PC's first serial port (COM1) is a 16550-compatible UART with its registers at I/O ports \code{0x3F8}--\code{0x3FF}.
+You initialise it once, choosing the speed with a divisor of its 115\,200\,Hz base clock and the frame format
+(8 data bits, no parity, one stop bit, known as ``8N1''). After that, sending a byte means waiting until the
+\emph{line status} register says the transmitter is empty, then writing the byte to the data port. QEMU's
+\code{-serial stdio} connects this port to your terminal.
+
+\subsection{A console abstraction and kprintf}
+
+Rather than making every function choose where to print, write one \code{kprintf} that formats a string and hands
+each character to a small console layer, which forwards it to every registered output (Figure~\ref{fig:console}).
+Formatting uses \texttt{stdarg.h}, which is available in freestanding mode because it is implemented by the compiler
+itself.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[node distance=0.5cm and 0.9cm]
+  \node[tkbox] (k) {\texttt{kprintf("\%d MiB", n)}};
+  \node[tkbox, right=of k] (f) {format engine\\\scriptsize \texttt{\%c \%s \%d \%u \%x \%p}};
+  \node[tkhi, right=of f] (c) {\code{console_putc()}};
+  \node[tkbox, above right=0.2cm and 0.9cm of c] (v) {VGA driver\\\scriptsize memory-mapped \code{0xB8000}};
+  \node[tkbox, below right=0.2cm and 0.9cm of c] (s) {serial driver\\\scriptsize port-mapped \code{0x3F8}};
+  \draw[tkarrow] (k) -- (f); \draw[tkarrow] (f) -- (c); \draw[tkarrow] (c) -- (v); \draw[tkarrow] (c) -- (s);
+\end{tikzpicture}
+\caption{Output path. Adding a third sink later (a log buffer for \code{dmesg}) is one line.}
+\label{fig:console}
+\end{figure}
+
+\section{Reading plan}
+
+\begin{readingplan}
+\must & \LOB & Ch.~3 \emph{Getting to C}: stack, calling C from assembly, packing structs, compiling C, build tools & 19--22 & Tasks 2.1--2.3 almost step by step. \\
+\must & \LOB & Ch.~4 \emph{Output}: framebuffer, cursor, serial port, configuring the line, buffers and modem & 23--31 & The two drivers of this phase. \\
+\must & \OSTEP & Ch.~36 \emph{I/O Devices} (\S36.1--36.7: canonical device, protocol, interrupts, DMA, device interaction, drivers) & 405--412 & The mental model for every driver you will write. \\
+\should & \MOS & \S5.1 \emph{Principles of I/O Hardware}, especially \S5.1.3 \emph{Memory-Mapped I/O} & 337--351 & Why x86 has both port and memory-mapped I/O. \\
+\should & \MOS & \S5.6.2 \emph{Output Software} (text windows, escape sequences) & 399--405 & How a text console turns bytes into a screen. \\
+\should & \OSDI & \S3.8.6 \emph{Implementation of the Display Driver} & 357--366 & MINIX writing to video memory and scrolling. \\
+\could & \OSC & \S12.2 \emph{I/O Hardware} & 490--500 & Another view: polling, interrupts, DMA. \\
+\could & \MOS & \S1.8 \emph{The World According to C} (if skipped in Phase 0) & 73--77 & Organising headers for a multi-file project. \\
+\end{readingplan}
+
+\begin{minixbox}
+Open \texttt{drivers/tty/console.c (15900)} in \OSDI. MINIX keeps a per-console struct with the cursor position and
+the video memory address, and it scrolls either by copying memory or by moving the hardware's display start.
+Compare its \code{out_char} and \code{scroll_screen} with what you write in Task~2.5. Notice that the MINIX console
+driver runs as a separate process and receives characters in messages; in Turk-OS it is an ordinary function call.
+\end{minixbox}
+
+\section{Build it}
+
+\task{Give the loader a stack and call C}
+Reserve 16\,KiB in \code{.bss}, point ESP at its top (the stack grows down), push the two Multiboot values in
+reverse order and call \code{kmain}. Also set bit 1 of the Multiboot flags so GRUB fills in the memory size fields,
+and bit 0 so boot modules are page-aligned (you will use modules in Phase 10).
+
+\begin{lst}{asm}{boot/loader.s}
+global loader
+extern kmain
+
+MB_ALIGN     equ 1 << 0                ; align boot modules on 4 KiB pages
+MB_MEMINFO   equ 1 << 1                ; ask for mem_lower / mem_upper and the memory map
+MAGIC_NUMBER equ 0x1BADB002
+FLAGS        equ MB_ALIGN | MB_MEMINFO
+CHECKSUM     equ -(MAGIC_NUMBER + FLAGS)
+
+KERNEL_STACK_SIZE equ 16384
+
+section .multiboot
+align 4
+    dd MAGIC_NUMBER
+    dd FLAGS
+    dd CHECKSUM
+
+section .bss
+align 16
+kernel_stack_bottom:
+    resb KERNEL_STACK_SIZE
+kernel_stack_top:
+
+section .text
+loader:
+    mov  esp, kernel_stack_top ; C needs a stack before anything else
+    push ebx                   ; arg 2: physical address of the Multiboot info
+    push eax                   ; arg 1: magic value 0x2BADB002
+    call kmain                 ; kmain(magic, mbi)
+.hang:
+    cli                        ; kmain should never return; if it does, stop
+    hlt
+    jmp  .hang
+\end{lst}
+
+\task{The first C code}
+Start with the smallest C that proves the jump worked: write a character straight into video memory.
+
+\begin{lst}{c}{kernel/kmain.c (first version)}
+#include <stdint.h>
+
+void kmain(uint32_t magic, uint32_t mbi_addr)
+{
+    (void)magic; (void)mbi_addr;
+    volatile uint16_t *vga = (volatile uint16_t *)0xB8000;
+    vga[0] = 0x1F00 | 'T';     /* white on blue, top-left corner */
+    vga[1] = 0x1F00 | 'K';
+}
+\end{lst}
+\verify{A blue ``TK'' appears in the top-left corner. In GDB, \code{break kmain} stops there and \code{p/x magic}
+prints \code{0x2badb002}.}
+
+\task{Compile C for the kernel}
+Extend the Makefile with a C rule. The flags say: freestanding (no hosted library assumptions), warnings on and
+treated seriously, debug info for GDB, and keep frame pointers for backtraces in Phase 3. Link through \code{gcc} so
+that \code{libgcc} is available; GCC sometimes emits calls into it (64-bit division, for example).
+
+\begin{lst}{make}{Makefile (additions)}
+CC      := i686-elf-gcc
+CFLAGS  := -std=gnu11 -ffreestanding -O2 -g -Wall -Wextra -fno-omit-frame-pointer -Iinclude
+LDFLAGS := -T link.ld -ffreestanding -nostdlib
+C_SRCS  := $(wildcard kernel/*.c kernel/drivers/*.c lib/*.c)
+OBJS    := $(BUILD)/boot/loader.o $(patsubst %.c,$(BUILD)/%.o,$(C_SRCS))
+
+$(BUILD)/kernel.elf: $(OBJS) link.ld
+	$(CC) $(LDFLAGS) -o $@ $(OBJS) -lgcc
+
+$(BUILD)/%.o: %.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+run: $(BUILD)/kernel.elf
+	qemu-system-i386 -kernel $< -serial stdio
+\end{lst}
+
+\task{Port I/O helpers}
+C has no way to express \code{in} and \code{out}, so wrap them. \LOB writes them as separate assembly functions,
+which is a good exercise in cdecl (the port is at \code{[esp+4]}, the value at \code{[esp+8]}). Most kernels use GCC
+inline assembly instead, which avoids a function call per port access. Write the assembly version first to
+practise, then switch to this header:
+
+\begin{lst}{c}{include/io.h}
+#pragma once
+#include <stdint.h>
+
+static inline void outb(uint16_t port, uint8_t val)
+{
+    __asm__ volatile ("outb %0, %1" : : "a"(val), "Nd"(port));
+}
+
+static inline uint8_t inb(uint16_t port)
+{
+    uint8_t ret;
+    __asm__ volatile ("inb %1, %0" : "=a"(ret) : "Nd"(port));
+    return ret;
+}
+
+/* A write to an unused port takes about 1 microsecond: a tiny delay for old devices. */
+static inline void io_wait(void) { outb(0x80, 0); }
+\end{lst}
+
+\task{The VGA text driver}
+Write \code{kernel/drivers/vga.c} with \code{vga_init}, \code{vga_clear}, \code{vga_set_color},
+\code{vga_putc} and \code{vga_write}. \code{vga_putc} must handle \texttt{\textbackslash n} (new line), \texttt{\textbackslash r}, \texttt{\textbackslash t} (next
+multiple of 8), and \texttt{\textbackslash b} (backspace, needed in Phase 4). When the cursor passes the last row, scroll: move rows
+1--24 up by one with \code{memmove} and clear the last row. After each character, move the hardware cursor.
+
+\begin{lst}{c}{kernel/drivers/vga.c (core pieces)}
+#define VGA_WIDTH  80
+#define VGA_HEIGHT 25
+static volatile uint16_t *const vga_buf = (volatile uint16_t *)0xB8000;
+static uint8_t  color = 0x07;             /* light grey on black */
+static uint16_t row, col;
+
+static inline uint16_t vga_cell(char c, uint8_t attr)
+{
+    return (uint16_t)attr << 8 | (uint8_t)c;
+}
+
+static void move_cursor(void)
+{
+    uint16_t pos = row * VGA_WIDTH + col;
+    outb(0x3D4, 14); outb(0x3D5, pos >> 8);    /* cursor location high byte */
+    outb(0x3D4, 15); outb(0x3D5, pos & 0xFF);  /* cursor location low byte  */
+}
+\end{lst}
+\verify{Print 100 numbered lines: the screen scrolls and the last 25 are visible. The cursor blinks after the last
+character.}
+
+\task{The serial driver}
+Write \code{kernel/drivers/serial.c}. The initialisation sequence below sets 38\,400 baud 8N1 with FIFOs enabled,
+following \LOB chapter 4. Each register offset is relative to the base port \code{0x3F8}.
+
+\begin{lst}{c}{kernel/drivers/serial.c}
+#define COM1 0x3F8
+
+void serial_init(void)
+{
+    outb(COM1 + 1, 0x00);   /* interrupt enable register: all off (we poll)        */
+    outb(COM1 + 3, 0x80);   /* line control: set DLAB to access the divisor         */
+    outb(COM1 + 0, 0x03);   /* divisor low byte:  115200 / 3 = 38400 baud           */
+    outb(COM1 + 1, 0x00);   /* divisor high byte                                     */
+    outb(COM1 + 3, 0x03);   /* line control: 8 data bits, no parity, 1 stop, DLAB=0 */
+    outb(COM1 + 2, 0xC7);   /* FIFO control: enable, clear, 14-byte threshold       */
+    outb(COM1 + 4, 0x03);   /* modem control: DTR and RTS set                        */
+}
+
+static int tx_empty(void) { return inb(COM1 + 5) & 0x20; }  /* line status bit 5 */
+
+void serial_putc(char c)
+{
+    if (c == '\n')
+        serial_putc('\r');  /* terminals expect CR LF */
+    while (!tx_empty())
+        ;
+    outb(COM1, (uint8_t)c);
+}
+\end{lst}
+\verify{With \code{make run} (which passes \code{-serial stdio}), text you send to the serial port appears in your
+terminal. Also try \code{-serial file:build/serial.log}.}
+
+\task{kprintf and the console layer}
+Write \code{lib/printf.c} with \code{kvprintf(void (*putc)(char), const char *fmt, va_list ap)} as the engine, and
+\code{kprintf} on top of it using the console. Support \texttt{\%c}, \texttt{\%s}, \texttt{\%d}, \texttt{\%i}, \texttt{\%u},
+\texttt{\%x}, \texttt{\%p} and \texttt{\%\%}, plus zero-padding with a width (\texttt{\%08x}), which makes addresses readable. Use
+\code{utoa} and \code{itoa} from Phase 0.
+
+\begin{lst}{c}{lib/printf.c (skeleton)}
+#include <stdarg.h>
+
+void kprintf(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    kvprintf(console_putc, fmt, ap);
+    va_end(ap);
+}
+\end{lst}
+\verify{Write a test that prints \code{0}, \code{-1}, \code{INT_MIN}, \code{0xFFFFFFFF} with \texttt{\%u} and \texttt{\%x},
+\texttt{\%08x} of \code{0xB8000}, a \code{NULL} string (print \code{(null)}), and \texttt{\%\%}. Compare with what the same
+format string gives in a Linux test program.}
+
+\task{panic and ASSERT}
+When the kernel detects something impossible, it must stop loudly instead of continuing with corrupt state.
+\code{panic} prints the message with file and line, disables interrupts and halts. \code{ASSERT} calls it when a
+condition is false. Use \code{ASSERT} generously from now on; it is the cheapest debugging tool you have.
+
+\begin{lst}{c}{include/panic.h}
+#pragma once
+void panic_at(const char *file, int line, const char *fmt, ...) __attribute__((noreturn));
+
+#define panic(...)  panic_at(__FILE__, __LINE__, __VA_ARGS__)
+#define ASSERT(cond) \
+    do { if (!(cond)) panic("assertion failed: %s", #cond); } while (0)
+\end{lst}
+
+\task{Read the Multiboot information}
+Check that \code{magic} equals \code{0x2BADB002}; otherwise panic with ``not loaded by a Multiboot loader''. Define
+the beginning of the Multiboot information structure as a packed struct (see \LOB\,``Packing Structs'' and the
+Multiboot spec \S3.3). If bit 0 of \code{flags} is set, \code{mem_lower} and \code{mem_upper} hold the KiB of memory
+below 1\,MiB and above 1\,MiB. Print a banner: \code{Turk-OS 0.2 - 127 MiB RAM}.
+
+\begin{lst}{c}{include/multiboot.h (first fields)}
+struct multiboot_info {
+    uint32_t flags;
+    uint32_t mem_lower;       /* KiB below 1 MiB, valid if flags bit 0 */
+    uint32_t mem_upper;       /* KiB above 1 MiB, valid if flags bit 0 */
+    uint32_t boot_device;
+    uint32_t cmdline;         /* physical address of the command line  */
+    uint32_t mods_count;      /* boot modules (Phase 10)                */
+    uint32_t mods_addr;
+    uint32_t syms[4];
+    uint32_t mmap_length;     /* memory map (Phase 5)                   */
+    uint32_t mmap_addr;
+} __attribute__((packed));
+\end{lst}
+\verify{\code{qemu-system-i386 -kernel build/kernel.elf -serial stdio -m 128} reports roughly 127\,MiB. Change
+\code{-m} and watch the number follow.}
+
+\section{Testing and debugging}
+
+From this phase on, run QEMU with \code{-serial stdio} every time and put a \code{kprintf} at each boot step
+(``GDT loaded'', ``paging on'', \dots). When the kernel dies, the last line in the log tells you where.
+
+\begin{pitfalls}
+QEMU reboots in a loop right after \code{call kmain} & Stack not set, or ESP pointing at the wrong end of the reserved area & Run with \code{-d int,cpu_reset -no-reboot} to see the fault; check \code{esp} in GDB before the \code{call}. \\
+Linker: \code{undefined reference to memset} (or \code{memcpy}) & GCC emits these calls itself for struct copies and array initialisation, even when freestanding & Provide them in \code{lib/string.c}. They must exist in every kernel. \\
+Linker: \code{undefined reference to __stack_chk_fail} & Host compiler with the stack protector enabled & Use the cross compiler (or add \code{-fno-stack-protector}). \\
+Nothing appears on screen, no crash & Missing \code{volatile}, so the optimiser removed the stores & Declare the buffer pointer as \code{volatile uint16_t *}. \\
+Serial output is garbled or missing & Wrong divisor or line settings, or not waiting for the transmitter & Re-check the register sequence; poll bit 5 of the line status register. \\
+\texttt{\%d} prints wrong values for negative numbers & Converting \code{INT_MIN} by negating an \code{int} overflows & Negate into an \code{unsigned} before converting. \\
+\end{pitfalls}
+
+\section{Milestone}
+
+\begin{milestonebox}[The kernel can talk]
+\begin{checklist}
+  \item \code{kmain} runs on your own 16\,KiB stack and receives the Multiboot magic and information pointer.
+  \item The screen shows a coloured Turk-OS banner with the RAM size, and scrolling works.
+  \item The same messages appear in your terminal through the serial port.
+  \item \code{kprintf} passes the edge-case tests; \code{panic} and \code{ASSERT} print file and line and halt.
+  \item The Makefile builds C and assembly, links with \code{libgcc}, and \code{make run} opens serial on stdio.
+\end{checklist}
+\end{milestonebox}
+
+\begin{questionbox}
+\begin{enumerate}
+  \item Why must ESP be set before \code{call kmain}, and why does it point at the \emph{end} of the reserved area?
+  \item Which does the VGA text buffer use, memory-mapped or port-mapped I/O? Which does the cursor use?
+  \item Why is \texttt{stdarg.h} available in a freestanding kernel when \texttt{stdio.h} is not?
+  \item What does \code{__attribute__((packed))} do, and what would go wrong without it in \code{multiboot_info}?
+  \item Why might GCC call \code{memcpy} in a kernel that never calls it explicitly?
+  \item What is the serial divisor for 115\,200 baud? For 9\,600?
+\end{enumerate}
+\end{questionbox}
+
+\section{Going further}
+
+Add log levels (\code{INFO}, \code{WARN}, \code{ERROR}) with different colours on screen and a prefix on serial. Keep
+a copy of every message in a ring buffer in memory; in Phase 4 you can add a \code{dmesg} command that prints it.
+Turkish letters are worth a look too: code page 437 contains ç, ö, ü, Ç, Ö and Ü but not ğ, ş, ı, İ, Ğ or Ş.
+Write a small UTF-8 to CP437 converter for the letters that exist and substitute the rest for now. Phase 15
+offers two ways to get full Turkish text: a custom VGA font, or a graphical framebuffer with your own font.
+
+\nextphase{3}{Segmentation, the IDT and CPU Exceptions}
+\booklegend
+\end{document}

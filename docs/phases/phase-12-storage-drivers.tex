@@ -1,0 +1,332 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{turkos}
+
+\begin{document}
+\phaseheader{12}{Storage: Block Devices, ATA Driver and Buffer Cache}{Make data survive a reboot: talk to a hard disk, organise devices behind one interface, and cache blocks in memory}{77}{83}
+
+\ataglance{2 weeks}{4}{Phase 9: semaphores and mutexes; Phase 4: IRQ handling; Phase 7: the heap and lists}{An ATA PIO driver that identifies,
+reads and writes the QEMU disk (first polling, then interrupt-driven), a block device layer with partitions from the
+MBR, a RAM disk from a boot module, a buffer cache with LRU replacement and write-back, and \code{lsblk} and
+\code{hexdump} commands. Data you write survives a reboot, and you can check it from Linux.}
+
+\section{Why this phase}
+
+Everything Turk-OS knows vanishes when QEMU exits. \OSTEP's third big idea, \textbf{persistence}, starts here: a
+driver for a disk, and the layers that let the rest of the kernel use disks without knowing how they work. The file
+system in Phase 13 sits directly on top of this phase and never touches hardware.
+
+You will write the most complete driver so far. The ATA disk is controlled through a handful of I/O ports, it is slow
+compared with the CPU, and it signals completion with an interrupt, so the task that asked for data should sleep
+until it arrives. That brings together port I/O (Phase 2), interrupts (Phase 4) and blocking synchronisation
+(Phase 9). Above the driver you will build the two layers that every UNIX kernel has in some form: a
+device-independent \textbf{block layer} and a \textbf{buffer cache} that keeps recently used blocks in memory, because
+reading from RAM is thousands of times faster than reading from a disk.
+
+\section{Concepts you need}
+
+\subsection{How a disk is organised}
+
+A disk stores data in fixed-size \textbf{sectors} of 512 bytes. Old interfaces addressed them by cylinder, head and
+sector (CHS); everything modern uses \textbf{logical block addressing} (LBA), which simply numbers the sectors 0, 1,
+2, \dots\ \OSTEP chapter 37 builds a model of a mechanical disk's access time: \textbf{seek} time to move the arm,
+\textbf{rotational} delay waiting for the sector to come round, and \textbf{transfer} time. The model explains why
+sequential access is so much faster than random access, why disk schedulers reorder requests (FIFO, SSTF, SCAN,
+C-SCAN), and why every file system tries to keep related blocks close together. QEMU's disk is a file on your host,
+so none of the timing is real, but the interface is the same as on a real PC.
+
+\subsection{The layers of I/O software}
+
+\MOS\,\S5.3 divides I/O software into four layers, and Turk-OS follows it (Figure~\ref{fig:layers}). The
+\textbf{interrupt handler} does the minimum and wakes whoever is waiting. The \textbf{device driver} knows one kind of
+hardware. The \textbf{device-independent} layer (block devices, partitions, the buffer cache) gives every driver the
+same interface and does the work common to all of them. \textbf{User-level} software (the file system, then
+programs) only ever sees that interface.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[l/.style={draw=tkNavy!60, rounded corners=2pt, minimum width=8.8cm, text width=8.6cm, minimum height=0.62cm, font=\sffamily\scriptsize, align=center},
+  n/.style={font=\sffamily\scriptsize, text=tkGray, anchor=west, align=left}]
+  \node[l, fill=tkGreen!10] (u) at (0,0) {user process: \code{read(fd, buf, n)}};
+  \node[l, fill=tkRed!8, below=2pt of u] (s) {system call layer (Phase 10)};
+  \node[l, fill=tkBlue!8, below=2pt of s] (f) {VFS and TurkFS: file offset $\rightarrow$ block number (Phase 13)};
+  \node[l, fill=tkAmber!14, below=2pt of f] (c) {\textbf{buffer cache}: \code{bread(dev, block)}, LRU, write-back};
+  \node[l, fill=tkAmber!14, below=2pt of c] (b) {\textbf{block layer}: \code{struct blockdev}, partitions (hda1 = hda + offset)};
+  \node[l, fill=tkAmber!14, below=2pt of b] (d) {\textbf{drivers}: ATA disk, RAM disk};
+  \node[l, fill=tkAmber!14, below=2pt of d] (i) {\textbf{interrupt handler} (IRQ 14): acknowledge, wake the waiting task};
+  \node[l, fill=tkGray!15, below=2pt of i] (h) {hardware: ATA controller and disk (\code{disk.img} on the host)};
+  \draw[decorate, decoration={brace, amplitude=5pt}, tkAmber!80!black, line width=0.7pt] ([xshift=4pt]c.north east) -- ([xshift=4pt]b.south east)
+    node[midway, right=6pt, n] {device-independent\\(this phase)};
+  \draw[decorate, decoration={brace, amplitude=5pt}, tkAmber!80!black, line width=0.7pt] ([xshift=4pt]d.north east) -- ([xshift=4pt]i.south east)
+    node[midway, right=6pt, n] {device-dependent\\(this phase)};
+\end{tikzpicture}
+\caption{The storage stack. A \code{read} on a file passes through every layer; a cache hit stops at the buffer cache.}
+\label{fig:layers}
+\end{figure}
+
+\subsection{Programmed I/O on the ATA interface}
+
+The primary ATA channel of a PC is a set of eight I/O ports starting at \code{0x1F0}, plus a control port at
+\code{0x3F6} (Table~\ref{tab:ata}). To read, the driver selects the drive, writes the sector count and the 28-bit LBA
+into four registers, and writes the \code{READ SECTORS} command. When the drive has a sector ready it sets
+\textbf{DRQ} in the status register (and raises IRQ 14 if interrupts are enabled), and the driver reads 256 16-bit
+words from the data port. That is \textbf{programmed I/O} (PIO): the CPU copies every word. \textbf{DMA}, where the
+controller copies directly into memory, is faster and is a stretch goal (\OSTEP\,\S36.5, \MOS\,\S5.1.4).
+
+\begin{table}[htbp]
+\centering\small\renewcommand{\arraystretch}{1.2}
+\begin{tabularx}{\linewidth}{@{}l >{\raggedright\arraybackslash}X >{\raggedright\arraybackslash}X@{}}
+\toprule
+\tkth{Port} & \tkth{Read} & \tkth{Write} \\
+\midrule
+\code{0x1F0} & data (16-bit) & data (16-bit) \\
+\code{0x1F1} & error & features \\
+\code{0x1F2} & sector count & sector count \\
+\code{0x1F3}, \code{0x1F4}, \code{0x1F5} & LBA bits 0--7, 8--15, 16--23 & same \\
+\code{0x1F6} & drive/head & \code{0xE0} $|$ (slave $\ll$ 4) $|$ LBA bits 24--27 \\
+\code{0x1F7} & status: BSY \code{0x80}, DRDY \code{0x40}, DF \code{0x20}, DRQ \code{0x08}, ERR \code{0x01} & command: \code{0xEC} identify, \code{0x20} read, \code{0x30} write, \code{0xE7} flush \\
+\code{0x3F6} & alternate status (reading it doesn't acknowledge an interrupt) & device control: bit 1 nIEN disables IRQs \\
+\bottomrule
+\end{tabularx}
+\caption{The primary ATA channel's registers in 28-bit LBA mode.}
+\label{tab:ata}
+\end{table}
+
+\subsection{The buffer cache}
+
+The file system reads the same blocks over and over: the superblock, the bitmaps, the inodes of directories on every
+path. The \textbf{buffer cache} keeps a fixed pool of block-sized buffers in memory. \code{bread(dev, block)} returns
+the buffer for that block, reading it from disk only if it isn't cached; the caller holds the buffer's lock while
+using it and gives it back with \code{brelse}. When all buffers are in use, the least recently used one that nobody
+holds is reused. Writes can go to disk immediately (\textbf{write-through}) or be delayed until the buffer is evicted
+or \code{sync} runs (\textbf{write-back}), which is faster but loses data in a crash: the central trade-off of Phase
+13's crash-consistency discussion. The cache also guarantees there is only ever \emph{one} buffer per block, so two
+tasks can't hold diverging copies.
+
+\section{Reading plan}
+
+\begin{readingplan}
+\must & \OSTEP & Ch.~36 \emph{I/O Devices}, especially \S36.8 \emph{A Simple IDE Disk Driver} & 405--416 & Section 36.8 is essentially the driver of Tasks 12.2--12.4. \\
+\must & \OSTEP & Ch.~37 \emph{Hard Disk Drives} & 419--436 & The disk model, access time, and disk scheduling. \\
+\must & \MOS & \S5.2--5.3 \emph{Principles of I/O Software}, \emph{I/O Software Layers} & 351--369 & The layering this phase implements. \\
+\must & \MOS & \S5.4 \emph{Disks} (hardware, formatting, arm scheduling, error handling, stable storage) & 369--388 & What a disk driver has to deal with in practice. \\
+\should & \OSDI & \S3.4--3.7: I/O in MINIX 3, block devices, RAM disks, disks & 252--302 & A complete disk driver and RAM disk with explanations. \\
+\should & \OSC & \S11.1--11.2 \emph{Mass-Storage Structure}, \emph{HDD Scheduling}; \S11.5 \emph{Storage Device Management} & 449--461, 463--467 & HDDs versus SSDs, scheduling, partitions and boot blocks. \\
+\should & \OSC & \S12.3--12.5 \emph{Application I/O Interface}, \emph{Kernel I/O Subsystem}, \emph{Transforming I/O Requests} & 500--519 & Block versus character devices; buffering and caching in the kernel. \\
+\could & \OSTEP & Ch.~38 \emph{RAID} & 437--456 & Combining disks for speed and reliability. \\
+\could & \OSDI & \S5.6.5 \emph{The Block Cache} & 557--559 & The MINIX buffer cache, which you will meet again in Phase 13. \\
+\end{readingplan}
+
+The OSDev Wiki page \emph{ATA PIO Mode} is the practical reference for the register sequences, including the quirks
+of real hardware that QEMU forgives.
+
+\begin{minixbox}
+The MINIX hard disk driver, \texttt{drivers/at\_wini/at\_wini.c (12100)}, is a user-space process that receives
+read and write requests as messages. Its \code{w_identify} does what your Task~12.2 does, and \code{w_transfer} with
+\code{com_out} issues commands and waits for the interrupt. All block drivers share the main loop in
+\texttt{drivers/libdriver/driver.c (11000)}: that is the device-independent layer, done as a library. The RAM disk is
+\texttt{drivers/memory/memory.c (11600)}. The block cache is part of the file-system server, in
+\texttt{servers/fs/cache.c (22400)}, with \code{get_block} and \code{put_block} playing the roles of your
+\code{bread} and \code{brelse}.
+\end{minixbox}
+
+\section{Build it}
+
+\task{A disk for QEMU}
+Create a raw disk image and attach it as the primary master; add a Makefile target so every run has it. Booting with
+\code{-kernel} or from the CD image doesn't conflict, because QEMU attaches the CD to the secondary channel.
+
+\begin{lst}{sh}{terminal}
+qemu-img create -f raw build/disk.img 64M
+qemu-system-i386 -kernel build/kernel.elf -serial stdio \
+    -drive file=build/disk.img,format=raw,if=ide,index=0,media=disk
+\end{lst}
+\verify{The QEMU monitor's \code{info block} lists \code{ide0-hd0} backed by \code{build/disk.img}.}
+
+\task{Find the drive with IDENTIFY}
+Select the master drive (\code{0xA0} to \code{0x1F6}), zero the count and LBA registers, send \code{0xEC}, and read the
+status. Zero means no drive. Otherwise wait for BSY to clear; if the LBA mid and high registers are now non-zero, the
+device is not an ATA disk. Wait for DRQ (or ERR), then read 256 words. Words 27--46 hold the model name, with the two
+bytes of every word swapped, and words 60--61 hold the number of 28-bit addressable sectors.
+\verify{At boot the kernel prints \code{hda: QEMU HARDDISK, 131072 sectors (64 MiB)}.}
+
+\task{Read and write sectors, polling}
+Write \code{ata_read} and \code{ata_write} for up to 255 sectors per call. After selecting the drive, wait about
+400\,ns by reading the alternate status port four times, because the status is not valid immediately. Before every
+sector, wait until BSY is clear and DRQ is set, and check ERR and DF. Move data with \code{rep insw} and
+\code{rep outsw}. After writing, send \code{CACHE FLUSH} (\code{0xE7}) and wait for BSY to clear, or the data may still
+be sitting in the drive's cache.
+
+\begin{lst}{c}{kernel/drivers/ata.c}
+#define ATA_DATA 0x1F0
+#define ATA_SECCOUNT 0x1F2
+#define ATA_LBA0 0x1F3
+#define ATA_LBA1 0x1F4
+#define ATA_LBA2 0x1F5
+#define ATA_DRIVE 0x1F6
+#define ATA_CMD 0x1F7
+#define ATA_STATUS 0x1F7
+#define ATA_ALTSTATUS 0x3F6
+#define ST_BSY 0x80
+#define ST_DF 0x20
+#define ST_DRQ 0x08
+#define ST_ERR 0x01
+
+static inline void insw(uint16_t port, void *buf, uint32_t words)
+{
+    __asm__ volatile ("rep insw" : "+D"(buf), "+c"(words) : "d"(port) : "memory");
+}
+
+static void delay400ns(void) { for (int i = 0; i < 4; i++) inb(ATA_ALTSTATUS); }
+
+static int wait_ready(void)
+{
+    uint8_t s;
+    while ((s = inb(ATA_STATUS)) & ST_BSY)
+        ;
+    if (s & (ST_ERR | ST_DF))
+        return -EIO;
+    return (s & ST_DRQ) ? 0 : -EIO;
+}
+
+int ata_read(uint32_t lba, uint8_t count, void *buf)
+{
+    outb(ATA_DRIVE, 0xE0 | ((lba >> 24) & 0x0F));   /* LBA mode, master, LBA 24..27 */
+    delay400ns();
+    outb(ATA_SECCOUNT, count);
+    outb(ATA_LBA0, lba & 0xFF);
+    outb(ATA_LBA1, (lba >> 8) & 0xFF);
+    outb(ATA_LBA2, (lba >> 16) & 0xFF);
+    outb(ATA_CMD, 0x20);                            /* READ SECTORS */
+    for (uint8_t i = 0; i < count; i++) {
+        if (wait_ready() < 0)
+            return -EIO;
+        insw(ATA_DATA, (uint8_t *)buf + i * 512, 256);
+    }
+    return 0;
+}
+\end{lst}
+\verify{Write a pattern to sectors 100--107, read it back and compare. Then exit QEMU and look at the image on
+the host with \code{hexdump -C -s $((100*512)) -n 64 build/disk.img}: your pattern is there.}
+
+\task{Let the disk interrupt}
+Polling wastes the CPU while the disk works. Enable disk interrupts (clear nIEN in the device control register),
+unmask IRQ 14 on the slave PIC and IRQ 2 on the master, and register a handler for vector 46 that reads the status
+register (which acknowledges the interrupt) and calls \code{sem_up}. In \code{ata_read}, replace the busy wait before
+each sector with \code{sem_down}. Serialise requests with a mutex, since the controller can only do one thing at a
+time.
+\verify{While one task reads 10\,MiB from the disk, another task that prints once a second keeps its rhythm, and
+\code{ps} shows the reader blocked most of the time.}
+
+\task{A block device layer}
+Define \code{struct blockdev} with a name, the sector size, the number of sectors, \code{read} and \code{write}
+function pointers, and a private pointer for the driver. Keep a registry, and add \code{blockdev_find("hda")}. From
+now on, nothing above this layer calls \code{ata_read} directly.
+
+\begin{lst}{c}{include/blockdev.h}
+struct blockdev {
+    char     name[8];                   /* "hda", "hda1", "ram0" */
+    uint32_t sector_size;               /* 512                   */
+    uint32_t nsectors;
+    int    (*read)(struct blockdev *d, uint32_t lba, uint32_t count, void *buf);
+    int    (*write)(struct blockdev *d, uint32_t lba, uint32_t count, const void *buf);
+    void    *priv;                      /* driver state; for a partition: parent + offset */
+};
+\end{lst}
+
+\task{Partitions}
+Read sector 0 of each disk. If bytes 510--511 are \code{55 AA}, parse the four 16-byte partition entries at offset
+\code{0x1BE}: byte 4 is the type, bytes 8--11 the first LBA, bytes 12--15 the number of sectors. Register each used
+entry as a block device (\code{hda1}\dots\code{hda4}) whose read and write add the offset and reject any request that
+would cross the partition's end. Partition the image on the host; type \code{81} is the traditional MINIX type, which
+fits the file system of Phase 13.
+
+\begin{lst}{sh}{terminal}
+echo 'start=2048, type=81' | sfdisk build/disk.img
+\end{lst}
+\verify{\code{lsblk} lists \code{hda} (64\,MiB) and \code{hda1} starting at sector 2048, and a read beyond the end of
+\code{hda1} fails with \code{-EINVAL}.}
+
+\task{A RAM disk}
+Register any boot module named \code{ramdisk} as the block device \code{ram0}; its read and write functions are just
+\code{memcpy}. It is useful for testing the file system without the ATA driver in the way, and in Phase 13 the initial
+root file system can live there.
+
+\task{The buffer cache}
+Write \code{bread}, \code{bwrite}, \code{bdirty}, \code{brelse} and \code{bsync} over a pool of 64 buffers of
+1\,KiB (the block size of the Phase 13 file system, two sectors). Each buffer has a device, a block number, valid and
+dirty flags, a reference count, a mutex held by whoever uses the data, and a position in an LRU list; add a small hash
+table from (device, block) to buffer once the linear search shows up in profiles. Look up and claim buffers under one
+spinlock, so two tasks asking for the same block get the same buffer.
+
+\begin{lst}{c}{include/bcache.h}
+#define BLOCK_SIZE 1024
+
+struct buf {
+    struct blockdev *dev;
+    uint32_t         blockno;
+    bool             valid;             /* data holds the block's contents    */
+    bool             dirty;             /* data must be written back          */
+    int              refcnt;            /* users holding it (not reusable)    */
+    struct mutex     lock;              /* held while a task uses data        */
+    struct list_node lru;               /* most recently released at the head */
+    uint8_t          data[BLOCK_SIZE];
+};
+
+struct buf *bread(struct blockdev *dev, uint32_t blockno);   /* returns locked, valid */
+void        bdirty(struct buf *b);                            /* write back later       */
+void        bwrite(struct buf *b);                            /* write now              */
+void        brelse(struct buf *b);                            /* unlock, move to MRU    */
+void        bsync(void);                                      /* flush every dirty one  */
+\end{lst}
+\verify{Reading the same block twice causes one disk read; a \code{cache} command prints hits, misses and dirty
+buffers; after \code{bsync} the dirty count is zero.}
+
+\task{Tools and tests}
+Add \code{lsblk} and \code{hexdump <dev> <block>} to the monitor. Add tests for block device reads and writes on
+\code{ram0}, partition bounds checking, cache hits and eviction (touch 100 different blocks with 64 buffers), and a
+persistence test: write a known block, \code{bsync}, reboot with the same image, and check it.
+
+\section{Testing and debugging}
+
+\begin{pitfalls}
+IDENTIFY returns only zeros or hangs & Wrong drive select, or no disk attached at \code{index=0} & Check \code{info block}; select with \code{0xA0} and wait 400\,ns before reading status. \\
+Reads return the previous sector's data & DRQ not checked before each sector of a multi-sector read & Call \code{wait_ready} before every 256-word transfer. \\
+Written data is missing after QEMU exits & No \code{CACHE FLUSH} after writes, or dirty buffers never synced & Send \code{0xE7} after writing; call \code{bsync} before shutdown. \\
+IRQ 14 never arrives & IRQ 2 on the master or IRQ 14 on the slave still masked, or nIEN set & Unmask both and clear nIEN in \code{0x3F6}; \code{info pic} shows the masks. \\
+Two tasks see different contents for the same block & Two buffers were created for the same block & Do lookup and allocation atomically under the cache's spinlock. \\
+Partition data lands in the wrong place & The partition offset is applied twice, or not at all & Test with a known pattern at the partition's first sector and check with \code{hexdump -C} on the host. \\
+\end{pitfalls}
+
+\section{Milestone}
+
+\begin{milestonebox}[Data survives]
+\begin{checklist}
+  \item The ATA driver identifies the QEMU disk, and reads and writes with interrupts and a blocking wait.
+  \item All disk access goes through \code{struct blockdev}; partitions from the MBR appear as their own devices.
+  \item The RAM disk works from a boot module.
+  \item The buffer cache serves repeated reads from memory and writes dirty blocks back on \code{bsync}.
+  \item Data written by Turk-OS survives a reboot and is visible with \code{hexdump -C} on the host.
+\end{checklist}
+\end{milestonebox}
+
+\begin{questionbox}
+\begin{enumerate}
+  \item What are the three components of disk access time, and which one does sequential access avoid?
+  \item Compare programmed I/O and DMA. What does the CPU do during each?
+  \item Why must the driver check DRQ before every sector rather than once per command?
+  \item What does the device-independent block layer buy you? Give two concrete examples in Turk-OS.
+  \item What does the buffer cache guarantee besides speed? What is the risk of write-back caching?
+  \item Describe the layout of an MBR and one partition entry.
+\end{enumerate}
+\end{questionbox}
+
+\section{Going further}
+
+Enumerate the PCI bus through configuration ports \code{0xCF8}/\code{0xCFC}, find the IDE controller, and use its
+bus-master DMA engine so the CPU no longer copies every word. Queue requests and sort them with C-SCAN
+(\OSTEP\,\S37.5, \MOS\,\S5.4.3). Add read-ahead: when block $n$ is read, start reading $n+1$ in the background. Or write
+a \code{virtio-blk} driver, which is how modern virtual machines expose disks, and compare its speed with ATA.
+
+\nextphase{13}{File Systems: VFS, initrd and TurkFS}
+\booklegend
+\end{document}

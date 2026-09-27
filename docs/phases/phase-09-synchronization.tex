@@ -1,0 +1,344 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{turkos}
+
+\begin{document}
+\phaseheader{9}{Synchronization and Concurrency in the Kernel}{Now that tasks can be interrupted anywhere, make shared data safe: interrupt control, spinlocks, wait queues, mutexes and semaphores}{56}{62}
+
+\ataglance{2 weeks}{4}{Phase 8: preemptive kernel threads, \code{schedule()}, sleep and wake-up}{Interrupt-safe critical
+sections, spinlocks built on the atomic \code{xchg} instruction, wait queues with lost-wakeup-free sleeping, mutexes,
+counting semaphores and condition variables, a keyboard driver that blocks instead of polling, the classic
+concurrency problems as kernel tests, and a written lock-ordering rule.}
+
+\section{Why this phase}
+
+Phase 8 introduced a new kind of bug. A task can now be interrupted between any two instructions, and another task
+or an interrupt handler can run and touch the same data. Before preemption, the kernel's lists and counters were
+only changed by one flow of control at a time. Now the run queue, the heap's free list, the PMM bitmap, the console
+cursor and the keyboard buffer can all be modified halfway through an update, and the result is corruption that
+appears rarely, at random, and never under the debugger.
+
+This phase gives you the tools to prevent that, and the discipline to use them everywhere. It follows \OSTEP's
+second big idea, concurrency, closely: build locks from a hardware atomic instruction, then build sleeping primitives
+on top of the locks, then use them to solve the classic problems. You will also think about deadlock for the first
+time, because once code takes more than one lock, the order it takes them in starts to matter.
+
+\section{Concepts you need}
+
+\subsection{Race conditions and critical sections}
+
+A \textbf{race condition} is a bug whose outcome depends on the timing of concurrent events. \OSTEP chapter 26 uses
+the simplest possible example: two threads running \code{counter = counter + 1}. The statement compiles to three
+instructions (load, add, store), and a switch between the load and the store loses an update (Table~\ref{tab:race}).
+The code that touches shared data is a \textbf{critical section}, and the goal is \textbf{mutual exclusion}: at most
+one flow of control inside it at a time.
+
+\begin{table}[htbp]
+\centering\small\renewcommand{\arraystretch}{1.25}
+\begin{tabular}{@{}c l l c c c@{}}
+\toprule
+\tkth{Step} & \tkth{Task A} & \tkth{Task B} & \tkth{A's EAX} & \tkth{B's EAX} & \tkth{counter} \\
+\midrule
+1 & \code{mov eax, [counter]} & & 50 & -- & 50 \\
+2 & \code{add eax, 1} & & 51 & -- & 50 \\
+3 & \multicolumn{2}{l}{\textit{timer interrupt: switch to B}} & 51 & -- & 50 \\
+4 & & \code{mov eax, [counter]} & 51 & 50 & 50 \\
+5 & & \code{add eax, 1} & 51 & 51 & 50 \\
+6 & & \code{mov [counter], eax} & 51 & 51 & 51 \\
+7 & \multicolumn{2}{l}{\textit{switch back to A}} & 51 & 51 & 51 \\
+8 & \code{mov [counter], eax} & & 51 & 51 & \textbf{51} \\
+\bottomrule
+\end{tabular}
+\caption{Two increments, one lost. Each task has its own saved EAX, so the switch at step 3 is invisible to A.}
+\label{tab:race}
+\end{table}
+
+\subsection{Where concurrency comes from in Turk-OS}
+
+On a single CPU there are exactly two sources of interleaving: \textbf{interrupts}, which can run a handler between
+any two instructions of a task, and \textbf{preemption}, which the timer interrupt causes. So on one CPU,
+\textbf{disabling interrupts} around a critical section is a complete lock (\OSTEP\,\S28.5). It is cheap and simple,
+but it doesn't scale: with several CPUs, the other CPUs keep running. That is why Turk-OS wraps interrupt control in
+a real \textbf{spinlock} built on an atomic instruction from the start. On one CPU the spinning never happens, but the
+code is already correct for the SMP track in Phase 15.
+
+\subsection{Atomic instructions and spinlocks}
+
+A lock needs an operation that reads and writes memory in one indivisible step. On x86, \code{xchg} with a memory
+operand is always atomic: it swaps a register with memory while locking out other CPUs. That makes it a
+\textbf{test-and-set}: write 1 and get the old value back; if the old value was 0, you have the lock
+(\OSTEP\,\S28.7, \OSC\,\S6.4). GCC exposes it as \code{__atomic_exchange_n}. Other atomics you will meet are
+compare-and-swap (\code{lock cmpxchg}) and fetch-and-add (\code{lock xadd}).
+
+\subsection{Sleeping instead of spinning}
+
+Spinning wastes the CPU, and on one CPU it can never succeed while the holder isn't running. When a task has to wait
+for something that may take a while (a key press, a disk block, a free slot in a buffer), it should \textbf{block}:
+go on a \textbf{wait queue}, let the scheduler run someone else, and be put back on the ready queue by whoever
+makes the condition true. Two rules make this correct. First, going to sleep must be atomic with respect to the
+wake-up, or you get the \textbf{lost wake-up} problem (\MOS\,\S2.3.4): the task checks the condition, the wake-up
+happens, and then the task sleeps forever. Second, a woken task must re-check its condition in a \code{while} loop,
+because by the time it runs, someone else may have taken what it was waiting for (\OSTEP chapter 30 calls this Mesa
+semantics).
+
+\begin{conceptbox}{Three primitives, three jobs}
+\textbf{Spinlock}: short critical sections, and the only lock allowed in interrupt handlers. The holder must never
+sleep. \textbf{Mutex}: a sleeping lock with an owner, for longer critical sections in task context, such as the
+file system in Phase 13. Never from an interrupt handler. \textbf{Semaphore}: a counter with a wait queue
+(\OSTEP chapter 31). \code{down} waits until the count is positive and decrements it; \code{up} increments it and
+wakes one waiter. It serves for counting resources and for signalling from an interrupt handler (which may call
+\code{up} but never \code{down}). \textbf{Condition variables} (\code{wait}, \code{signal}, \code{broadcast}) with a
+mutex round out the set.
+\end{conceptbox}
+
+\subsection{Deadlock}
+
+A \textbf{deadlock} is a set of tasks each waiting for something another one holds. \OSTEP chapter 32, \MOS chapter 6
+and \OSC chapter 8 list the four conditions that must all hold for it: mutual exclusion, hold-and-wait, no preemption,
+and circular wait. Breaking any one prevents deadlock, and in kernels the practical choice is to break circular wait
+with a global \textbf{lock order}: if every piece of code takes locks in the same order, no cycle can form. \MOS\,\S6.3
+also names the ``ostrich algorithm'', ignoring the problem, and explains when that is a reasonable choice (for the
+kernel, it isn't).
+
+\section{Reading plan}
+
+\begin{readingplan}
+\must & \OSTEP & Ch.~26 \emph{Concurrency: An Introduction} & 273--288 & Races, critical sections, atomicity. \\
+\must & \OSTEP & Ch.~28 \emph{Locks} (interrupts, test-and-set, compare-and-swap, spinning versus sleeping) & 301--324 & The design behind Tasks 9.1--9.2. \\
+\must & \OSTEP & Ch.~30 \emph{Condition Variables}; Ch.~31 \emph{Semaphores} & 339--372 & Producer/consumer, the \code{while} rule, semaphores as locks and as signals. \\
+\must & \OSTEP & Ch.~32 \emph{Common Concurrency Problems} & 373--388 & Atomicity and order violations; deadlock and how to prevent it. \\
+\should & \OSC & Ch.~6 \emph{Synchronization Tools} (critical sections, Peterson, hardware support, mutexes, semaphores, monitors, liveness) & 257--288 & A second, more formal treatment. \\
+\should & \OSC & \S7.1--7.2 \emph{Classic Problems}; \emph{Synchronization within the Kernel} & 289--299 & What Linux and Windows use inside their kernels. \\
+\should & \MOS & \S2.3 \emph{Interprocess Communication}; \S2.5 \emph{Classical IPC Problems} & 119--148, 167--172 & Sleep and wakeup, semaphores, mutexes, monitors, message passing; philosophers. \\
+\should & \MOS & \S6.1--6.6 \emph{Deadlocks} & 436--458 & Resources, conditions, detection, avoidance, prevention. \\
+\should & \OSDI & \S2.2.8 \emph{Message Passing}; \S2.6.9 \emph{Interprocess Communication in MINIX 3} & 85--88, 178--182 & The alternative MINIX chose instead of kernel locks. \\
+\could & \OSTEP & Ch.~27 \emph{Thread API}; Ch.~29 \emph{Lock-based Concurrent Data Structures} & 289--300, 325--338 & Locking real data structures well. \\
+\could & \OSDI & \S3.3 \emph{Deadlocks} & 237--252 & The same theory with the I/O perspective. \\
+\end{readingplan}
+
+\begin{minixbox}
+The MINIX 3 kernel needs almost no locks: it is small, it is not preemptible, and it runs with interrupts disabled.
+Everything else (drivers, the file system, the process manager) runs as separate processes that cooperate through
+\textbf{synchronous message passing}: \code{send} blocks until the receiver calls \code{receive}, so every message is
+a rendezvous with no buffering (\OSDI\,\S2.2.8 and \S2.6.9). Read \code{mini_send} and \code{mini_receive} in
+\texttt{kernel/proc.c (07400)}. Notice the check that refuses a \code{send} which would close a cycle of processes
+sending to each other: deadlock detection built into the IPC primitive itself.
+\end{minixbox}
+
+\section{Build it}
+
+\task{Interrupt control that nests}
+Replace every bare \code{cli}/\code{sti} with a pair that saves and restores the previous state. A function that
+disables interrupts must not enable them on exit if they were already disabled when it was called.
+
+\begin{lst}{c}{include/arch/irq.h}
+static inline uint32_t irq_save(void)
+{
+    uint32_t flags;
+    __asm__ volatile ("pushf; pop %0; cli" : "=r"(flags) : : "memory");
+    return flags;
+}
+
+static inline void irq_restore(uint32_t flags)
+{
+    if (flags & 0x200)                      /* IF was set: enable interrupts again */
+        __asm__ volatile ("sti" : : : "memory");
+}
+\end{lst}
+
+\task{Spinlocks}
+A spinlock disables interrupts (on one CPU, that is what actually excludes everyone else) and then takes an atomic
+flag, so the same code stays correct on several CPUs. Record the owner: taking a lock you already hold is a guaranteed
+deadlock, and an assertion turns it into an immediate, readable panic. The \code{"memory"} clobbers and the
+acquire/release orderings stop the compiler from moving accesses out of the critical section.
+
+\begin{lst}{c}{kernel/sync/spinlock.c}
+typedef struct {
+    volatile uint32_t locked;
+    uint32_t          saved_flags;          /* interrupt state of the holder before locking */
+    struct task      *owner;                /* debugging: who holds it                      */
+    const char       *name;
+} spinlock_t;
+
+void spin_lock(spinlock_t *l)
+{
+    uint32_t flags = irq_save();
+    ASSERT(!(l->locked && l->owner == current));          /* already mine: deadlock */
+    while (__atomic_exchange_n(&l->locked, 1, __ATOMIC_ACQUIRE))
+        __asm__ volatile ("pause");                       /* only ever spins on SMP */
+    l->saved_flags = flags;
+    l->owner = current;
+}
+
+void spin_unlock(spinlock_t *l)
+{
+    ASSERT(l->locked && l->owner == current);
+    uint32_t flags = l->saved_flags;
+    l->owner = NULL;
+    __atomic_store_n(&l->locked, 0, __ATOMIC_RELEASE);
+    irq_restore(flags);
+}
+\end{lst}
+\verify{Taking the same lock twice panics with the lock's name. Releasing locks in the reverse order they were
+taken restores the original interrupt state at every level.}
+
+\task{Wait queues without lost wake-ups}
+A wait queue is a list of blocked tasks. \code{sleep_on(wq, lock)} is called with a spinlock held, which on one CPU
+means interrupts are off. It marks the task blocked and queues it \emph{before} releasing the lock, so a wake-up can't
+slip in between. Then it schedules, and it takes the lock again before returning, so the caller can re-check its
+condition safely. \code{wake_up_one} and \code{wake_up_all} move tasks from the wait queue to the ready queue; they
+never block, so interrupt handlers may call them.
+
+\begin{lst}{c}{kernel/sync/waitq.c}
+struct wait_queue { struct list_node tasks; };
+
+/* Caller holds lk. Returns with lk held again, after a wake_up. */
+void sleep_on(struct wait_queue *wq, spinlock_t *lk)
+{
+    uint32_t caller_flags = lk->saved_flags;
+    current->state = TASK_BLOCKED;
+    list_add_tail(&wq->tasks, &current->node);
+    lk->owner = NULL;
+    __atomic_store_n(&lk->locked, 0, __ATOMIC_RELEASE);  /* release, keep interrupts off */
+    schedule();                                           /* returns after we are woken  */
+    spin_lock(lk);
+    lk->saved_flags = caller_flags;                       /* keep the caller's IF state  */
+}
+
+void wake_up_one(struct wait_queue *wq)
+{
+    if (!list_empty(&wq->tasks)) {
+        struct task *t = container_of(wq->tasks.next, struct task, node);
+        list_del(&t->node);
+        make_ready(t);
+    }
+}
+\end{lst}
+
+\task{Semaphores, mutexes and condition variables}
+Build the three sleeping primitives on spinlocks and wait queues. The semaphore is shown below. A mutex is a
+semaphore with an initial count of one plus an owner field and an assertion that only the owner unlocks. A condition
+variable is a wait queue used together with a mutex: \code{cv_wait} releases the mutex and sleeps atomically, and
+re-acquires the mutex before returning.
+
+\begin{lst}{c}{kernel/sync/semaphore.c}
+struct semaphore {
+    int               count;
+    spinlock_t        lock;
+    struct wait_queue waiters;
+};
+
+void sem_down(struct semaphore *s)          /* task context only: may sleep */
+{
+    spin_lock(&s->lock);
+    while (s->count == 0)                   /* while, not if: re-check after waking */
+        sleep_on(&s->waiters, &s->lock);
+    s->count--;
+    spin_unlock(&s->lock);
+}
+
+void sem_up(struct semaphore *s)            /* safe from interrupt handlers */
+{
+    spin_lock(&s->lock);
+    s->count++;
+    wake_up_one(&s->waiters);
+    spin_unlock(&s->lock);
+}
+\end{lst}
+
+\task{A keyboard that blocks}
+Rewrite the keyboard buffer as a producer/consumer pair. The interrupt handler is the producer: it puts the character
+in the ring buffer and calls \code{sem_up} on a semaphore that counts available characters. \code{kbd_getchar} is the
+consumer: \code{sem_down}, then take a character. The \code{sti; hlt} loop from Phase 4 disappears; a task waiting for
+a key now simply sleeps and costs nothing.
+\verify{With the monitor waiting for input and no other task ready, \code{ps} shows the monitor as blocked and the
+idle task running.}
+
+\task{Make the classic problems into tests}
+Add these to \code{make test}. Each one should run long enough (a few seconds) to expose timing bugs.
+
+\begin{center}
+\small\renewcommand{\arraystretch}{1.3}
+\begin{tabularx}{\linewidth}{@{}l X@{}}
+\toprule
+\tkth{Test} & \tkth{What it shows} \\
+\midrule
+\code{race_counter} & four tasks increment a shared counter 100\,000 times each. Without a lock the total comes out short; with a spinlock it is exactly 400\,000. To make the race visible on one CPU, widen the window between load and store with a short busy loop. \\
+\code{bounded_buffer} & three producers and three consumers share a 16-slot buffer, using semaphores for empty slots, full slots and mutual exclusion (\OSTEP chapter 31). Every item produced is consumed exactly once. \\
+\code{philosophers} & five tasks, five forks. Taking forks in a fixed global order (lowest number first) runs without deadlock; for the lesson, run a version without ordering once and watch it freeze. \\
+\code{cv_ping_pong} & two tasks alternate strictly using a mutex and a condition variable, 10\,000 rounds. \\
+\bottomrule
+\end{tabularx}
+\end{center}
+\verify{All four tests pass repeatedly. The unlocked version of \code{race_counter} fails, which proves the test
+can see races.}
+
+\task{Audit the kernel and write the lock order}
+Go through every shared structure you have built and give it an owner. Write the result into a comment block in
+\code{include/locks.h} and follow it from now on. Locks are always taken from top to bottom in the table, never upward.
+
+\begin{center}
+\small\renewcommand{\arraystretch}{1.25}
+\begin{tabularx}{\linewidth}{@{}l l X@{}}
+\toprule
+\tkth{Data} & \tkth{Protected by} & \tkth{Notes} \\
+\midrule
+task list, run queue, sleep queue & \code{sched_lock} (spinlock) & taken inside \code{schedule()}, \code{make_ready()} and the timer handler \\
+keyboard buffer & its semaphore and a spinlock & producer is the IRQ handler \\
+console and \code{kprintf} & \code{console_lock} (spinlock) & also used from interrupt context, so it must be a spinlock \\
+kernel heap & \code{heap_lock} (spinlock) & leaf lock: never call anything that takes another lock while holding it \\
+PMM bitmap & \code{pmm_lock} (spinlock) & leaf lock \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\section{Testing and debugging}
+
+Concurrency bugs hide from debuggers because stopping the machine changes the timing. Rely on assertions instead:
+check lock ownership, check that interrupts are disabled where you expect them to be (\code{ASSERT(!(read_eflags() &
+0x200))}), and run tests many times. Changing the timer frequency (10\,Hz, 1000\,Hz) shuffles the interleavings and
+often exposes a race that was hiding.
+
+\begin{pitfalls}
+System freezes the first time an IRQ handler runs & The handler took a mutex or called \code{sem_down}, which sleeps in interrupt context & Handlers may only take spinlocks and call \code{wake_up}/\code{sem_up}. Assert that you are not in an interrupt in every sleeping function. \\
+Deadlock when \code{kprintf} is called from an interrupt & The interrupted task held \code{console_lock}, and the lock didn't disable interrupts & Spinlocks must disable interrupts: that is exactly what \code{spin_lock} does. \\
+A task sleeps forever although the event happened & Lost wake-up: the condition was checked, then the wake-up came, then the task slept & Queue the task before releasing the lock, as \code{sleep_on} does. \\
+Consumers take items that aren't there & \code{if} instead of \code{while} around the wait & Always re-check the condition in a \code{while} loop. \\
+Interrupts stay off after some code path & An early \code{return} skipped \code{spin_unlock} or \code{irq_restore} & One exit path per locked function; assert IF at the top of the idle loop. \\
+Occasional hang under load & Two locks taken in opposite orders & Follow the lock order table; see Going further for automatic checking. \\
+\end{pitfalls}
+
+\section{Milestone}
+
+\begin{milestonebox}[Safe concurrency]
+\begin{checklist}
+  \item \code{irq_save}/\code{irq_restore}, spinlocks, wait queues, semaphores, mutexes and condition variables are implemented.
+  \item The unlocked counter test loses updates; the locked one is exact.
+  \item Bounded buffer, philosophers and ping-pong tests pass repeatedly in \code{make test}.
+  \item The keyboard driver blocks the reader on a semaphore; no busy waiting remains in the kernel.
+  \item Every shared structure has a documented lock, and the lock order is written down.
+\end{checklist}
+\end{milestonebox}
+
+\begin{questionbox}
+\begin{enumerate}
+  \item Why is disabling interrupts a complete lock on one CPU but not on several?
+  \item Write test-and-set with \code{xchg}. Why must the exchange be atomic, and what does ``atomic'' mean on a multiprocessor?
+  \item What is the lost wake-up problem, and which line of \code{sleep_on} prevents it?
+  \item Compare a spinlock, a mutex, a semaphore and a condition variable. Which may be used in an interrupt handler?
+  \item Why must a woken task re-check its condition in a \code{while} loop?
+  \item Name the four conditions for deadlock. Which one does a lock order break, and how?
+  \item MINIX uses synchronous message passing instead of shared-memory locks. What does it gain and what does it lose?
+\end{enumerate}
+\end{questionbox}
+
+\section{Going further}
+
+Build a small \emph{lock validator}: give each lock a class number, record the order in which each task acquires
+classes, and panic the first time an order inversion appears, even if it didn't deadlock that time. Linux's lockdep
+works this way. Implement reader-writer locks (\OSTEP chapter 31) for data that is read far more often than written.
+Or add MINIX-style synchronous messages (\code{send}, \code{receive}, \code{sendrec}) as a second IPC mechanism
+between kernel threads, and compare the code you write with each style.
+
+\nextphase{10}{User Mode and System Calls}
+\booklegend
+\end{document}

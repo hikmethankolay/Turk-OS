@@ -1,0 +1,260 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{turkos}
+
+\begin{document}
+\phaseheader{15}{Hardening, Polish and Release: Turk-OS 1.0}{Make it survive hostile input, measure it, document it, ship it, and choose where to go next}{96}{100}
+
+\ataglance{3--4 weeks for the core, then open-ended}{4}{Phases 0--14 complete: Turk-OS boots to a shell with pipes, files and processes}{A
+system call fuzzer that runs for an hour without a kernel panic, an audited user/kernel boundary, kernel stack
+protection and read-only kernel code, users and file permissions, a benchmark suite with one measured optimisation,
+an architecture document, a reproducible \code{make release} that produces a bootable ISO, the \code{v1.0} tag, and a
+written reflection on your design. After that, a choice of tracks beyond 100\,\%.}
+
+\section{Why this phase}
+
+A system isn't finished when its features work on the inputs you tried. It is finished when it survives inputs
+nobody intended, when you know how fast it is and why, when someone else can build and understand it, and when you
+can explain every design choice in it. That is the difference between a demo and version 1.0, and this phase is about
+closing that gap.
+
+It is also a good moment to step back. \MOS chapter 12, written by an author who designed several operating systems,
+is about exactly the decisions you have been making for nine months: interfaces, structure, mechanism versus policy,
+performance, and managing a large software project. Reading it now, with your own kernel in mind, is very different
+from reading it at the start. The phase ends with a written comparison of Turk-OS against MINIX 3 and Linux, and with
+a list of optional tracks for going further, one of which connects Turk-OS to the RISC-V core you are building in
+hardware.
+
+\section{Concepts you need}
+
+\subsection{The kernel is the trusted computing base}
+
+\MOS\,\S9.2.2 defines the \textbf{trusted computing base} (TCB): the hardware and software that must be correct for
+the system's security to hold. In Turk-OS that is the entire kernel. Every system call is an entry point into the TCB
+controlled by a possibly hostile program, which is why Phase 10's rule (never trust a user pointer) was only the
+start. \MOS\,\S9.7 catalogues how kernels get broken, and several items apply directly to code you have written:
+\textbf{buffer overflows} when a length from the user isn't checked; \textbf{integer overflows} when
+\code{offset + length} wraps around; \textbf{null-pointer dereferences} in the kernel; and \textbf{time-of-check to
+time-of-use} (TOCTOU) races, where the kernel checks a value in user memory and then reads it again after the user has
+changed it. The cure for the last one is to copy first and check the copy.
+
+\subsection{Protection: who may do what}
+
+Protection needs a model of \emph{subjects} (users, processes), \emph{objects} (files, devices) and \emph{rights}
+(read, write, execute). \MOS\,\S9.3 and \OSC chapter 17 describe the two ways to store it: \textbf{access control
+lists} attached to objects, and \textbf{capabilities} held by subjects. UNIX uses a compact ACL, nine permission bits
+for owner, group and others in each inode, plus the rule that user ID 0 (root) may do anything. TurkFS already stores
+the mode, user ID and group ID in every inode (Phase 13), so what is left is to give processes an identity and check it.
+
+\subsection{Measuring before optimising}
+
+\MOS\,\S12.4 gives the rules for performance work: find out what is actually slow, optimise the common case, use
+caching and hints, and exploit locality. None of that works without measurements. The x86 \code{rdtsc} instruction
+reads a cycle counter, which is precise enough to time a single system call. The classic operating-system
+microbenchmarks (in the style of \emph{lmbench}) measure the null system call, a context switch between two processes
+passing a token through pipes, process creation, and file-system throughput.
+
+\subsection{Design, looking back}
+
+\MOS\,\S12.2--12.3 lists principles you can now test against your own code: \textbf{simplicity} and
+\textbf{completeness} of the interface, \textbf{orthogonality} (independent concepts that combine freely, like
+\code{fork} and \code{exec}), \textbf{separation of mechanism and policy} (your scheduler), static versus dynamic
+structures (MINIX's fixed tables versus your heap), and top-down versus bottom-up implementation (you went bottom-up).
+\S12.5 adds Brooks's observations about software projects, including the \emph{second-system effect}: the temptation to
+put everything you left out of version 1 into version 2.
+
+\section{Reading plan}
+
+\begin{readingplan}
+\must & \MOS & Ch.~12 \emph{Operating System Design}: nature of the problem, interface design, implementation, performance, project management, trends & 981--1030 & Read all of it, with Turk-OS in mind. \\
+\must & \MOS & \S9.1--9.3 \emph{The Security Environment}, \emph{Operating Systems Security}, \emph{Controlling Access to Resources} & 595--611 & Threats, the TCB, protection domains, ACLs and capabilities. \\
+\must & \MOS & \S9.7 \emph{Exploiting Software} (buffer overflows, format strings, dangling and null pointers, integer overflows, TOCTOU) & 639--657 & The bugs your audit is looking for. \\
+\should & \MOS & \S9.10 \emph{Defenses} (especially code signing and jailing) & 684--703 & What operating systems add on top of correct code. \\
+\should & \OSC & \S16.1--16.2 \emph{The Security Problem}, \emph{Program Threats}; \S16.5--16.6 \emph{User Authentication}, \emph{Implementing Security Defenses} & 621--634, 648--662 & A second view, with passwords and defences in depth. \\
+\should & \OSC & Ch.~17 \emph{Protection}, \S17.1--17.6 (principles, rings, domains, access matrix) & 667--682 & The formal model behind UNIX permissions. \\
+\should & \OSDI & \S5.4--5.5 \emph{Security}, \emph{Protection Mechanisms} & 526--548 & Compact coverage of authentication, ACLs, capabilities and covert channels. \\
+\should & \OSDI & \S1.5 \emph{Operating System Structure}; \S2.5.1 \emph{The Internal Structure of MINIX 3} & 42--51, 112--116 & Monolithic versus microkernel, for your design reflection. \\
+\should & \MOS & \S10.1--10.8 \emph{Case Study: UNIX, Linux, and Android} (skim) & 713--848 & Compare each subsystem with yours. \\
+\could & \OSC & Ch.~20 \emph{The Linux System} & 775--819 & Another view of Linux for the comparison. \\
+\end{readingplan}
+
+\begin{minixbox}
+MINIX 3's central design goal is reliability, and \OSDI\,\S2.5.1 explains how its structure serves it. Drivers run
+as separate user processes with only the privileges they need, so a buggy driver can't overwrite the kernel. A
+special process, the \textbf{reincarnation server}, watches the drivers and servers and restarts any that crash
+(\OSDI pp.~114 and 599). In Turk-OS, every driver bug is a kernel bug. Keep this contrast in mind for Task~15.8, and
+look at Track F below if you want to try the MINIX approach on one of your own drivers.
+\end{minixbox}
+
+\section{Build it}
+
+\task{Fuzz the system call interface}
+Write \code{user/bin/fuzz}: a program that makes random system calls forever, with a seed you can print and replay.
+Mix the arguments: small integers, huge integers, negative numbers, pointers to valid buffers, pointers into the kernel
+(\code{0xC0000000} and up), unmapped addresses, addresses one byte before the end of a page, descriptors that exist and
+ones that don't, and random strings as paths. Run several copies at once together with a stress script that forks,
+execs, pipes and writes files in parallel. Every kernel panic is a bug to fix; every process killed by a signal is
+fine.
+\verify{Four fuzzers and the stress script run for one hour with zero kernel panics and no growth in memory use
+after they are stopped.}
+
+\task{Audit the boundary}
+Go through every system call and write down, in a table in \code{docs/}, each argument and how it is validated. Look
+specifically for these bugs, because the fuzzer is unlikely to find all of them.
+
+\begin{center}
+\small\renewcommand{\arraystretch}{1.25}
+\begin{tabularx}{\linewidth}{@{}l X@{}}
+\toprule
+\tkth{Bug class} & \tkth{Where to look in Turk-OS} \\
+\midrule
+missing pointer check & any use of a user pointer outside \code{copy_from_user}/\code{copy_to_user}/\code{strncpy_from_user} \\
+integer overflow & \code{offset + len} in \code{read}/\code{write}/\code{lseek}, \code{brk} arguments, ELF segment sizes, \code{argv} totals \\
+TOCTOU & paths or structures read twice from user memory; copy once into the kernel, then validate the copy \\
+unchecked index & descriptor numbers, signal numbers, system call numbers, directory entry indices \\
+information leak & kernel stack or heap bytes copied to the user in padding of \code{struct stat} or \code{dirent}; zero structures before filling them \\
+resource exhaustion & unlimited processes, descriptors, pipe buffers or path lengths; every resource needs a limit \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\task{Harden the kernel itself}
+Compile the kernel with \code{-fstack-protector-strong}. GCC then inserts a canary check in functions with local
+arrays and needs two symbols from you: \code{__stack_chk_guard}, set to an unpredictable value at boot (for example
+from \code{rdtsc}), and \code{__stack_chk_fail}, which panics. Map the kernel image with 4\,KiB pages so \code{.text} and
+\code{.rodata} are read-only (with CR0.WP set, a stray write faults at once). Make sure the page at address 0 is never
+mapped in any process. Finally, make crash reports readable: generate a symbol table from \code{i686-elf-nm} at build
+time, load it as a boot module, and print function names in the backtrace of every panic.
+\verify{A deliberate overflow of a local buffer in a test system call panics with ``stack smashing detected'' and a
+symbolised backtrace; a write to a function's code faults.}
+
+\task{Users and permissions}
+Give each task a user ID and a group ID, inherited through \code{fork}. Add \code{getuid} (24), \code{setuid} (23),
+\code{getgid} and \code{setgid}; only root may change identity. Check permissions in the VFS against the inode's mode,
+owner and group on \code{open}, \code{execve}, \code{create}, \code{mkdir} and \code{unlink}, with root bypassing the
+checks. Add \code{/etc/passwd} with lines of the form \code{name:uid:gid:home:shell}, and a \code{login} program that
+\code{init} runs on the console, which looks up the user, changes to their identity and home directory, and runs their
+shell. If you add passwords, store only salted hashes, never the passwords themselves.
+\verify{An ordinary user can't read a file with mode \code{0600} owned by root, can't write to \code{/bin}, and can't
+kill root's processes; root can do all three.}
+
+\task{Benchmarks, and one real optimisation}
+Write \code{user/bin/bench}, which reports the median of many runs for each measurement below, and put the results in
+a table in your documentation. Then pick the worst number, find the cause with measurements, fix it, and record the
+before and after values.
+
+\begin{center}
+\small\renewcommand{\arraystretch}{1.25}
+\begin{tabularx}{\linewidth}{@{}l X@{}}
+\toprule
+\tkth{Benchmark} & \tkth{How} \\
+\midrule
+null system call & time 100\,000 calls to \code{getpid} with \code{rdtsc} \\
+context switch & two processes pass a byte back and forth through two pipes; divide by the number of switches \\
+process creation & \code{fork} + \code{exit} + \code{wait}; and \code{fork} + \code{exec} + \code{wait} of a tiny program \\
+file throughput & write and read a 16\,MiB file on TurkFS, with a cold and a warm buffer cache \\
+boot time & \code{rdtsc} in the loader and at the first shell prompt, printed on the serial port \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+Typical optimisations at this point are global pages for kernel mappings (no TLB flush of kernel entries on a CR3
+switch), multi-sector disk transfers and read-ahead, a hash table in the buffer cache, and avoiding the double copy
+through a kernel buffer in pipes. Run the same benchmarks in a Linux system for perspective; the point is to
+understand the differences, not to win.
+
+\task{Write the documentation}
+Write an architecture document (a LaTeX file next to this plan, or Markdown): an overview diagram like the one in the
+roadmap; each subsystem in a page or two; the virtual and physical memory maps; the system call table with numbers,
+arguments and errors; the lock order; the TurkFS on-disk format; how to build, run, test and debug; and known
+limitations. Add a \code{README} that gets a newcomer from a clean clone to a running shell, a \code{CHANGELOG}, and a
+license (MIT matches your other open-source work).
+
+\task{Release v1.0}
+Add \code{make release}: build the kernel, the user programs, the root archive and a TurkFS image populated with
+\code{/bin}, \code{/etc} and a home directory, and a GRUB ISO whose \code{grub.cfg} loads the kernel and its modules.
+Check that the release builds from a clean clone (\code{git clone} into a temporary directory, then \code{make release}),
+boot the ISO in QEMU, and tag the commit \code{v1.0}. If you want to try real hardware, an older PC with legacy BIOS (or
+UEFI with CSM) can boot the ISO from a USB stick.
+
+\begin{warnbox}[Writing a USB stick]
+\code{sudo dd if=build/turkos.iso of=/dev/sdX bs=4M} erases the target device completely. Run \code{lsblk} before and
+after plugging the stick in, make sure \code{sdX} is the stick and not your laptop's disk, and never guess.
+\end{warnbox}
+\verify{A fresh clone builds with one command and boots from ISO to the login prompt. \code{make test} passes on the
+tagged commit.}
+
+\task{Defend your design}
+Write a reflection of three to five pages, as if for a thesis committee. For each subsystem (boot, memory, processes,
+scheduling, synchronisation, system calls, file system, drivers), state what Turk-OS does, how MINIX 3 does it
+(\OSDI) and how Linux does it (\MOS chapter 10), and what you would change with hindsight. Use \MOS chapter 12's
+principles as the yardstick, and end with the one decision you are proudest of and the one you would reverse first.
+Presenting it to your advisor or classmates is the best test of whether you really understand your own system.
+
+\section{Beyond 100\,\%: choose a track}
+
+Turk-OS 1.0 is a complete small system. These tracks extend it in different directions; each is a project of several
+weeks to several months, and they can be combined. Pick by interest, not by size.
+
+\begin{center}
+\small\renewcommand{\arraystretch}{1.35}
+\begin{longtable}{@{}>{\raggedright\arraybackslash}p{0.19\linewidth} >{\raggedright\arraybackslash}p{0.46\linewidth} >{\raggedright\arraybackslash}p{0.29\linewidth}@{}}
+\toprule
+\tkth{Track} & \tkth{What you build} & \tkth{Where to read} \\
+\midrule
+\endfirsthead
+\toprule
+\tkth{Track} & \tkth{What you build} & \tkth{Where to read} \\
+\midrule
+\endhead
+\bottomrule
+\endlastfoot
+A.\ Graphics and Turkish text & Request a linear framebuffer through the Multiboot video fields, draw text with a PSF font that covers the whole Turkish alphabet (ğ, ş, ı, İ, Ğ, Ş), add a PS/2 mouse (IRQ 12), then a simple window system & \MOS\,\S5.6 (user interfaces); OSDev Wiki (VESA, PSF, mouse) \\
+B.\ Multiprocessor (SMP) & Parse the ACPI MADT, program the local APIC and I/O APIC, start the other CPUs (INIT--SIPI--SIPI), per-CPU data and run queues, TLB shootdown; your Phase 9 spinlocks finally spin & \MOS\,\S8.1 (520--544); \OSTEP Ch.~10 (97--108); \OSC\,\S5.5 (220--227) \\
+C.\ Networking & PCI enumeration, an e1000 or RTL8139 driver in QEMU, Ethernet, ARP, IPv4, ICMP (\code{ping}), UDP, then a minimal TCP and a socket API & \OSC Ch.~19 (733--768); \MOS\,\S8.3 (566--587); OSDev Wiki and RFCs \\
+D.\ 64-bit port & Long mode, four-level paging, Multiboot2, \code{syscall}/\code{sysret}, the x86-64 calling convention & \OSC\,\S9.6 (379--383); Intel SDM Vol.~3A \\
+E.\ RISC-V port & Separate the architecture layer (boot, traps, context switch, page tables), port it to RISC-V with Sv32 paging (two levels, like x86), boot on QEMU's \code{virt} machine, then on your own Timur-RV32IMC core once it has supervisor mode and a timer & RISC-V Privileged Specification; xv6-riscv as a reference \\
+F.\ Microkernel experiment & Move the ATA driver (or TurkFS) into a user-space server that talks to the kernel with synchronous messages, as MINIX does, and measure the cost & \OSDI\,\S2.5, \S3.4 (112--125, 252--261); \MOS\,\S1.7.3 (65--68) \\
+G.\ Virtualisation & Understand what QEMU and KVM do for you, run Turk-OS with \code{-enable-kvm}, and compare the benchmarks & \OSC Ch.~18 (701--729); \MOS Ch.~7 (471--516) \\
+\end{longtable}
+\end{center}
+
+Track E deserves a note. Porting forces you to find every place where x86 leaked into supposedly generic code, which
+improves the whole kernel. And running your own operating system on a processor you designed yourself is a rare
+thing to be able to say about a student project, and a natural thesis topic.
+
+\section{Milestone}
+
+\begin{milestonebox}[Turk-OS 1.0]
+\begin{checklist}
+  \item One hour of parallel fuzzing and stress testing without a kernel panic or a memory leak.
+  \item Boundary audit table complete; stack protector, read-only kernel code and symbolised backtraces in place.
+  \item Users, \code{login} and file permissions enforced.
+  \item Benchmark table written, with one optimisation measured before and after.
+  \item Architecture document, README, system call reference and CHANGELOG written.
+  \item \code{make release} works from a clean clone; the ISO boots; \code{v1.0} is tagged.
+  \item The design reflection is written, and ideally presented.
+\end{checklist}
+\end{milestonebox}
+
+\begin{questionbox}
+\begin{enumerate}
+  \item Which parts of Turk-OS trust input from user programs, and how is each validated?
+  \item Give an example of a TOCTOU bug that could exist in \code{execve}, and explain how copying first prevents it.
+  \item Where would MINIX 3 put your ATA driver, and what would change about a driver bug's consequences?
+  \item What is the most expensive operation you measured, and where does the time go?
+  \item Which of \MOS chapter 12's principles did Turk-OS follow best, and which did it violate most?
+  \item What would break first if Turk-OS ran on two CPUs tomorrow?
+\end{enumerate}
+\end{questionbox}
+
+\section{Closing}
+
+You started this plan knowing basic C and no assembly. Turk-OS 1.0 boots on a PC, protects processes from each other,
+schedules them preemptively, manages virtual memory with copy-on-write, stores files in a real on-disk format, and runs
+a shell with pipes. More useful than the code is what you now understand: what happens between pressing a key and a
+character appearing, between \code{fork} and \code{exit}, between \code{write} and the disk. The five books on your
+shelf will read differently from now on, because every chapter describes something you have built or decided not to
+build. Keep the journal going, and pick a track.
+
+\booklegend
+\end{document}

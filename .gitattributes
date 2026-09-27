@@ -1,0 +1,12 @@
+# Normalise line endings; Makefiles, shell scripts and NASM expect LF
+* text=auto eol=lf
+
+# Better hunk headers in diffs
+*.c   diff=cpp
+*.h   diff=cpp
+*.tex diff=tex
+
+*.pdf binary
+
+# Built from docs/*.tex: collapse in GitHub diffs, leave out of language stats
+docs/pdf/*.pdf linguist-generated

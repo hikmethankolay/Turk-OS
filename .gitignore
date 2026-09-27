@@ -1,0 +1,29 @@
+# Build output: kernel, boot sector, ISO staging, disk images, host test binaries
+build/
+*.o
+*.d
+*.a
+*.elf
+*.bin
+*.iso
+*.img
+*.map
+*.sym
+
+# Root archive (Phase 13): make copies user programs into rootfs/bin/
+/rootfs/bin/
+initrd.tar
+
+# Debugging leftovers (QEMU serial logs, GDB history)
+*.log
+.gdb_history
+
+# Editor and language-server files
+compile_commands.json
+.cache/
+.vscode/
+*.swp
+*~
+
+# Reference books: copyrighted and ~46 MB, keep them local only
+/Books/

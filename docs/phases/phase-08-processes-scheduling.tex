@@ -1,0 +1,351 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{turkos}
+
+\begin{document}
+\phaseheader{8}{Processes, Context Switching and Scheduling}{Run many things at once on one CPU: kernel threads, the context switch, and a preemptive scheduler driven by the timer}{48}{56}
+
+\ataglance{3 weeks}{5}{Phase 7: \code{kmalloc}, \code{list.h}, \code{make test}; Phase 4: the timer interrupt}{Kernel threads, each
+with its own stack and guard page, a context switch in about ten lines of assembly, cooperative \code{yield}, then
+preemptive round-robin scheduling on the timer, \code{sleep_ms} with proper blocking, an idle task that halts the CPU,
+task exit with reaping, and a \code{ps} command. Optionally, a multi-level feedback queue.}
+
+\section{Why this phase}
+
+This is where Turk-OS stops being a program and becomes an operating system. A single CPU can only run one
+instruction stream at a time, but by switching between streams quickly enough, the kernel creates the illusion that
+many run at once. \OSTEP calls this \emph{virtualizing the CPU}, and it is the first of its three big ideas.
+
+You will build it in two layers, as the books do. The \textbf{mechanism} is the context switch: saving everything
+that describes one running thread and restoring another. The \textbf{policy} is the scheduler: deciding which thread
+runs next and for how long. You start with kernel threads, which all share the kernel's address space; in Phase 10
+the same machinery switches between user processes with separate address spaces. Take your time with the context
+switch. It is short, it is subtle, and every later phase depends on it.
+
+\section{Concepts you need}
+
+\subsection{The process abstraction}
+
+\OSTEP chapter 4 defines a process by its \textbf{machine state}: the registers (including the instruction and stack
+pointers), the memory it can address, and the I/O resources it holds. The kernel keeps this state in a
+\textbf{process control block} (PCB), which Turk-OS calls \code{struct task}, and tracks every task's
+\textbf{state} (Figure~\ref{fig:states}). A task is \emph{running} on the CPU, \emph{ready} to run and waiting its turn,
+\emph{blocked} waiting for an event (a timer, a key, a disk block), or a \emph{zombie} that has finished but whose
+resources have not been reclaimed yet.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[st/.style={draw=tkNavy!70, fill=tkLight, circle, minimum size=1.55cm, font=\sffamily\small\bfseries, align=center},
+  every edge/.style={draw=tkNavy!80, -{Stealth[length=2mm]}, line width=0.7pt}, lab/.style={font=\sffamily\scriptsize, text=tkGray, align=center}]
+  \node[st, fill=tkGray!10] (new) at (0,0) {new};
+  \node[st, fill=tkGreen!12] (ready) at (3.4,0) {ready};
+  \node[st, fill=tkRed!10] (run) at (7.4,0) {running};
+  \node[st, fill=tkAmber!14] (blk) at (5.4,-2.8) {blocked};
+  \node[st, fill=tkGray!18] (zom) at (10.6,0) {zombie};
+  \draw (new) edge node[above, lab] {created} (ready);
+  \draw (ready) edge[bend left=25] node[above, lab] {scheduled} (run);
+  \draw (run) edge[bend left=25] node[below, lab] {time slice over\\or \code{yield()}} (ready);
+  \draw (run) edge[bend left=15] node[right, lab] {\ sleep, wait for\\\ I/O or a lock} (blk);
+  \draw (blk) edge[bend left=15] node[left, lab] {event happened\ \ } (ready);
+  \draw (run) edge node[above, lab] {exit} (zom);
+\end{tikzpicture}
+\caption{Task states in Turk-OS. Only the scheduler moves a task into \emph{running}.}
+\label{fig:states}
+\end{figure}
+
+\subsection{The context switch}
+
+The key insight of \OSTEP chapter 6 is that the kernel regains control of the CPU in only two ways: the running code
+calls into it (a system call, or \code{yield} for kernel threads), or a \textbf{timer interrupt} forces it in. Either
+way, the kernel is now running on the current task's kernel stack. To switch, it saves the current task's registers,
+records its stack pointer in its \code{struct task}, loads the next task's stack pointer, and restores that task's
+registers. Because each task has its \textbf{own kernel stack}, the part of the old task's state that lives on the
+stack (its return addresses, its interrupt frame) simply stays there until it is resumed.
+
+The switch is done by a C-callable assembly function, \code{switch_context}. It only needs to save the four
+callee-saved registers (EBX, ESI, EDI, EBP) plus ESP: under cdecl, the C code that calls it has already saved anything
+else it cares about (Phase 1). When the new task's stack is loaded and \code{switch_context} executes \code{ret}, it
+returns into wherever \emph{that} task called \code{switch_context} from, which might be the middle of a timer
+interrupt from several seconds ago (Figure~\ref{fig:switch}).
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[st/.style={draw=tkNavy!60, fill=tkLight, rounded corners=2pt, font=\sffamily\scriptsize, align=center, text width=4.4cm, minimum height=0.6cm},
+  hi/.style={st, draw=tkRed!80!black, fill=tkRed!8}]
+  \node[font=\sffamily\small\bfseries, text=tkNavy] at (0,0.7) {task A (being switched out)};
+  \node[font=\sffamily\small\bfseries, text=tkNavy] at (7.2,0.7) {task B (being switched in)};
+  \node[st] (a1) at (0,0) {A runs its code};
+  \node[st, below=0.25cm of a1] (a2) {timer IRQ: CPU pushes EFLAGS, CS, EIP;\\\code{isr_common} saves all registers\\on A's kernel stack};
+  \node[st, below=0.25cm of a2] (a3) {\code{timer_handler}: slice used up\\$\rightarrow$ \code{schedule()}};
+  \node[hi, below=0.25cm of a3] (a4) {\code{switch_context(&A->esp, B->esp)}\\push EBP EBX ESI EDI; save ESP in A};
+  \node[hi] (b1) at (7.2,-3.95) {load B's ESP; pop EDI ESI EBX EBP;\\\code{ret}};
+  \node[st, above=0.25cm of b1] (b0) {B was switched out earlier inside its own \code{schedule()} call; its stack still holds that state};
+  \node[st, below=0.25cm of b1] (b2) {back in B's \code{schedule()}, then B's\\\code{timer_handler}, \code{isr_common}};
+  \node[st, below=0.25cm of b2] (b3) {\code{iret}: B continues exactly where it was interrupted};
+  \draw[tkarrow] (a1) -- (a2); \draw[tkarrow] (a2) -- (a3); \draw[tkarrow] (a3) -- (a4);
+  \draw[tkarrow, tkRed, line width=1pt] (a4.east) -- node[above, font=\sffamily\scriptsize, text=tkRed] {stack switch} (b1.west);
+  \draw[tkarrow, dashed] (b0) -- (b1); \draw[tkarrow] (b1) -- (b2); \draw[tkarrow] (b2) -- (b3);
+\end{tikzpicture}
+\caption{A preemptive switch from A to B. A's half-finished interrupt stays frozen on A's stack until A is chosen again.}
+\label{fig:switch}
+\end{figure}
+
+\subsection{Scheduling policy}
+
+With the mechanism in place, the scheduler decides who runs. \OSTEP chapter 7 introduces the metrics:
+\textbf{turnaround time} (from arrival to completion) and \textbf{response time} (from arrival to first run). Policies
+like shortest-job-first optimise turnaround but need to know the future. \textbf{Round-robin} (RR) gives each ready
+task a fixed \textbf{time slice} (quantum) in turn, which is excellent for response time and is what Turk-OS starts
+with. Chapter 8's \textbf{multi-level feedback queue} (MLFQ) keeps several RR queues at different priorities, lowers
+the priority of tasks that use their whole slice (CPU-bound work), and periodically boosts everyone to prevent
+starvation. It favours interactive tasks without knowing anything about them in advance, which is why variants of it
+ran in most UNIX systems. \OSDI\,\S2.4.5 adds the principle to keep policy and mechanism separate, so you can change
+one without touching the other.
+
+\section{Reading plan}
+
+\begin{readingplan}
+\must & \OSTEP & Ch.~4 \emph{The Abstraction: The Process} & 25--36 & Machine state, process states, the process list. \\
+\must & \OSTEP & Ch.~6 \emph{Limited Direct Execution}, re-read \S6.3 \emph{Switching Between Processes} with its timeline & 52--58 & The exact mechanism of Tasks 8.3--8.6. \\
+\must & \OSTEP & Ch.~7 \emph{Scheduling: Introduction}; Ch.~8 \emph{Scheduling: The Multi-Level Feedback Queue} & 63--86 & Metrics, RR, and the MLFQ rules for Task 8.9. \\
+\must & \LOB & Ch.~14 \emph{Multitasking}: creating processes, cooperative and preemptive scheduling, separate kernel stacks & 73--75 & The x86 specifics, and the difficulties it warns about. \\
+\should & \MOS & \S2.1 \emph{Processes} (model, creation, states, implementation) & 85--97 & Another view, with the interrupt-handling sequence spelled out. \\
+\should & \MOS & \S2.4 \emph{Scheduling} & 148--167 & Goals per system type; RR, priority, multiple queues, lottery. \\
+\should & \OSDI & \S2.5 \emph{Overview of Processes in MINIX 3}; \S2.6.5 \emph{Process Data Structures} & 112--125, 146--156 & MINIX's process table and scheduling queues. \\
+\should & \OSDI & \S2.6.10 \emph{Scheduling in MINIX 3} & 182--185 & A real multi-queue scheduler in a few pages. \\
+\should & \OSC & \S3.1--3.2 \emph{Process Concept}, \emph{Process Scheduling}; \S5.1--5.3 \emph{CPU scheduling} & 106--116, 200--217 & Queues, context switches, algorithms with examples. \\
+\could & \OSTEP & Ch.~9 \emph{Proportional Share}; Ch.~10 \emph{Multiprocessor Scheduling} & 87--108 & Lottery and stride scheduling; what changes with more CPUs. \\
+\could & \MOS & \S2.2 \emph{Threads}, especially \S2.2.5 \emph{Implementing Threads in the Kernel} & 97--113 & What you are building, placed among the alternatives. \\
+\could & \OSC & \S5.7 \emph{Operating-System Examples} (Linux CFS, Windows) & 234--244 & How production schedulers do it. \\
+\end{readingplan}
+
+\begin{minixbox}
+MINIX keeps each process's saved registers \emph{in the process table} (\code{p_reg} in \texttt{kernel/proc.h
+(05500)}), not on a per-process kernel stack. Its assembly entry code in \texttt{kernel/mpx386.s (06300)} saves the
+interrupted process's registers into its table entry, the kernel runs on one shared stack, and \code{restart} loads
+whichever process was chosen. \code{enqueue}, \code{dequeue} and \code{pick_proc} in \texttt{kernel/proc.c (07400)}
+manage 16 priority queues. This works for MINIX because its kernel never blocks in the middle of a call: work that has
+to wait is done by user-space servers. Turk-OS gives every task its own kernel stack, like Linux and xv6, so a task can
+block anywhere inside the kernel (in the middle of a disk read, for example) and resume there later.
+\end{minixbox}
+
+\section{Build it}
+
+\task{The task structure}
+Define \code{struct task} and a global list of all tasks (for \code{ps}), plus a \code{current} pointer. Keep the
+saved stack pointer as the first field so the assembly never needs to know the struct layout. Hand out PIDs from a
+counter.
+
+\begin{lst}{c}{include/task.h}
+enum task_state { TASK_READY, TASK_RUNNING, TASK_BLOCKED, TASK_ZOMBIE };
+
+struct task {
+    uint32_t         esp;          /* saved kernel ESP while not running (offset 0)  */
+    uint32_t         pid;
+    enum task_state  state;
+    char             name[16];
+    void            *kstack;       /* the stack allocation, freed when reaped        */
+    uint32_t         wake_tick;    /* when a sleeping task should wake               */
+    int              slice;        /* ticks left in the current time slice           */
+    uint32_t         cpu_ticks;    /* accounting for ps                              */
+    struct list_node node;         /* on the run queue, a sleep queue, or zombies    */
+    struct list_node all;          /* on the list of all tasks                       */
+};
+
+extern struct task *current;
+\end{lst}
+
+\task{Kernel stacks with guard pages}
+Give each task a 16\,KiB kernel stack in the region from \code{0xF0000000}, whose page tables already exist. Divide
+the region into 20\,KiB slots and map only the top four pages of each slot, leaving the lowest page unmapped. A stack
+overflow then hits the guard page and produces a page fault with an address just below the stack, instead of silently
+overwriting the next task's memory. Keep freed slots on a list for reuse.
+\verify{A test task that recurses without limit dies with a page fault whose address is in its own guard page.}
+
+\task{switch\_context}
+Type this in and comment it until you could explain every line to someone else.
+
+\begin{lst}{asm}{kernel/arch/i386/switch.s}
+; void switch_context(uint32_t *save_esp, uint32_t load_esp)
+; Saves the current task's callee-saved registers and ESP, then resumes the task
+; whose saved ESP is load_esp. Must be called with interrupts disabled.
+global switch_context
+switch_context:
+    mov  eax, [esp + 4]     ; eax = &old->esp
+    mov  edx, [esp + 8]     ; edx = new->esp
+    push ebp                ; save callee-saved registers on the OLD task's stack
+    push ebx
+    push esi
+    push edi
+    mov  [eax], esp         ; old->esp = current stack pointer
+    mov  esp, edx           ; switch to the NEW task's stack
+    pop  edi                ; restore the new task's callee-saved registers
+    pop  esi
+    pop  ebx
+    pop  ebp
+    ret                     ; return to wherever the new task last called switch_context
+\end{lst}
+
+\task{Creating a task}
+A new task has never called \code{switch_context}, so fake it: build its stack so the pops and \code{ret} land in a
+small trampoline. The trampoline enables interrupts (the new task doesn't return through an interrupt path that
+would restore them), calls the task's entry function, and calls \code{task_exit} if the function ever returns.
+
+\begin{lst}{c}{kernel/proc/task.c}
+extern void task_trampoline(void);          /* in switch.s, see below */
+
+struct task *task_create(const char *name, void (*entry)(void *), void *arg)
+{
+    struct task *t = kcalloc(1, sizeof *t);
+    t->kstack = kstack_alloc();             /* 16 KiB + guard page */
+    uint32_t *sp = (uint32_t *)((char *)t->kstack + KSTACK_SIZE);
+
+    *--sp = (uint32_t)task_trampoline;      /* switch_context's ret jumps here */
+    *--sp = 0;                              /* ebp                             */
+    *--sp = (uint32_t)entry;                /* ebx: the function to run        */
+    *--sp = (uint32_t)arg;                  /* esi: its argument               */
+    *--sp = 0;                              /* edi                             */
+    t->esp = (uint32_t)sp;
+
+    t->pid = next_pid++;
+    strncpy(t->name, name, sizeof t->name - 1);
+    make_ready(t);                          /* state = READY, append to run queue */
+    return t;
+}
+\end{lst}
+
+\begin{lst}{asm}{kernel/arch/i386/switch.s (continued)}
+extern task_exit
+global task_trampoline
+task_trampoline:
+    sti                     ; new tasks start with interrupts enabled
+    push esi                ; argument
+    call ebx                ; entry(arg)
+    call task_exit          ; if entry returns, end the task (never returns)
+\end{lst}
+\verify{In GDB, break on \code{task_trampoline}: when it is hit, EBX holds your entry function and ESI its
+argument.}
+
+\task{Cooperative multitasking}
+Turn the code that is already running (\code{kmain}) into task 0 by giving it a \code{struct task}; its
+\code{esp} gets filled in at the first switch. Write \code{schedule()}, which moves the current task to the back of the
+ready queue if it is still runnable and switches to the task at the front, and \code{yield()}, which calls it with
+interrupts disabled. Save and restore the flags rather than blindly using \code{sti}, because \code{yield} may be
+called with interrupts already off.
+
+\begin{lst}{c}{kernel/proc/sched.c}
+static struct list_node run_queue;          /* READY tasks, first in first out */
+
+void schedule(void)                         /* interrupts must be disabled */
+{
+    struct task *prev = current;
+    if (prev->state == TASK_RUNNING && prev != idle_task) {
+        prev->state = TASK_READY;
+        list_add_tail(&run_queue, &prev->node);
+    }
+    struct task *next = idle_task;
+    if (!list_empty(&run_queue)) {
+        next = container_of(run_queue.next, struct task, node);
+        list_del(&next->node);
+    }
+    next->state = TASK_RUNNING;
+    next->slice = QUANTUM_TICKS;            /* e.g. 5 ticks = 50 ms at 100 Hz */
+    if (next == prev)
+        return;
+    current = next;
+    switch_context(&prev->esp, next->esp);
+}
+
+void yield(void)
+{
+    uint32_t flags;
+    __asm__ volatile ("pushf; pop %0; cli" : "=r"(flags));
+    schedule();
+    if (flags & 0x200)                      /* IF was set before: enable again */
+        __asm__ volatile ("sti");
+}
+\end{lst}
+\verify{Two tasks that each print a letter and call \code{yield()} in a loop produce \code{ABABAB...}; a third task
+joins the rotation.}
+
+\task{Preemption from the timer}
+Now let the timer take the CPU away. In the timer handler, charge the tick to \code{current}, and when its slice
+reaches zero, call \code{schedule()}. One change elsewhere is essential: in \code{isr_handler}, send the EOI to the PIC
+\emph{before} calling an IRQ handler, not after. If the handler switches to another task, the old task's half-finished
+interrupt stays frozen on its stack, and an EOI placed after the call would not be sent until that task runs again.
+Until then the PIC delivers no more timer interrupts and preemption stops. Sending it first is safe because the
+interrupt gate keeps interrupts disabled until \code{iret}.
+\verify{Three tasks that loop printing without ever calling \code{yield} still take turns. The kernel monitor stays
+responsive while they run.}
+
+\task{Sleeping, idling and exiting}
+Add \code{sleep_ms}: set \code{wake_tick}, mark the task blocked, put it on a sleep list, and call \code{schedule()}.
+The timer handler moves every task whose \code{wake_tick} has passed back to the ready queue. Create an \code{idle}
+task that runs \code{sti; hlt} forever; \code{schedule} picks it only when nothing else is ready, so the CPU halts
+instead of spinning. Finally, \code{task_exit} marks the task as a zombie, puts it on a zombie list and schedules
+away. It can't free its own stack, because it is still running on it, so another task (the idle task is a good
+choice) reaps zombies: it frees their stacks and structures.
+\verify{With every task sleeping, QEMU's CPU usage on the host drops to almost zero. Creating and exiting 1000 tasks
+leaves the PMM and heap statistics exactly where they started.}
+
+\task{ps and accounting}
+Add a \code{ps} monitor command that walks the list of all tasks and prints PID, name, state and CPU ticks. Add
+\code{spawn <name>} to start a demo task and \code{kill <pid>} to end one (for kernel threads, simply mark it to exit
+at its next tick).
+
+\task{A multi-level feedback queue (optional)}
+Replace the single run queue with three queues and apply the rules of \OSTEP chapter 8: the highest non-empty queue
+runs first; equal priorities share round-robin; new tasks start at the top; a task that uses up its allotment at a
+level moves down; every second, all tasks move back to the top. Compare a CPU-bound task and an interactive one (the
+monitor) with and without MLFQ.
+
+\section{Testing and debugging}
+
+When a switch goes wrong, the symptom usually appears later, in the new task. Break on \code{switch_context}, step
+through it with \code{stepi}, and check with \code{x/6xw $esp} that the new stack holds exactly what the pops and
+\code{ret} expect. The GDB command \code{info symbol <addr>} tells you where a return address points.
+
+\begin{pitfalls}
+Preemption works once, then the timer stops & EOI sent after the IRQ handler, which switched away & Send the EOI before calling the handler (Task~8.6). \\
+New task crashes at its first instruction & The initial stack doesn't match \code{switch_context}'s pop order & Five words: EDI, ESI, EBX, EBP, return address, from low to high. \\
+New task runs, but never gets preempted & Interrupts disabled in the new task & The trampoline must execute \code{sti}. \\
+Random corruption, other tasks' data changes & Kernel stack overflow into a neighbour & Guard pages turn this into a page fault; make stacks bigger or recursion shallower. \\
+Crash in \code{task_exit} or right after & The task freed its own stack while running on it & Only mark it as a zombie; let another task reap it. \\
+Queue corruption under load & \code{schedule()} entered with interrupts enabled, so a timer interrupt re-entered it & Every path into \code{schedule()} disables interrupts first; assert IF is clear at its start. \\
+\end{pitfalls}
+
+\section{Milestone}
+
+\begin{milestonebox}[Turk-OS multitasks]
+\begin{checklist}
+  \item Kernel threads run with their own 16\,KiB stacks and guard pages.
+  \item \code{switch_context} and \code{task_trampoline} work; you can explain every instruction.
+  \item At least three threads share the CPU preemptively, without calling \code{yield}.
+  \item \code{sleep_ms} blocks properly; the idle task halts the CPU when nothing is ready.
+  \item Tasks exit and are reaped; 1000 create/exit cycles leak no memory.
+  \item \code{ps} shows every task with its state and CPU time.
+\end{checklist}
+\end{milestonebox}
+
+\begin{questionbox}
+\begin{enumerate}
+  \item What state must be saved in a context switch, and why does \code{switch_context} save only four registers besides ESP?
+  \item How does the timer interrupt make preemption possible, according to \OSTEP chapter 6?
+  \item Draw the stack of a newly created task just before its first switch.
+  \item Why must the EOI be sent before an IRQ handler that might call \code{schedule()}?
+  \item Round-robin versus MLFQ: what problem does MLFQ solve, and why does it need a periodic priority boost?
+  \item Why can't a task free its own kernel stack in \code{task_exit}?
+  \item MINIX saves registers in the process table and uses a single kernel stack. What can Turk-OS do that MINIX's kernel can't, and what does it cost?
+\end{enumerate}
+\end{questionbox}
+
+\section{Going further}
+
+Implement lottery or stride scheduling from \OSTEP chapter 9 and compare fairness over a long run. Add a \code{top}
+command that shows CPU usage per task over the last second. Measure the cost of a context switch by switching back and
+forth a million times and reading the CPU's time-stamp counter (\code{rdtsc}) before and after. If you are heading for
+the SMP track in Phase 15, read \OSTEP chapter 10 now and note what would have to change: one \code{current} per CPU,
+per-CPU run queues, and real locks.
+
+\nextphase{9}{Synchronization and Concurrency in the Kernel}
+\booklegend
+\end{document}

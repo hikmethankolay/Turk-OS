@@ -1,0 +1,332 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{turkos}
+
+\begin{document}
+\phaseheader{0}{Foundations and Toolchain}{Set up the workshop: a cross compiler, an emulator, a debugger, and the C habits a kernel needs}{0}{5}
+
+\ataglance{2--3 weeks}{1}{Basic C, a Fedora Linux machine, curiosity}{A working \texttt{i686-elf} cross toolchain, QEMU and GDB,
+a Git repository with the Turk-OS skeleton, and a small C library (strings, bitmaps, lists, ring buffer) with unit tests.
+You will reuse that library inside the kernel.}
+
+\section{Why this phase}
+
+An operating system kernel is a C program with nothing underneath it: no standard library, no \code{printf}, no
+\code{malloc}, no operating system to catch its mistakes. Before you can write one, you need three things. The first
+is a \textbf{toolchain} that produces code for a bare x86 machine instead of for Linux. The second is a
+\textbf{laboratory}, an emulator you can reboot a hundred times an hour with a debugger attached. The third is
+\textbf{C fluency at the level of bits and addresses}: pointers to fixed memory locations, bit masks, struct layout,
+and the build pipeline from \code{.c} file to executable.
+
+This phase builds all three and gives you the vocabulary of the field. It is the only phase with no kernel code, and
+the temptation is to rush it. Don't. Almost every mysterious failure in Phases 1--3 comes from a toolchain
+misconfiguration or a C misunderstanding that could have been fixed here in ten minutes.
+
+\section{Concepts you need}
+
+\subsection{What an operating system is}
+
+\OSTEP describes the OS through three ideas that also organise the whole book and this plan. It
+\textbf{virtualizes} the hardware, so each program believes it has its own CPU and its own memory (Phases 5--11). It
+manages \textbf{concurrency}, so many activities can safely share the machine (Phases 8--9). It provides
+\textbf{persistence}, so data survives power loss (Phases 12--13). \MOS gives two complementary views of the same
+thing: the OS as an \emph{extended machine} that hides ugly hardware behind clean abstractions, and as a
+\emph{resource manager} that shares the CPU, memory and devices fairly and safely.
+
+\begin{conceptbox}{Kernel mode and user mode}
+The CPU has at least two privilege levels. Code in \textbf{kernel mode} (ring 0 on x86) can do anything: touch any
+memory, talk to devices, disable interrupts. Code in \textbf{user mode} (ring 3) can't, and if it tries, the CPU
+stops it and hands control to the kernel. This hardware-enforced split is what lets an OS protect itself and its
+programs from each other (\OSC\,\S1.4). For the first nine phases everything you write runs in ring 0. Ring 3 arrives
+in Phase 10.
+\end{conceptbox}
+
+\subsection{The machine you are going to program}
+
+Read \MOS\,\S1.3 with this picture in mind. The \textbf{CPU} fetches instructions from memory and executes them,
+keeping its working values in a handful of \textbf{registers}. \textbf{Memory} is one big array of bytes, indexed by
+address. \textbf{Devices} (screen, keyboard, disk, timer) are controlled by reading and writing their registers,
+either through a separate I/O address space with special \code{in}/\code{out} instructions, or by mapping them into
+ordinary memory addresses. When a device needs attention it raises an \textbf{interrupt}, which makes the CPU pause
+what it is doing and jump to a handler the OS registered earlier. Nearly everything in Phases 2--4 is a concrete case
+of these four sentences.
+
+\subsection{C the way a kernel uses it}
+
+A kernel is compiled \textbf{freestanding}: there is no C library, but the compiler still provides the headers that
+only define types and macros: \texttt{stdint.h}, \texttt{stddef.h}, \texttt{stdbool.h}, \texttt{stdarg.h},
+\texttt{limits.h} and a few others. Everything else you write yourself. The listing shows the idioms you will use every
+day. Make sure you can explain each line before moving on.
+
+\begin{lst}{c}{idioms.c (study this, you will write code like it constantly)}
+#include <stdint.h>
+#include <stddef.h>
+
+/* 1. A pointer to a fixed physical address: the VGA text buffer.            */
+/*    volatile = "every read/write really happens"; the compiler may not     */
+/*    cache, merge or delete these accesses.                                  */
+volatile uint16_t *const vga = (volatile uint16_t *)0xB8000;
+
+/* 2. Bit manipulation: set, clear, test bit n of a flags word.              */
+#define BIT(n)            (1u << (n))
+#define SET(x, n)         ((x) |=  BIT(n))
+#define CLEAR(x, n)       ((x) &= ~BIT(n))
+#define TEST(x, n)        (((x) & BIT(n)) != 0)
+
+/* 3. Alignment: round an address up/down to a power-of-two boundary.        */
+#define ALIGN_DOWN(x, a)  ((x) & ~((uintptr_t)(a) - 1))
+#define ALIGN_UP(x, a)    ALIGN_DOWN((x) + (a) - 1, (a))
+
+/* 4. A struct whose memory layout is dictated by hardware: no padding.      */
+struct __attribute__((packed)) gdt_ptr {
+    uint16_t limit;
+    uint32_t base;
+};                       /* sizeof == 6, not 8 */
+
+/* 5. Function pointers: tables of handlers, e.g. one per interrupt.         */
+typedef void (*handler_t)(void);
+static handler_t handlers[256];
+\end{lst}
+
+\subsection{From source file to bootable image}
+
+You will spend a lot of time looking at what the toolchain produced, so learn the pipeline now
+(Figure~\ref{fig:pipeline}). The compiler turns C into assembly and the assembler turns that into an
+\textbf{object file} containing \textbf{sections}: \code{.text} (code), \code{.rodata} (constants), \code{.data}
+(initialised globals) and \code{.bss} (zero-initialised globals, which take no space in the file). The
+\textbf{linker} combines object files and places each section at the address a \textbf{linker script} tells it to.
+The result is an \textbf{ELF} executable that GRUB or QEMU can load. \OSC\,\S2.5 covers linkers and loaders.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[node distance=0.55cm and 0.7cm, font=\sffamily\small]
+  \node[tkbox] (c) {\texttt{kmain.c}};
+  \node[tkbox, right=of c] (cc) {\texttt{i686-elf-gcc}\\\scriptsize preprocess + compile};
+  \node[tkbox, right=of cc] (s) {\texttt{kmain.o}};
+  \node[tkbox, below=of c] (asm) {\texttt{loader.s}};
+  \node[tkbox, right=of asm] (nasm) {\texttt{nasm -f elf32}};
+  \node[tkbox, right=of nasm] (o2) {\texttt{loader.o}};
+  \node[tkhi, right=1.0cm of $(s)!0.5!(o2)$] (ld) {\texttt{i686-elf-ld}\\\scriptsize + \texttt{link.ld}};
+  \node[tkbox, right=of ld] (elf) {\texttt{kernel.elf}};
+  \node[tkok, below=0.6cm of elf] (q) {QEMU / GRUB};
+  \draw[tkarrow] (c) -- (cc); \draw[tkarrow] (cc) -- (s);
+  \draw[tkarrow] (asm) -- (nasm); \draw[tkarrow] (nasm) -- (o2);
+  \draw[tkarrow] (s) -- (ld); \draw[tkarrow] (o2) -- (ld);
+  \draw[tkarrow] (ld) -- (elf); \draw[tkarrow] (elf) -- (q);
+\end{tikzpicture}
+\caption{The build pipeline you set up in this phase and use for the rest of the project.}
+\label{fig:pipeline}
+\end{figure}
+
+\subsection{Numbers you will see every day}
+
+Kernel code talks in hexadecimal and powers of two. Memorise this table; you will recognise these values in register
+dumps long before you understand everything around them.
+
+\begin{center}
+\small\renewcommand{\arraystretch}{1.25}
+\begin{tabular}{@{}l l l@{}}
+\toprule
+\tkth{Value} & \tkth{Hex} & \tkth{Where you meet it} \\
+\midrule
+512 bytes & \texttt{0x200} & one disk sector, the boot sector (Phase 1) \\
+4 KiB & \texttt{0x1000} & one page or page frame (Phases 5--6) \\
+1 MiB & \texttt{0x100000} & where the kernel is loaded (Phase 1) \\
+4 MiB & \texttt{0x400000} & memory covered by one page table (Phase 6) \\
+3 GiB & \texttt{0xC0000000} & start of the higher-half kernel (Phase 6) \\
+4 GiB & \texttt{0x100000000} & the whole 32-bit address space \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Reading plan}
+
+Read the \must items before starting the tasks. The \should items make the tasks easier and are worth the time
+this early. Your reading order: \OSTEP first, then \MOS\,\S1.3, then \LOB.
+
+\begin{readingplan}
+\must & \OSTEP & Ch.~1 \emph{A Dialogue on the Book}; Ch.~2 \emph{Introduction to Operating Systems} & 1--22 & The three big ideas; the map for the whole plan. \\
+\must & \MOS & \S1.3 \emph{Computer Hardware Review} (processors, memory, I/O devices, buses, booting) & 20--35 & The hardware you will program directly. \\
+\must & \LOB & Ch.~1 \emph{Introduction}; Ch.~2 up to \emph{Booting} (Tools, Quick Setup, Build System, Virtual Machine) & 7--12 & How the practical guide works and what it expects. \\
+\should & \MOS & \S1.1 \emph{What Is an OS?}; \S1.5 \emph{OS Concepts} & 3--6, 38--50 & Vocabulary: processes, address spaces, files, shell. \\
+\should & \MOS & \S1.8 \emph{The World According to C} & 73--77 & Header files, large projects, the C runtime model. \\
+\should & \OSC & Ch.~1 \S1.1--1.4 (organization, interrupts, storage, dual-mode) & 4--27 & A second, more detailed view of the same ground. \\
+\could & \OSC & \S1.9 \emph{Kernel Data Structures}; \S2.5 \emph{Linkers and Loaders} & 36--40, 75--77 & Background for the warm-up library and the build pipeline. \\
+\could & \OSDI & \S1.1--1.2 (what an OS is, history, history of MINIX 3) & 4--19 & Where MINIX came from and why it matters for teaching. \\
+\end{readingplan}
+
+\section{Build it}
+
+\task{Install the host tools}
+Everything below is packaged in Fedora. \code{grub2-tools-extra} provides \code{grub2-mkrescue} (Phase 1) and
+\code{mtools} is used by it. The second line installs what GCC needs to build from source.
+
+\begin{lst}{sh}{terminal (host)}
+sudo dnf install gcc make git nasm qemu-system-x86 gdb xorriso mtools \
+                 grub2-tools-extra grub2-pc-modules
+sudo dnf install bison flex gmp-devel mpfr-devel libmpc-devel texinfo
+\end{lst}
+\verify{\code{nasm -v}, \code{qemu-system-i386 --version} and \code{gdb --version} all print a version.}
+
+\task{Make your editor's terminal see those tools}
+Your VS Code is the Flatpak build, so its integrated terminal runs inside a sandbox where host programs like
+\code{nasm} and \code{qemu-system-i386} are not visible. Either work in a normal terminal window, or add a terminal
+profile to VS Code's \code{settings.json} that starts a shell on the host:
+
+\begin{lst}{plain}{settings.json (VS Code)}
+"terminal.integrated.profiles.linux": {
+  "host-bash": { "path": "/usr/bin/flatpak-spawn", "args": ["--host", "--env=TERM=xterm-256color", "bash"] }
+},
+"terminal.integrated.defaultProfile.linux": "host-bash"
+\end{lst}
+\verify{In a new VS Code terminal, \code{which nasm} prints \code{/usr/bin/nasm}.}
+
+\task{Build the i686-elf cross compiler}
+The Fedora \code{gcc} produces programs for Linux. It assumes things that are false inside your kernel: that a C
+library exists, that the stack protector runtime is available, that code should be position-independent. A
+\textbf{cross compiler} targeting \code{i686-elf} assumes nothing. Follow the OSDev Wiki page \emph{GCC
+Cross-Compiler}. Download recent binutils and GCC sources from \url{https://ftp.gnu.org/gnu/}, then build each one in
+a separate build directory, never inside its source tree:
+
+\begin{lst}{sh}{build-cross.sh (outline; replace X.Y with the versions you downloaded)}
+export PREFIX="$HOME/opt/cross"
+export TARGET=i686-elf
+export PATH="$PREFIX/bin:$PATH"
+
+mkdir -p ~/src/build-binutils && cd ~/src/build-binutils
+../binutils-X.Y/configure --target=$TARGET --prefix="$PREFIX" \
+    --with-sysroot --disable-nls --disable-werror
+make -j"$(nproc)" && make install
+
+mkdir -p ~/src/build-gcc && cd ~/src/build-gcc
+../gcc-X.Y.Z/configure --target=$TARGET --prefix="$PREFIX" \
+    --disable-nls --enable-languages=c --without-headers
+make -j"$(nproc)" all-gcc all-target-libgcc
+make install-gcc install-target-libgcc
+\end{lst}
+
+Add \code{export PATH="$HOME/opt/cross/bin:$PATH"} to \code{~/.bashrc}. The GCC build takes 20--40 minutes.
+
+\begin{tipbox}[If the cross build fails]
+You can start Phase 1 with the host compiler while you fix it, as \LOB does. Use these flags and link with
+\code{ld -m elf_i386}. Switch to the cross compiler before Phase 3, because the host compiler's hidden assumptions
+cause bugs that are very hard to recognise.
+\begin{lst}{plain}{fallback CFLAGS for the host gcc}
+-m32 -ffreestanding -fno-pie -fno-stack-protector -fno-builtin -nostdlib -fcf-protection=none
+\end{lst}
+\end{tipbox}
+\verify{\code{i686-elf-gcc --version} and \code{i686-elf-ld --version} work in a fresh terminal.}
+
+\task{Create the repository skeleton}
+Create the project layout, initialise Git, and ignore build outputs. Commit early and often from now on: small
+commits let you bisect your way back to the last working kernel when something breaks.
+
+\begin{lst}{sh}{terminal}
+cd Turk-OS                     # your project folder
+mkdir -p boot kernel lib include tests tools user
+git init
+printf 'build/\n*.o\n*.elf\n*.bin\n*.iso\n*.img\n' > .gitignore
+git add . && git commit -m "Turk-OS: empty skeleton and study plan"
+\end{lst}
+\verify{\code{git log} shows your first commit.}
+
+\task{Write the C warm-up library, and test it on Linux}
+Write these functions from scratch, without the C library, in \code{lib/}. They are small, and every one of them
+reappears in the kernel. Compile them with the \emph{host} compiler for now and test them with \code{assert}, using the
+address and undefined-behaviour sanitizers to catch memory mistakes while you still have an OS to catch them.
+
+\begin{center}
+\small\renewcommand{\arraystretch}{1.25}
+\begin{tabularx}{\linewidth}{@{}l X l@{}}
+\toprule
+\tkth{File} & \tkth{Functions} & \tkth{Used again in} \\
+\midrule
+\code{string.c} & \code{memset}, \code{memcpy}, \code{memmove}, \code{memcmp}, \code{strlen}, \code{strcmp}, \code{strncpy} & Phase 2 (GCC may call these itself) \\
+\code{convert.c} & \code{utoa(value, buf, base)} for bases 10 and 16, \code{itoa} with sign & Phase 2 (\code{kprintf}) \\
+\code{bitmap.c} & \code{bitmap_set}, \code{bitmap_clear}, \code{bitmap_test}, \code{bitmap_find_first_clear} & Phase 5 (frame allocator) \\
+\code{ringbuf.c} & fixed-size byte ring buffer: \code{rb_put}, \code{rb_get}, \code{rb_empty}, \code{rb_full} & Phase 4 (keyboard) \\
+\code{list.h} & intrusive doubly linked list: \code{list_add}, \code{list_del}, \code{list_for_each} & Phases 7--8 (heap, tasks) \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\begin{lst}{sh}{terminal}
+gcc -std=gnu11 -Wall -Wextra -g -fsanitize=address,undefined \
+    -Iinclude tests/test_lib.c lib/*.c -o build/test_lib && ./build/test_lib
+\end{lst}
+\verify{All asserts pass with sanitizers enabled, including edge cases: zero-length copies, overlapping
+\code{memmove}, \code{utoa(0)}, \code{itoa(INT_MIN)}, a full ring buffer, the last bit of a bitmap.}
+
+\task{Read your first assembly}
+You will learn to write assembly in Phase 1, but you can start reading it today. Write three tiny functions (add two
+ints, sum an array, call another function) and look at what the compiler makes of them. Compare \code{-O0} with
+\code{-O2}, and keep the output in your journal as a phrase book.
+
+\begin{lst}{sh}{terminal}
+i686-elf-gcc -std=gnu11 -ffreestanding -O0 -S -masm=intel add.c -o add.s  # read add.s
+i686-elf-gcc -std=gnu11 -ffreestanding -O0 -c add.c -o add.o
+i686-elf-objdump -d -M intel add.o     # machine code next to the instructions
+i686-elf-readelf -S add.o              # the sections: .text .data .bss ...
+i686-elf-nm add.o                      # the symbols the linker will see
+\end{lst}
+\verify{You can point to where each function starts, where its argument is read from the stack, and which register
+holds the return value.}
+
+\task{Smoke-test QEMU and GDB}
+Start the emulated PC with nothing to boot: \code{qemu-system-i386}. You should see the SeaBIOS firmware try every
+device and report that there is no bootable disk. That screen is the \emph{exact} point where your code will take
+over in Phase 1. Also open the QEMU monitor (\code{Ctrl+Alt+2} in the window, or start with \code{-monitor stdio}) and
+run \code{info registers}.
+\verify{You can find the value of \code{EIP} and \code{CR0} in the \code{info registers} output.}
+
+\task{Start the lab journal}
+Create \code{docs/journal.md}. For every session, write down the date, what you tried, what happened, and what you
+learned. When a bug takes more than an hour, write down the hypothesis before each attempt. This feels slow and
+saves weeks.
+
+\section{Testing and debugging}
+
+Most problems in this phase are environment problems. The table covers the common ones.
+
+\begin{pitfalls}
+\code{nasm: command not found} in VS Code, but it works in a normal terminal & Flatpak sandbox (Task~0.2) & Use the host terminal profile or a normal terminal. \\
+GCC build stops with missing \code{gmp.h} or \code{mpfr.h} & Build dependencies missing & Install \code{gmp-devel mpfr-devel libmpc-devel}, rerun \code{configure}. \\
+\code{configure: error: building in source directory} & Built inside the source tree & Use a separate \code{build-gcc} directory. \\
+\code{i686-elf-gcc} found in one terminal, not another & \code{PATH} set only in that shell & Put the export in \code{~/.bashrc}; open a new terminal. \\
+Sanitizer reports \code{heap-buffer-overflow} in your \code{strncpy} & Off-by-one on the terminator & Good: this is why you test on Linux first. Fix it now, not inside a kernel. \\
+\end{pitfalls}
+
+\section{Milestone}
+
+\begin{milestonebox}[Workshop ready]
+\begin{checklist}
+  \item \code{i686-elf-gcc}, \code{i686-elf-ld}, \code{nasm}, \code{qemu-system-i386} and \code{gdb} run from your editor's terminal.
+  \item The Turk-OS repository exists with the skeleton folders and at least one commit.
+  \item The warm-up library passes its tests under AddressSanitizer and UBSan.
+  \item You have compiled C to assembly and can explain the output of a small function.
+  \item You have seen the SeaBIOS ``no bootable device'' screen and used \code{info registers}.
+  \item \code{docs/journal.md} has its first entries.
+\end{checklist}
+\end{milestonebox}
+
+\begin{questionbox}
+\begin{enumerate}
+  \item What are the three big ideas of \OSTEP, and which Turk-OS phases correspond to each?
+  \item What is the difference between kernel mode and user mode, and who enforces it?
+  \item Which C headers are still available in freestanding mode, and why exactly those?
+  \item What can the compiler do to a non-\code{volatile} pointer access that would break a device driver?
+  \item Why does the \code{.bss} section take no space in the ELF file? Who zeroes it?
+  \item Round \code{0x00123456} up to the next 4\,KiB boundary by hand.
+  \item Name two things the host GCC assumes that are false inside a kernel.
+\end{enumerate}
+\end{questionbox}
+
+\section{Going further}
+
+If you finish early, set up \code{clangd} or the VS Code C/C++ extension with a \code{compile_commands.json} so
+the editor understands your cross-compiled code (\code{bear -- make} generates the file). Work through the Makefile
+chapter of the GNU Make manual, especially automatic variables (\code{$@}, \code{$<}, \code{$^}) and pattern rules.
+Then read \MOS\,\S1.4 \emph{The Operating System Zoo} for the wider landscape.
+
+\nextphase{1}{x86 Assembly and the Boot Process}
+\booklegend
+\end{document}

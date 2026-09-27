@@ -1,0 +1,369 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{turkos}
+
+\begin{document}
+\phaseheader{13}{File Systems: VFS, initrd and TurkFS}{Turn a pile of numbered blocks into named files and directories, behind one interface that also covers devices and a read-only boot image}{83}{90}
+
+\ataglance{3--4 weeks}{5}{Phase 12: block devices and the buffer cache; Phase 11: processes, \code{fork}/\code{exec}; Phase 9: mutexes}{A
+virtual file system layer (in-memory inodes, open-file objects, per-process descriptor tables, path lookup, mount
+points), a read-only root file system from a tar archive, \code{/dev} with \code{tty}, \code{null}, \code{zero} and
+disks, and TurkFS: a writable on-disk file system in the MINIX V3 format that Linux's \code{fsck.minix} accepts as
+clean. System calls: \code{open}, \code{close}, \code{read}, \code{write}, \code{lseek}, \code{dup}, \code{dup2},
+\code{stat}, \code{fstat}, \code{getdents}, \code{mkdir}, \code{unlink}, \code{chdir}, \code{getcwd}.}
+
+\section{Why this phase}
+
+A disk is a very long array of blocks. Users want named files in a tree of directories that they can open, read,
+grow and delete, and that survive crashes. The \textbf{file system} bridges the two, and it is the largest subsystem
+you will write. It uses nearly everything from before: the buffer cache and block devices (Phase 12), processes and
+\code{fork} semantics (Phase 11), user-pointer checks (Phase 10), and mutexes, because file-system operations sleep on
+disk I/O while holding locks (Phase 9).
+
+The phase has two halves. The \textbf{VFS} (virtual file system) is the file-system-independent layer: file
+descriptors, open files, path names, mount points. It is what makes ``everything is a file'' possible in UNIX, since
+a terminal, a disk and a regular file all look the same to \code{read}. Below it you plug in concrete file systems:
+first a trivial read-only one for booting, then \textbf{TurkFS}, a real on-disk format with inodes, bitmaps and
+indirect blocks. TurkFS uses the MINIX V3 layout from \OSDI, so the book's figures describe your disk exactly, and
+Linux can check your images and even mount them.
+
+\section{Concepts you need}
+
+\subsection{Files, directories and descriptors}
+
+\OSTEP chapter 39 describes the interface. A \textbf{file} is an array of bytes with a low-level name, its
+\textbf{inode number}. A \textbf{directory} is a file whose contents are a list of (name, inode number) pairs, and
+directories nest into a tree. A process doesn't use inodes directly; \code{open} returns a small integer, the
+\textbf{file descriptor}, which indexes the process's descriptor table. Three levels of objects are involved
+(Figure~\ref{fig:vfs}), and keeping them apart is the key to getting \code{fork} and \code{dup} right. The descriptor
+table is per process. An \textbf{open file} records the current offset and access mode and can be shared, so after
+\code{fork} the parent and child share one offset. An \textbf{in-memory inode} exists once per file no matter how many
+times it is open.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[b/.style={draw=tkNavy!70, fill=tkLight, rounded corners=2pt, font=\sffamily\scriptsize, align=center, minimum height=0.9cm},
+  every node/.style={font=\sffamily\scriptsize}]
+  \node[b, fill=tkGreen!10, text width=2.2cm] (pa) at (0,1.0) {process A\\fd table: 0 1 2 \textbf{3}};
+  \node[b, fill=tkGreen!10, text width=2.2cm] (pb) at (0,-1.0) {process B (child of A)\\fd table: 0 1 2 \textbf{3}};
+  \node[b, fill=tkAmber!12, text width=2.3cm] (f) at (3.9,0) {\code{struct file}\\offset 4096, O\_RDWR\\refcnt 2};
+  \node[b, fill=tkBlue!10, text width=2.4cm] (i) at (7.6,0) {\code{struct inode}\\ino 57, size 9000\\refcnt 1, ops = TurkFS};
+  \node[b, fill=tkRed!8, text width=2.2cm] (sb) at (11.2,0.9) {mounted TurkFS\\superblock, bitmaps};
+  \node[b, fill=tkGray!15, text width=2.2cm] (bc) at (11.2,-0.9) {buffer cache and block device \code{hdb}};
+  \draw[tkarrow] (pa.east) -- (f); \draw[tkarrow] (pb.east) -- (f);
+  \draw[tkarrow] (f) -- (i); \draw[tkarrow] (i) -- (sb); \draw[tkarrow] (i) -- (bc);
+\end{tikzpicture}
+\caption{After \code{fork}, descriptor 3 in both processes refers to the same open file, and so to the same offset.}
+\label{fig:vfs}
+\end{figure}
+
+\subsection{How an on-disk file system is laid out}
+
+\OSTEP chapter 40 builds a very simple file system, \emph{vsfs}, and TurkFS is its real-world sibling. The disk is
+divided into regions: a \textbf{superblock} describing the whole file system, an \textbf{inode bitmap} and a
+\textbf{zone bitmap} marking which inodes and data blocks are in use, the \textbf{inode table}, and the \textbf{data}
+region (Figure~\ref{fig:layout}). MINIX calls data blocks \emph{zones}; with the settings you will use, a zone is
+exactly one 1\,KiB block (\OSDI\,\S5.6.2).
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[r/.style={draw=tkNavy!70, minimum height=0.9cm, font=\sffamily\scriptsize, align=center}]
+  \node[r, fill=tkGray!15, minimum width=1.1cm, anchor=west] (b0) at (0,0) {boot};
+  \node[r, fill=tkRed!10, minimum width=1.3cm, right=0pt of b0] (b1) {super-\\block};
+  \node[r, fill=tkAmber!14, minimum width=1.3cm, right=0pt of b1] (b2) {inode\\bitmap};
+  \node[r, fill=tkAmber!14, minimum width=1.3cm, right=0pt of b2] (b3) {zone\\bitmap};
+  \node[r, fill=tkBlue!10, minimum width=3.3cm, right=0pt of b3] (b4) {inode table\\(64-byte inodes, 16 per block)};
+  \node[r, fill=tkGreen!10, minimum width=5.0cm, right=0pt of b4] (b5) {data zones\\(file contents, directories, indirect blocks)};
+  \foreach \n/\t in {b0/0, b1/1, b2/2, b3/3, b4/4--174, b5/175--8191}
+    \node[font=\ttfamily\scriptsize, text=tkGray, above=1pt] at (\n.north) {\t};
+\end{tikzpicture}
+\caption{TurkFS on an 8\,MiB image, exactly as \code{mkfs.minix -3} lays it out: 2736 inodes, first data zone 175. Numbers are 1\,KiB block numbers.}
+\label{fig:layout}
+\end{figure}
+
+\begin{center}
+\small\renewcommand{\arraystretch}{1.2}
+\begin{tabularx}{\linewidth}{@{}l >{\raggedright\arraybackslash}X@{}}
+\toprule
+\tkth{Structure} & \tkth{Format (all little-endian)} \\
+\midrule
+superblock (at byte 1024) & \code{u32 s_ninodes; u16 pad; u16 s_imap_blocks; u16 s_zmap_blocks; u16 s_firstdatazone; u16 s_log_zone_size; u16 pad; u32 s_max_size; u32 s_zones; u16 s_magic (0x4D5A); u16 pad; u16 s_blocksize (1024); u8 s_disk_version} \\
+inode (64 bytes) & \code{u16 i_mode; u16 i_nlinks; u16 i_uid; u16 i_gid; u32 i_size; u32 i_atime, i_mtime, i_ctime; u32 i_zone[10]} \\
+directory entry (64 bytes) & \code{u32 inode; char name[60]} (name padded with zeros; inode 0 means an empty slot) \\
+bitmaps & bit $n$ of the inode map is inode $n$; bit $n$ of the zone map is zone $n + \code{s_firstdatazone} - 1$; bit 0 of both is reserved and always set \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\subsection{Finding a file's data}
+
+An inode has ten zone pointers (Figure~\ref{fig:inode}). The first seven point directly at data zones, so small files
+need nothing else. Pointer 7 points to a \textbf{single indirect} block holding 256 more zone numbers, and pointer 8 to
+a \textbf{double indirect} block holding 256 pointers to blocks of 256 zone numbers each. The tenth pointer (triple
+indirect) is reserved and TurkFS doesn't use it. \OSTEP\,\S40.3 and \OSDI\,\S5.6.4 explain the scheme, and \MOS\,\S4.3.2
+compares it with the alternatives: contiguous allocation, linked lists and FAT.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[zptr/.style={draw=tkNavy!70, fill=tkBlue!8, minimum width=2.4cm, minimum height=0.42cm, font=\ttfamily\scriptsize},
+  d/.style={draw=tkNavy!70, fill=tkGreen!12, minimum width=1.3cm, minimum height=0.42cm, font=\sffamily\scriptsize},
+  ind/.style={draw=tkNavy!70, fill=tkAmber!14, minimum width=1.9cm, minimum height=0.85cm, font=\sffamily\scriptsize, align=center}]
+  \node[font=\sffamily\scriptsize\bfseries] at (0,0.55) {inode};
+  \node[zptr] (z0) at (0,0) {i\_zone[0]};
+  \node[zptr, below=0pt of z0] (z1) {i\_zone[1..5]};
+  \node[zptr, below=0pt of z1] (z6) {i\_zone[6]};
+  \node[zptr, below=0pt of z6] (z7) {i\_zone[7]};
+  \node[zptr, below=0pt of z7] (z8) {i\_zone[8]};
+  \node[zptr, below=0pt of z8, fill=tkGray!12] (z9) {i\_zone[9] (unused)};
+  \node[d] (d0) at (3.3,0) {data};
+  \node[d] (d6) at (3.3,-0.84) {data};
+  \node[ind] (s) at (3.6,-2.0) {single indirect\\256 zone numbers};
+  \node[d] (sd) at (6.4,-2.0) {256 data zones};
+  \node[ind] (dd) at (3.6,-3.3) {double indirect\\256 pointers};
+  \node[ind] (dd2) at (6.6,-3.3) {256 blocks of\\256 zone numbers};
+  \node[d, minimum width=2.1cm] (ddd) at (9.6,-3.3) {65\,536 data zones};
+  \draw[tkarrow] (z0.east) -- (d0.west); \draw[tkarrow] (z6.east) -- (d6.west);
+  \draw[tkarrow] (z7.east) -- (s.west); \draw[tkarrow] (s) -- (sd);
+  \draw[tkarrow] (z8.east) -- (dd.west); \draw[tkarrow] (dd) -- (dd2); \draw[tkarrow] (dd2) -- (ddd);
+\end{tikzpicture}
+\caption{Zone pointers in a TurkFS inode, with 1\,KiB zones and 4-byte zone numbers.}
+\label{fig:inode}
+\end{figure}
+
+\subsection{Path lookup, and what it costs}
+
+To open \code{/bin/hello}, the kernel starts at the root inode (inode 1), reads the root directory's data and
+searches it for \code{bin}, reads inode \code{bin}, reads its data and searches for \code{hello}, then reads inode
+\code{hello}. \OSTEP\,\S40.4 draws this as a timeline of disk reads, and it is the best way to understand why caching
+matters: without the buffer cache, every \code{open} costs several disk reads just to walk the path.
+
+\subsection{Crashes}
+
+Creating a file changes several blocks: the inode bitmap, the inode, the directory, maybe the zone bitmap and a data
+block. If the machine stops half-way, the file system is left inconsistent: an inode marked used that no directory
+points to, or a zone used by two files. \OSTEP chapter 42 presents the two classic answers. \textbf{fsck} scans the
+whole disk after a crash and repairs it, which is simple but slow. \textbf{Journaling} writes a description of the
+change to a log first and replays it after a crash. TurkFS relies on \code{fsck.minix} on the host for now and orders
+its writes carefully (allocate, then initialise, then link), so a crash leaves at worst leaked blocks instead of
+corruption. A journal is a stretch goal.
+
+\section{Reading plan}
+
+\begin{readingplan}
+\must & \LOB & Ch.~12 \emph{File Systems}: a read-only file system, inodes, a virtual file system & 69--70 & The route of this phase in two pages. \\
+\must & \OSTEP & Ch.~39 \emph{Interlude: Files and Directories} & 457--476 & The interface: descriptors, offsets, \code{fork} and \code{dup} sharing, links. \\
+\must & \OSTEP & Ch.~40 \emph{File System Implementation} (vsfs, inodes, multi-level index, the access-path timeline, caching) & 477--494 & The design of TurkFS in miniature. \\
+\must & \OSTEP & Ch.~42 \emph{Crash Consistency: FSCK and Journaling} & 507--526 & Why write order matters. \\
+\must & \OSDI & \S5.6 \emph{Overview of the MINIX 3 File System}: messages, layout, bitmaps, i-nodes, block cache, directories and paths, descriptors, locking, pipes, the READ walkthrough & 548--566 & This is your on-disk format, explained by its designers. \\
+\should & \OSDI & \S5.7 \emph{Implementation of the MINIX 3 File System} & 566--606 & Working code for every operation in Tasks 13.5--13.8. \\
+\should & \MOS & \S4.1--4.3 \emph{Files}, \emph{Directories}, \emph{File-System Implementation} (incl.\ journaling and VFS) & 265--299 & Allocation methods compared; VFS in \S4.3.7. \\
+\should & \MOS & \S4.5 \emph{Example File Systems} (MS-DOS FAT, UNIX V7) & 320--331 & Two real designs next to yours. \\
+\should & \OSC & Ch.~13 \emph{File-System Interface}; \S14.1--14.5; \S15.5 \emph{Virtual File Systems} & 529--582, 603--605 & A thorough second treatment. \\
+\could & \OSTEP & Ch.~41 \emph{Locality and the Fast File System}; Ch.~43 \emph{Log-structured File Systems} & 495--506, 527--542 & How layout decisions affect speed. \\
+\could & \MOS & \S4.4 \emph{File-System Management and Optimization} & 299--320 & Block size, free-space tracking, consistency checks, caching. \\
+\end{readingplan}
+
+\begin{minixbox}
+The MINIX file system server in \texttt{servers/fs/} implements the exact format you are writing. Read it alongside
+your code: the superblock and bitmap allocation (\code{alloc_bit}, \code{free_bit}) in \texttt{super.c (23300)}; the
+in-memory inode table (\code{get_inode}, \code{put_inode}, \code{alloc_inode}) in \texttt{inode.c (22900)}; path
+lookup (\code{eat_path}, \code{advance}, \code{search_dir}) in \texttt{path.c (26300)}; file position to zone
+mapping (\code{read_map}) in \texttt{read.c (25000)}; \code{open} and \code{mkdir} in \texttt{open.c (24500)};
+descriptors in \texttt{filedes.c (23700)}. \OSDI\,\S5.6.10 traces one \code{read} call through all of it.
+\end{minixbox}
+
+\section{Build it}
+
+\task{The VFS objects}
+Define the three core structures. \code{struct inode} is the in-memory inode, file-system independent, with a table
+of operations that each file system fills in. \code{struct file} is an open file. A mounted file system is a
+\code{struct superblock} with its root inode. Keep in-memory inodes in a table keyed by (superblock, inode number), so
+each file has exactly one, with a reference count.
+
+\begin{lst}{c}{include/vfs.h}
+struct inode_ops {
+    int     (*lookup)(struct inode *dir, const char *name, struct inode **out);
+    int     (*create)(struct inode *dir, const char *name, uint16_t mode, struct inode **out);
+    int     (*mkdir)(struct inode *dir, const char *name, uint16_t mode);
+    int     (*unlink)(struct inode *dir, const char *name);
+    int     (*readdir)(struct inode *dir, uint32_t index, struct dirent *out);
+    int32_t (*read)(struct inode *ino, void *buf, uint32_t n, uint32_t off);
+    int32_t (*write)(struct inode *ino, const void *buf, uint32_t n, uint32_t off);
+    int     (*truncate)(struct inode *ino, uint32_t size);
+};
+
+struct inode {
+    uint32_t                ino;        /* number inside its file system        */
+    uint16_t                mode;       /* type bits (dir, file, device) + rwx  */
+    uint32_t                size;
+    int                     refcnt;     /* in-memory references                 */
+    struct superblock      *sb;
+    const struct inode_ops *ops;
+    struct mutex            lock;       /* held during operations that may sleep */
+    struct inode           *mounted;    /* root of a file system mounted here   */
+    void                   *priv;       /* file-system specific data            */
+};
+
+struct file {
+    struct inode *inode;
+    uint32_t      offset;
+    int           flags;                /* O_RDONLY, O_WRONLY, O_RDWR, O_APPEND */
+    int           refcnt;               /* descriptors pointing here            */
+};
+\end{lst}
+
+\task{Descriptors and the basic calls}
+Give each process a table of 32 \code{struct file} pointers. \code{open} resolves the path, allocates a
+\code{struct file} and returns the lowest free descriptor. \code{read} and \code{write} copy through a kernel buffer
+with \code{copy_to_user}/\code{copy_from_user} and advance the offset. \code{close} drops a reference. \code{dup} and
+\code{dup2} copy a pointer and increment the count. \code{fork} copies the whole table, incrementing every count;
+\code{exec} keeps it; \code{exit} closes everything. Keep using the Linux i386 numbers.
+
+\begin{center}
+\small\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{@{}l l l l l l@{}}
+\toprule
+\tkth{Call} & \tkth{No.} & \tkth{Call} & \tkth{No.} & \tkth{Call} & \tkth{No.} \\
+\midrule
+\code{open} & 5 & \code{lseek} & 19 & \code{stat} & 106 \\
+\code{close} & 6 & \code{mkdir} & 39 & \code{fstat} & 108 \\
+\code{unlink} & 10 & \code{dup} & 41 & \code{getdents} & 141 \\
+\code{chdir} & 12 & \code{dup2} & 63 & \code{getcwd} & 183 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\task{Devices as files}
+Write a tiny \code{devfs} and mount it at \code{/dev}. Its inodes carry device operations instead of disk data:
+\code{/dev/tty} reads a line from the keyboard and writes to the console; \code{/dev/null} discards writes and returns
+end-of-file; \code{/dev/zero} returns zeros; \code{/dev/hda} and \code{/dev/hdb} read and write their block devices. When
+the kernel starts \code{init}, it opens \code{/dev/tty} three times, so \code{init} and everything it starts inherit
+descriptors 0, 1 and 2. \code{sys_write} to descriptor 1 now goes through the VFS like any other file.
+
+\task{A read-only root from a tar archive}
+The simplest file system to parse is a tar archive in the POSIX \emph{ustar} format, so use one as the initial root.
+Each file is a 512-byte header followed by its contents padded to a multiple of 512 bytes, and the archive ends with
+two zero blocks. The header holds the name (100 bytes at offset 0, plus a prefix of 155 bytes at offset 345), the size
+as an octal ASCII string (12 bytes at offset 124), the type (one byte at 156: \code{'0'} for a file, \code{'5'} for a
+directory) and the magic \code{"ustar"} at offset 257. Build the archive from a \code{rootfs/} directory in the
+Makefile, load it as a boot module, and mount it at \code{/}. Now \code{execve} can take real paths.
+
+\begin{lst}{make}{Makefile (root archive)}
+$(BUILD)/initrd.tar: $(USER_PROGS) $(shell find rootfs -type f)
+	mkdir -p rootfs/bin && cp $(USER_PROGS) rootfs/bin/
+	tar --format=ustar -cf $@ -C rootfs .
+\end{lst}
+\verify{\code{execve("/bin/hello", ...)} loads the program from the archive, and \code{cat /etc/motd} (from the
+monitor for now) prints a file you put in \code{rootfs/etc/}.}
+
+\task{Path lookup}
+Write \code{namei(path, &inode)}. Start at the root for absolute paths and at the process's current directory
+otherwise, then take one component at a time: skip empty components (\code{//}), stay put on \code{.}, and call the
+directory's \code{lookup} for everything else, including \code{..}. When the result has a file system mounted on it,
+continue at that file system's root; when \code{..} is taken at the root of a mounted file system, go to the mount
+point's parent. Also write \code{nameiparent} (the directory and the last component), which \code{create}, \code{mkdir}
+and \code{unlink} need. Add \code{chdir} and \code{getcwd}.
+\verify{\code{/bin/../etc/./motd}, \code{//etc//motd} and a relative \code{etc/motd} from \code{/} all resolve to the
+same inode; \code{/dev/..} is \code{/}.}
+
+\task{TurkFS, reading}
+Create a file-system image on the host and attach it to QEMU as the primary slave (\code{hdb}); your ATA driver needs
+to select the slave with \code{0xF0} in the drive register. Mount it at \code{/mnt}. Read the superblock through the
+buffer cache and check the magic and block size; read inodes by number (inode $n$ is in block
+$2 + \text{imap} + \text{zmap} + (n-1)/16$, at offset $((n-1) \bmod 16) \times 64$); map a file offset to a zone through the direct,
+single and double indirect pointers; search directories entry by entry.
+
+\begin{lst}{sh}{terminal (host)}
+dd if=/dev/zero of=build/turkfs.img bs=1024 count=32768     # 32 MiB
+mkfs.minix -3 build/turkfs.img                               # MINIX V3 layout, 1 KiB blocks
+sudo mount -o loop build/turkfs.img /mnt                     # optional: put files on it
+sudo cp -r rootfs/* /mnt && sudo umount /mnt
+qemu-system-i386 ... -drive file=build/turkfs.img,format=raw,if=ide,index=1,media=disk
+\end{lst}
+\verify{\code{ls /mnt} (with the monitor, or a test program using \code{getdents}) lists what you copied from Linux,
+and reading a file larger than 263\,KiB gives the right contents, which exercises the double indirect block.}
+
+\task{TurkFS, writing}
+Now allocation. Find a free inode by scanning the inode bitmap; find a free zone by scanning the zone bitmap and
+remember the offset: bit $n$ is zone $n + \code{s_firstdatazone} - 1$. Implement \code{create} (allocate and
+initialise an inode, then add a directory entry), \code{write} (allocate zones and indirect blocks as the file grows,
+zeroing new blocks), \code{mkdir} (a new directory containing \code{.} and \code{..}, with the parent's link count
+incremented), \code{unlink} (remove the entry, decrement the link count, and free the inode and its zones when the
+count reaches zero and nobody has the file open), and \code{truncate}. Do every change through the buffer cache,
+marking buffers dirty, and order the writes so a crash leaves at worst leaked space: allocate, initialise, and only then
+link. Add a \code{sync} system call and flush all file systems at shutdown.
+\verify{After Turk-OS creates, writes and deletes files, shut it down cleanly and run
+\code{fsck.minix -f build/turkfs.img} on the host: it reports no errors and exits with status 0.}
+
+\task{stat, fstat and getdents}
+Define \code{struct stat} (device, inode, mode, link count, size, times) and \code{struct dirent} (inode number, name),
+and implement the three calls through the inode operations. These are what \code{ls} will use in Phase 14.
+
+\task{Tests}
+Add these to \code{make test}, running on a fresh image each time; after the run, \code{make test} also runs
+\code{fsck.minix} on the image.
+
+\begin{center}
+\small\renewcommand{\arraystretch}{1.25}
+\begin{tabularx}{\linewidth}{@{}l X@{}}
+\toprule
+\tkth{Test} & \tkth{What must hold} \\
+\midrule
+\code{many_files} & create 200 files with random contents, read them back, delete them; free inode and zone counts return to their starting values \\
+\code{big_file} & write and verify a 2\,MiB file (well into the double indirect range), then truncate it to 0 \\
+\code{dirs} & nested \code{mkdir}, removing directories, link counts of parents \\
+\code{paths} & \code{.}, \code{..}, \code{//}, relative paths, crossing into and out of \code{/mnt} and \code{/dev} \\
+\code{fd_sharing} & after \code{fork}, parent and child share an offset; after \code{dup2}, two descriptors share one; closing one leaves the other working \\
+\code{readonly_root} & writing to the tar root fails with \code{-EROFS} \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\section{Testing and debugging}
+
+When the on-disk format goes wrong, compare with what Linux sees. Mount the image read-only on the host
+(\code{sudo mount -o loop,ro}) and look around, run \code{fsck.minix -fsv} for a detailed report, and dump raw blocks
+with \code{hexdump -C -s $((BLOCK*1024)) -n 1024 build/turkfs.img}.
+
+\begin{pitfalls}
+\code{fsck.minix} reports zones marked in use but not used, or the reverse & The zone bitmap offset is wrong & Bit $n$ is zone $n + \code{s_firstdatazone} - 1$, not zone $n$. \\
+Directory listing shows garbage names or skips entries & Inode 0 slots not skipped, or names treated as NUL-terminated when they are exactly 60 bytes & Skip entries with inode 0; copy at most 60 bytes and terminate yourself. \\
+Wrong inode read & Inode numbers start at 1 & Use $n-1$ when computing the block and offset. \\
+Writes vanish after reboot & Buffers not marked dirty, or no \code{sync} at shutdown & \code{bdirty} after every change; flush in the shutdown path. \\
+After \code{fork}, the two processes read the file independently & The descriptor table was deep-copied into new \code{struct file} objects & Copy pointers and increment counts; they must share the offset. \\
+Deadlock while creating a file & A directory inode lock and a buffer lock taken in different orders in different paths & Add the file-system locks to the lock order from Phase 9: inode, then buffer. \\
+\end{pitfalls}
+
+\section{Milestone}
+
+\begin{milestonebox}[Files and directories]
+\begin{checklist}
+  \item The VFS resolves paths across \code{/} (tar), \code{/dev} (devfs) and \code{/mnt} (TurkFS).
+  \item Every process has descriptors 0--2 on \code{/dev/tty}; \code{fork}, \code{dup2} and \code{exec} handle descriptors correctly.
+  \item Programs are loaded by path from the file system.
+  \item TurkFS reads and writes files and directories, and \code{fsck.minix -f} on the host finds no errors.
+  \item All file-system tests pass, including the 2\,MiB file.
+\end{checklist}
+\end{milestonebox}
+
+\begin{questionbox}
+\begin{enumerate}
+  \item List the disk reads needed to open and read \code{/home/turk/notes.txt} with an empty cache, following \OSTEP\,\S40.4.
+  \item What is the largest file TurkFS can hold with seven direct zones, one single and one double indirect block, 1\,KiB zones and 4-byte zone numbers?
+  \item What is the difference between a file descriptor, an open file and an inode? Which of them does \code{fork} copy?
+  \item What does the VFS layer buy you? Name three things in Turk-OS that would be harder without it.
+  \item Why is crash consistency hard? In what order should \code{create} write its blocks, and why?
+  \item What is the difference between a hard link and a symbolic link? How does the link count relate to \code{unlink}?
+\end{enumerate}
+\end{questionbox}
+
+\section{Going further}
+
+Make TurkFS the root file system and keep the tar archive only for early boot. Add a simple metadata journal
+(\OSTEP\,\S42.3): write the blocks of each operation to a log region first, then a commit block, then apply them, and
+replay the log at mount. Write a FAT16 driver (\MOS\,\S4.5.1) so Turk-OS can read USB-stick images made on any
+computer. Or add symbolic links, \code{rename}, and file permissions checked against the process's user ID, which
+Phase 15 builds on.
+
+\nextphase{14}{Userland: libc, Shell and Utilities}
+\booklegend
+\end{document}

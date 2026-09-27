@@ -1,0 +1,324 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{turkos}
+
+\begin{document}
+\phaseheader{7}{Kernel Heap and Core Data Structures}{Give the kernel malloc and free, a reusable linked list, and an automated test run that guards everything you have built so far}{42}{48}
+
+\ataglance{1--2 weeks}{3}{Phase 6: paging, the direct map, the VMM, pre-allocated kernel page tables}{Whole-page allocation
+through the direct map, a growable kernel heap with \code{kmalloc}, \code{kfree}, \code{kcalloc} and \code{krealloc}
+(first fit, splitting, coalescing, corruption checks), an intrusive doubly linked list, and \code{make test}, which
+boots a headless QEMU, runs every test and exits with pass or fail.}
+
+\section{Why this phase}
+
+The next phases create objects whose number and size you can't know in advance: a task structure for every thread,
+a file object for every \code{open}, a buffer for every disk block, a copy of every path name. They need a general
+allocator, and the PMM only hands out whole 4\,KiB frames. The kernel heap sits on top of the PMM and the VMM and
+cuts pages into objects of any size.
+
+Writing an allocator is also the best practice you can get for the kind of code that fills a kernel: pointer
+arithmetic, invariants that must hold after every operation, and bugs that show up far from where they were made.
+That is why this phase also builds the automated test run. From now on, one command boots Turk-OS without a window,
+runs every test, and tells you in seconds whether today's change broke something from three phases ago.
+
+\section{Concepts you need}
+
+\subsection{Free-space management}
+
+\OSTEP chapter 17 is the core reading. An allocator manages a region as a sequence of \textbf{blocks}, each with a
+small \textbf{header} in front of the memory it hands out. The header records the block's size and whether it is
+free, so \code{kfree(p)} can find it from the pointer alone by stepping back one header. To allocate, the allocator
+searches the free blocks for one that is large enough, according to a \textbf{strategy}: first fit (the first one
+that fits), best fit (the smallest that fits), or next fit (first fit starting where the last search stopped). If the
+chosen block is much larger than needed, it \textbf{splits} it. When a block is freed next to another free block, it
+\textbf{coalesces} them into one, otherwise memory breaks into fragments that are each too small to use
+(Figure~\ref{fig:heap}).
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[h/.style={draw=tkNavy!70, fill=tkNavy!15, minimum height=0.7cm, minimum width=0.7cm, font=\sffamily\tiny},
+  u/.style={draw=tkNavy!70, fill=tkRed!10, minimum height=0.7cm, font=\sffamily\scriptsize},
+  f/.style={draw=tkNavy!70, fill=tkGreen!12, minimum height=0.7cm, font=\sffamily\scriptsize}]
+  \node[font=\sffamily\scriptsize\bfseries, anchor=east] at (-0.2,0) {before \code{kfree(B)}};
+  \node[h, anchor=west] (h1) at (0,0) {hdr};
+  \node[f, minimum width=2.2cm, right=0pt of h1] (a) {A: free};
+  \node[h, right=0pt of a] (h2) {hdr};
+  \node[u, minimum width=2.6cm, right=0pt of h2] (b) {B: in use};
+  \node[h, right=0pt of b] (h3) {hdr};
+  \node[f, minimum width=1.8cm, right=0pt of h3] (c) {C: free};
+  \node[h, right=0pt of c] (h4) {hdr};
+  \node[u, minimum width=2.0cm, right=0pt of h4] (d) {D: in use};
+  \node[font=\sffamily\scriptsize\bfseries, anchor=east] at (-0.2,-1.3) {after coalescing};
+  \node[h, anchor=west] (g1) at (0,-1.3) {hdr};
+  \node[f, minimum width=8.7cm, right=0pt of g1] (abc) {one free block: A + header + B + header + C};
+  \node[h, right=0pt of abc] (g4) {hdr};
+  \node[u, minimum width=2.0cm, right=0pt of g4] (d2) {D: in use};
+  \draw[tkarrow] (b.south) -- ([yshift=-0.3cm]b.south) -- ([yshift=0.1cm]abc.north -| b.south);
+\end{tikzpicture}
+\caption{Freeing B between two free neighbours merges all three into a single block. Without coalescing, a request larger than A, B or C alone would fail.}
+\label{fig:heap}
+\end{figure}
+
+\subsection{Kernel allocators in practice}
+
+Real kernels usually combine several allocators, and \OSC\,\S10.8 describes the two classic ones. The \textbf{buddy
+system} manages power-of-two blocks that can split in half and merge back cheaply. \textbf{Slab allocation} keeps a
+cache of ready-made objects of one type (say, every \code{struct task}), which avoids fragmentation and
+re-initialisation. Turk-OS uses a simple layered scheme that is easy to get right and easy to replace later. Whole
+pages come straight from the PMM through the direct map: \code{kalloc_page()} is just \code{P2V(pmm_alloc_frame())},
+and it gives you page-aligned memory for page tables and similar structures. Everything smaller comes from the heap,
+a first-fit list in the virtual region \code{0xE0000000}--\code{0xEFFFFFFF} that grows by mapping new frames as needed.
+
+\subsection{Intrusive lists}
+
+A textbook linked list allocates a separate node that points at the data. Kernels usually do it the other way round:
+the list links live \emph{inside} the object (\code{struct task} contains a \code{struct list_node}), and a macro,
+\code{container_of}, gets from a pointer to the embedded node back to the object that contains it. The list code never
+allocates memory, an object can sit on several lists at once, and a single generic implementation serves every list
+in the kernel. The same design is used throughout Linux, and \OSC\,\S1.9 covers the standard kernel data structures
+in general.
+
+\subsection{Testing a kernel automatically}
+
+QEMU has a tiny virtual device made for testing, \code{isa-debug-exit}. When the guest writes a value $v$ to its I/O
+port, QEMU exits immediately with status $2v + 1$. A kernel started with a \code{test} command line can run every
+test, print the results on the serial port, and write 0 (exit status 1, meaning success) or 1 (status 3, failure) to
+the port. A Makefile target turns that into an ordinary pass or fail, which you can run before every commit.
+
+\section{Reading plan}
+
+\begin{readingplan}
+\must & \OSTEP & Ch.~17 \emph{Free-Space Management} (re-read with the implementation in mind: headers, free list, splitting, coalescing, strategies, segregated lists, buddy) & 161--178 & The design of Tasks 7.2--7.4. \\
+\must & \OSTEP & Ch.~14 \emph{Interlude: Memory API} & 123--134 & Every bug in its list is something your heap must detect. \\
+\must & \LOB & Ch.~10, section \emph{A Kernel Heap} & 63 & Short, and points to the same options. \\
+\should & \OSC & \S10.8 \emph{Allocating Kernel Memory} (buddy system, slab allocation) & 426--430 & What production kernels do, and why. \\
+\should & \OSC & \S1.9 \emph{Kernel Data Structures} & 36--40 & Lists, queues, trees, hash maps, bitmaps in kernels. \\
+\could & \MOS & \S3.2.3 \emph{Managing Free Memory} & 190--194 & First, next, best, worst and quick fit compared. \\
+\could & \MOS & \S1.8.3 \emph{Large Programming Projects} & 75--76 & Your source tree is growing; organise headers and objects now. \\
+\end{readingplan}
+
+\begin{minixbox}
+The MINIX 3 kernel has no heap at all. Every table has a fixed size chosen at compile time: the process table is the
+array \code{proc[NR_TASKS + NR_PROCS]} declared in \texttt{kernel/proc.h (05500)}, and \texttt{kernel/table.c
+(06000)} holds other static tables. That makes memory use predictable and removes a whole class of allocator bugs, at
+the price of hard limits on processes, open files and so on. Turk-OS takes the other road, but you could still use
+fixed tables for some objects. Think about which one you would choose for the process table, and why.
+\end{minixbox}
+
+\section{Build it}
+
+\task{Whole pages from the direct map}
+Add \code{kalloc_page()} and \code{kfree_page()}. Because the direct map covers all usable RAM, a frame from the PMM
+is already reachable at \code{P2V(frame)}, so these are two one-line functions. Zero pages on allocation while you
+are debugging, so you never read stale data.
+
+\begin{lst}{c}{kernel/mm/kalloc.c}
+void *kalloc_page(void)
+{
+    uintptr_t pa = pmm_alloc_frame();
+    if (!pa)
+        return NULL;
+    void *va = P2V(pa);
+    memset(va, 0, PAGE_SIZE);
+    return va;
+}
+
+void kfree_page(void *va)
+{
+    ASSERT(((uintptr_t)va & (PAGE_SIZE - 1)) == 0);
+    pmm_free_frame(V2P(va));
+}
+\end{lst}
+
+\task{A heap region that grows}
+Reserve \code{KHEAP_START = 0xE0000000} and \code{KHEAP_MAX = 0xF0000000}. Keep a \code{heap_end} pointer, and write
+\code{ksbrk(n)}, which maps enough fresh frames to extend the heap by at least $n$ bytes and returns the old end.
+The page tables for this region already exist (Phase 6), so no kernel PDE ever changes.
+\verify{Call \code{ksbrk(10000)} twice and check with \code{info mem} that three pages, then six, are mapped from
+\code{0xE0000000}.}
+
+\task{kmalloc and kfree}
+Implement first fit with splitting and coalescing over a doubly linked list of blocks kept in address order. Make the
+header a multiple of 16 bytes and round every request up to 16, so every pointer you return is 16-byte aligned. Put a
+magic number in each header: it catches most buffer overflows and bad frees the moment they happen.
+
+\begin{lst}{c}{kernel/mm/heap.c}
+#define HEAP_MAGIC 0xC0FFEE42u
+#define ALIGN16(x) (((x) + 15) & ~(size_t)15)
+
+struct block {
+    uint32_t      magic;
+    uint32_t      size;        /* payload size in bytes, a multiple of 16  */
+    uint32_t      free;
+    uint32_t      pad;
+    struct block *next;        /* neighbours in address order              */
+    struct block *prev;
+    uint32_t      pad2[2];
+};                             /* 32 bytes: payload stays 16-byte aligned  */
+_Static_assert(sizeof(struct block) % 16 == 0, "header must keep alignment");
+
+void *kmalloc(size_t size)
+{
+    if (size == 0)
+        return NULL;
+    size = ALIGN16(size);
+    for (;;) {
+        for (struct block *b = heap_head; b; b = b->next) {
+            if (b->free && b->size >= size) {
+                split_block(b, size);          /* only if the rest can hold a header + 16 */
+                b->free = 0;
+                return b + 1;                  /* payload starts right after the header   */
+            }
+        }
+        if (!grow_heap(size + sizeof(struct block)))
+            return NULL;                       /* out of memory */
+    }
+}
+
+void kfree(void *p)
+{
+    if (!p)
+        return;
+    struct block *b = (struct block *)p - 1;
+    ASSERT(b->magic == HEAP_MAGIC);            /* bad pointer or corrupted header */
+    ASSERT(!b->free);                          /* double free                     */
+    b->free = 1;
+    coalesce(b);                               /* merge with free neighbours      */
+}
+\end{lst}
+\verify{Allocate three blocks, free the middle one, then the first: \code{heap_check()} (next task) finds one free
+block covering both, not two.}
+
+\task{The rest of the API, and a heap checker}
+Add \code{kcalloc} (allocate and zero), \code{krealloc} (grow in place when the next block is free and large enough,
+otherwise allocate, copy and free) and \code{kmalloc_stats()}. Then write \code{heap_check()}, which walks every block
+and asserts the invariants: every magic is correct, \code{b->next->prev == b}, blocks are in address order and touch
+each other exactly, and no two free blocks are adjacent. Add a monitor command \code{heap} that prints the block
+count, bytes in use and free, and the largest free block.
+\verify{\code{heap_check()} passes after each step of every test in Task~7.7.}
+
+\task{An intrusive list}
+Write \code{include/list.h} with a circular doubly linked list and a dummy head node, which removes every special
+case for empty lists and list ends. Phase 8 builds the scheduler's queues on it, and many later structures follow.
+
+\begin{lst}{c}{include/list.h}
+#include <stddef.h>
+
+struct list_node { struct list_node *next, *prev; };
+
+#define container_of(ptr, type, member) \
+    ((type *)((char *)(ptr) - offsetof(type, member)))
+
+static inline void list_init(struct list_node *head) { head->next = head->prev = head; }
+static inline int  list_empty(const struct list_node *head) { return head->next == head; }
+
+static inline void list_add_tail(struct list_node *head, struct list_node *n)
+{
+    n->prev = head->prev;
+    n->next = head;
+    head->prev->next = n;
+    head->prev = n;
+}
+
+static inline void list_del(struct list_node *n)
+{
+    n->prev->next = n->next;
+    n->next->prev = n->prev;
+    n->next = n->prev = NULL;      /* makes use-after-remove crash loudly */
+}
+
+#define list_for_each(pos, head) \
+    for ((pos) = (head)->next; (pos) != (head); (pos) = (pos)->next)
+\end{lst}
+\verify{A test puts five structs on a list, removes the second and fourth, and walks it with \code{container_of}
+to check the remaining values and their order.}
+
+\task{make test}
+Add \code{outl} to \code{io.h}. In \code{kmain}, look at the Multiboot command line: if it contains \code{test}, run
+the whole suite, print a summary on serial, and exit QEMU through \code{isa-debug-exit}. Then add the Makefile target.
+A timeout protects you from a test that hangs.
+
+\begin{lst}{c}{kernel/kmain.c (test mode)}
+static inline void qemu_exit(uint32_t v) { outl(0xF4, v); }   /* QEMU exits with 2v+1 */
+
+if (cmdline_has(mbi, "test")) {
+    int failed = ktest_run_all();          /* prints PASS/FAIL per test on serial */
+    qemu_exit(failed ? 1 : 0);
+}
+\end{lst}
+
+\begin{lst}{make}{Makefile (test target)}
+QEMU_TEST := qemu-system-i386 -kernel $(BUILD)/kernel.elf -append "test" \
+             -display none -serial stdio -no-reboot \
+             -device isa-debug-exit,iobase=0xf4,iosize=0x04
+
+test: $(BUILD)/kernel.elf
+	@timeout 120 $(QEMU_TEST); status=$$?; \
+	if [ $$status -eq 1 ]; then echo "ALL TESTS PASSED"; \
+	else echo "TESTS FAILED (status $$status)"; exit 1; fi
+\end{lst}
+\verify{\code{make test} prints every test result and \code{ALL TESTS PASSED}. Break one test on purpose and
+check that the target now fails with status 3.}
+
+\task{Stress the heap}
+Write a randomised test with a small pseudo-random generator (xorshift is enough). Keep 256 slots. At each of 10\,000
+steps pick a slot: if it is empty, allocate a random size from 1 to 4096 bytes and fill it with the slot's number; if
+it is full, check that the fill pattern is intact and free it. Run \code{heap_check()} every 100 steps. At the end,
+free everything and check that bytes in use is zero and that the heap is one free block again.
+\verify{The stress test passes, is deterministic for a given seed, and is part of \code{make test}.}
+
+\task{A slab cache (optional)}
+Add \code{kmem_cache_create(name, object_size)}, \code{kmem_cache_alloc} and \code{kmem_cache_free}: each cache takes
+whole pages from \code{kalloc_page} and cuts them into equal objects linked on a free list. Use it for
+\code{struct task} in Phase 8 and compare the heap statistics with and without it.
+
+\section{Testing and debugging}
+
+\begin{pitfalls}
+\code{ASSERT(b->magic == HEAP_MAGIC)} fails in \code{kfree} & A buffer overflow in the previous block overwrote this header, or a pointer that didn't come from \code{kmalloc} was freed & Print the neighbouring headers; check the caller's sizes. Red zones (Going further) pinpoint the overflow. \\
+Returned pointers are not 16-byte aligned & The header size, or a split size, is not a multiple of 16 & Keep the \code{_Static_assert}; round the split size up. \\
+The heap keeps growing although usage is flat & Coalescing misses a case, so blocks fragment & \code{heap_check()} asserting ``no two adjacent free blocks'' finds it. \\
+List corruption after removing a block & A \code{prev} pointer not updated in split or coalesce & Assert \code{b->next->prev == b} in \code{heap_check()}. \\
+\code{make test} hangs forever & A test waits for a key, or the kernel crashed without reaching \code{qemu_exit} & The timeout catches it; make \code{panic} call \code{qemu_exit(1)} in test mode too. \\
+\end{pitfalls}
+
+\begin{warnbox}[A rule for later phases]
+Don't call \code{kmalloc} or \code{kfree} from interrupt handlers. Once Phase 8 adds preemption and Phase 9 adds locks,
+an interrupt that arrives while the heap lock is held would deadlock if its handler tried to take the same lock.
+Interrupt handlers should use memory allocated in advance.
+\end{warnbox}
+
+\section{Milestone}
+
+\begin{milestonebox}[The kernel can allocate]
+\begin{checklist}
+  \item \code{kalloc_page}/\code{kfree_page} and \code{kmalloc}/\code{kfree}/\code{kcalloc}/\code{krealloc} work, with 16-byte alignment.
+  \item Magic numbers catch double frees and bad pointers; \code{heap_check()} verifies every invariant.
+  \item The 10\,000-step stress test passes, and all memory returns to the heap at the end.
+  \item \code{list.h} is tested and ready for the scheduler.
+  \item \code{make test} runs headless and fails loudly when any test fails.
+\end{checklist}
+\end{milestonebox}
+
+\begin{questionbox}
+\begin{enumerate}
+  \item How does \code{kfree(p)} know how big the block is?
+  \item What is coalescing, when does it happen, and what goes wrong without it?
+  \item First fit or best fit: which fragments memory faster, and which searches faster?
+  \item Why can't \code{kmalloc} hand out whole pages for page tables? What does Turk-OS use instead?
+  \item How does a slab allocator reduce both fragmentation and initialisation cost?
+  \item What exactly does \code{container_of} compute? Write it out for a \code{struct task} whose list node is at offset 24.
+\end{enumerate}
+\end{questionbox}
+
+\section{Going further}
+
+Add a debug mode with \textbf{red zones}: a few guard bytes with a known value after each allocation, checked on
+\code{kfree}, which pinpoints overflows. Fill freed memory with \code{0xDEADBEEF} so use-after-free shows up as
+obviously wrong values. Record the caller of every allocation with \code{__builtin_return_address(0)} and add a
+\code{leaks} command that lists live allocations by caller. Or replace first fit with segregated free lists (one list
+per size class), and measure the difference with the stress test.
+
+\nextphase{8}{Processes, Context Switching and Scheduling}
+\booklegend
+\end{document}

@@ -1,0 +1,479 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{turkos}
+
+\begin{document}
+\phaseheader{1}{x86 Assembly and the Boot Process}{Learn enough assembly to read and write kernel glue code, and follow a PC from power-on to your first instruction}{5}{10}
+
+\ataglance{2--3 weeks}{3}{Phase 0 complete: cross toolchain, NASM, QEMU, GDB}{A NASM ``phrase book'' in your journal, two
+assembly functions called from C, a 512-byte boot sector that prints a message, and a Multiboot kernel that both
+\code{qemu -kernel} and a GRUB ISO boot. You will prove it runs by finding \code{0xCAFEBABE} in \code{EAX}.}
+
+\section{Why this phase}
+
+You don't need to become an assembly programmer to write an operating system. Turk-OS will contain a few hundred
+lines of assembly in total. But those lines do the things C cannot do: set up the very first stack, load descriptor
+tables, save and restore registers on an interrupt, switch between processes, and drop into user mode. If you can't
+read them, you can't debug them. And the only way to see what is really happening when the kernel crashes is to
+read the machine state in terms of registers, the stack and instructions.
+
+The second half of the phase answers a question that feels like magic until you see it: how does a PC go from
+power-on to running \emph{your} code? You will follow that path once by hand, writing a boot sector the BIOS loads
+directly, and then hand the job to GRUB, which is what Turk-OS will use from here on.
+
+\section{Concepts you need}
+
+\subsection{Registers}
+
+The 32-bit x86 CPU has eight general-purpose registers. Each can be used as a whole (32 bits) or, for the first
+four, in smaller pieces that keep their names from the 8086 era (Figure~\ref{fig:eax}). The remaining registers
+have fixed jobs, and several of them will get a phase of their own.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[x=0.36cm, y=1cm]
+  \draw[draw=tkNavy!70, fill=tkGray!10] (0,0) rectangle (16,0.7);
+  \draw[draw=tkNavy!70, fill=tkBlue!12] (16,0) rectangle (24,0.7);
+  \draw[draw=tkNavy!70, fill=tkRed!10] (24,0) rectangle (32,0.7);
+  \node[font=\sffamily\scriptsize, text=tkGray] at (8,0.35) {upper 16 bits (no separate name)};
+  \node[font=\sffamily\small\bfseries] at (20,0.35) {AH};
+  \node[font=\sffamily\small\bfseries] at (28,0.35) {AL};
+  \foreach \x/\b in {0.5/31, 15.5/16, 16.5/15, 23.5/8, 24.5/7, 31.5/0}
+    \node[font=\sffamily\scriptsize, text=tkGray] at (\x,0.95) {\b};
+  \draw[decorate, decoration={brace, amplitude=5pt, mirror}, tkNavy, line width=0.6pt] (16,-0.1) -- (32,-0.1)
+    node[midway, below=5pt, font=\sffamily\small\bfseries] {AX (16 bits)};
+  \draw[decorate, decoration={brace, amplitude=6pt, mirror}, tkRed, line width=0.6pt] (0,-0.75) -- (32,-0.75)
+    node[midway, below=6pt, font=\sffamily\small\bfseries, text=tkRed] {EAX (32 bits)};
+\end{tikzpicture}
+\caption{One register, four names. The same split applies to EBX, ECX and EDX.}
+\label{fig:eax}
+\end{figure}
+
+\begin{center}
+\small\renewcommand{\arraystretch}{1.25}
+\begin{tabularx}{\linewidth}{@{}l >{\raggedright\arraybackslash}X >{\raggedright\arraybackslash}X@{}}
+\toprule
+\tkth{Register(s)} & \tkth{Job} & \tkth{Where Turk-OS uses it} \\
+\midrule
+EAX, EBX, ECX, EDX & general purpose; EAX holds function return values & everywhere; EAX also carries the system call number (Phase 10) \\
+ESI, EDI & general purpose; source and destination for string instructions & copying memory \\
+ESP & stack pointer: address of the top of the stack & set up before any C runs (Phase 2); swapped on every context switch (Phase 8) \\
+EBP & frame pointer: base of the current function's stack frame & walking the stack for backtraces (Phase 3) \\
+EIP & instruction pointer: address of the next instruction & printed in every crash report \\
+EFLAGS & condition flags (zero, carry, sign...) and the interrupt flag IF & \code{cli}/\code{sti} (Phase 4) \\
+CS, DS, SS, ES, FS, GS & segment selectors & loaded from your own GDT (Phase 3) \\
+CR0, CR2, CR3, CR4 & control registers: protected mode, paging, fault address & paging (Phase 6) \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\subsection{A small instruction vocabulary}
+
+About twenty instructions cover nearly all the assembly in this project. NASM uses Intel syntax, where the
+destination comes first: \code{mov eax, 5} means \code{eax = 5}. Square brackets mean ``the memory at this address'':
+\code{mov eax, [ebx+4]} reads four bytes starting at address \code{ebx+4}. When the size is ambiguous, say it:
+\code{mov dword [eax], 0}.
+
+\begin{center}
+\small\renewcommand{\arraystretch}{1.2}
+\begin{tabularx}{\linewidth}{@{}l X l@{}}
+\toprule
+\tkth{Instruction} & \tkth{Meaning} & \tkth{C equivalent} \\
+\midrule
+\code{mov dst, src} & copy a value & \code{dst = src;} \\
+\code{add}, \code{sub}, \code{inc}, \code{dec} & arithmetic; results set EFLAGS & \code{a += b; a--;} \\
+\code{and}, \code{or}, \code{xor}, \code{not}, \code{shl}, \code{shr} & bitwise operations and shifts & \code{a &= m; a <<= 2;} \\
+\code{cmp a, b} then \code{je}/\code{jne}/\code{jl}/\code{jg}/\code{jge} & compare (a subtraction that only sets flags), then jump on the result & \code{if (a == b) goto L;} \\
+\code{test a, a} then \code{jz} & bitwise AND that only sets flags; common zero check & \code{if (a == 0) goto L;} \\
+\code{jmp label} & unconditional jump & \code{goto label;} \\
+\code{push x}, \code{pop x} & \code{esp -= 4; [esp] = x} and the reverse & (the call stack) \\
+\code{call f}, \code{ret} & push the return address and jump; pop it and jump back & \code{f();} \code{return;} \\
+\code{lea eax, [ebx+ecx*4]} & compute an address without reading memory & \code{eax = &ebx[ecx];} \\
+\code{in al, dx}, \code{out dx, al} & read or write an I/O port & (device access, Phase 2) \\
+\code{cli}, \code{sti}, \code{hlt} & disable or enable interrupts; halt until the next interrupt & (Phase 4) \\
+\code{int n}, \code{iret} & software interrupt; return from an interrupt handler & (Phases 3 and 10) \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\subsection{The stack and the cdecl calling convention}
+
+C code compiled for 32-bit x86 follows the \textbf{cdecl} convention, and your assembly must follow it too whenever
+it calls C or is called from C. The caller pushes the arguments \emph{right to left}, then executes \code{call},
+which pushes the return address. Inside the callee, the first argument is therefore at \code{[esp+4]}, the second at
+\code{[esp+8]}, and so on. The return value goes in EAX. The callee may freely overwrite EAX, ECX and EDX
+(\emph{caller-saved}), but must restore EBX, ESI, EDI, EBP and ESP before returning (\emph{callee-saved}). The caller
+removes the arguments afterwards. Most functions start by saving EBP and pointing it at their frame, so arguments
+sit at fixed offsets from EBP (Figure~\ref{fig:frame}). Remember the callee-saved list: it is the reason the context
+switch in Phase 8 only saves four registers.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[slot/.style={draw=tkNavy!70, minimum width=4.2cm, minimum height=0.62cm, font=\sffamily\small, fill=tkLight},
+  lab/.style={font=\ttfamily\small, anchor=west}]
+  \node[slot] (b) at (0,0) {argument \code{b}};
+  \node[slot, below=0pt of b] (a) {argument \code{a}};
+  \node[slot, below=0pt of a, fill=tkAmber!12] (ra) {return address};
+  \node[slot, below=0pt of ra, fill=tkBlue!10] (bp) {saved EBP};
+  \node[slot, below=0pt of bp] (l1) {local variable};
+  \node[slot, below=0pt of l1, fill=white] (l2) {\dots};
+  \node[lab] at ([xshift=4pt]b.east) {[ebp+12]};
+  \node[lab] at ([xshift=4pt]a.east) {[ebp+8]};
+  \node[lab] at ([xshift=4pt]ra.east) {[ebp+4]};
+  \node[lab] at ([xshift=4pt]bp.east) {[ebp]  $\leftarrow$ EBP};
+  \node[lab] at ([xshift=4pt]l1.east) {[ebp-4]};
+  \node[lab] at ([xshift=4pt]l2.east) {$\leftarrow$ ESP};
+  \draw[tkarrow] ([xshift=-10pt]b.north west) -- ([xshift=-10pt]l2.south west) node[midway, left, tknote, text width=1.8cm] {stack grows toward lower addresses};
+  \draw[decorate, decoration={brace, amplitude=4pt}, tkGray] ([xshift=3.3cm]b.north east) -- ([xshift=3.3cm]a.south east) node[midway, right=5pt, tknote] {pushed by caller};
+\end{tikzpicture}
+\caption{Stack frame inside \code{f(a, b)} after \code{push ebp; mov ebp, esp}. Higher addresses are at the top.}
+\label{fig:frame}
+\end{figure}
+
+\subsection{Real mode, protected mode, and how a PC boots}
+
+An x86 CPU wakes up in \textbf{real mode}, pretending to be a 1978 8086: 16-bit registers, addresses formed as
+\code{segment * 16 + offset}, one megabyte of reachable memory, no protection at all. The BIOS runs in real mode and
+so does the boot sector it loads. Operating systems switch to \textbf{protected mode} as soon as they can: 32-bit
+registers, a 4\,GiB address space, privilege levels, and (later) paging. GRUB does this switch for you. Figure
+\ref{fig:boot} shows the whole chain.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[node distance=0.45cm and 0.45cm, every node/.style={font=\sffamily\scriptsize}]
+  \node[tkbox, text width=2.3cm] (pw) {\textbf{Power on}\\CPU in real mode, starts at \code{0xFFFFFFF0}};
+  \node[tkbox, text width=2.3cm, right=of pw] (bios) {\textbf{BIOS firmware}\\self-test, finds a bootable device};
+  \node[tkbox, text width=2.5cm, right=of bios] (mbr) {\textbf{Boot sector}\\512 bytes loaded at \code{0x7C00}, must end in \code{0x55 0xAA}};
+  \node[tkbox, text width=2.5cm, right=of mbr] (grub) {\textbf{GRUB}\\enters protected mode, reads the Multiboot header};
+  \node[tkhi, text width=3.4cm, below=0.8cm of grub] (k) {\textbf{Your kernel} (\code{loader})\\loaded at 1\,MiB; \code{EAX = 0x2BADB002}, \code{EBX} = Multiboot info};
+  \node[tkok, text width=3.2cm, left=1.2cm of k] (q) {\textbf{\code{qemu -kernel}}\\QEMU's built-in Multiboot loader: skips BIOS and GRUB};
+  \draw[tkarrow] (pw) -- (bios); \draw[tkarrow] (bios) -- (mbr); \draw[tkarrow] (mbr) -- (grub);
+  \draw[tkarrow] (grub) -- (k); \draw[tkarrow, dashed] (q) -- (k);
+\end{tikzpicture}
+\caption{From power-on to the kernel. In Task~1.3 you replace the boot sector with your own; from Task~1.4 on GRUB (or QEMU) does it.}
+\label{fig:boot}
+\end{figure}
+
+The boot sector is loaded low in memory because the first megabyte is crowded (Figure~\ref{fig:lowmem}). Your kernel
+goes at 1\,MiB, the first address above all of it.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[m/.style={draw=tkNavy!70, minimum width=6.2cm, minimum height=0.52cm, font=\sffamily\scriptsize, fill=tkLight},
+  a/.style={font=\ttfamily\scriptsize, anchor=east}]
+  \node[m, fill=tkGreen!10] (k) at (0,0) {extended memory: \textbf{Turk-OS kernel loaded here}};
+  \node[m, below=0pt of k, fill=tkGray!15] (bios) {system BIOS ROM};
+  \node[m, below=0pt of bios, fill=tkGray!15] (rom) {video BIOS and option ROMs};
+  \node[m, below=0pt of rom, fill=tkAmber!12] (vga) {video memory (text buffer at \code{0xB8000})};
+  \node[m, below=0pt of vga, fill=tkGray!15] (ebda) {extended BIOS data area (size varies)};
+  \node[m, below=0pt of ebda] (free2) {free conventional memory};
+  \node[m, below=0pt of free2, fill=tkRed!10] (bs) {\textbf{boot sector} (512 bytes)};
+  \node[m, below=0pt of bs] (free1) {free conventional memory};
+  \node[m, below=0pt of free1, fill=tkGray!15] (bda) {BIOS data area};
+  \node[m, below=0pt of bda, fill=tkGray!15] (ivt) {real-mode interrupt vector table};
+  \foreach \n/\t in {k/0x00100000, bios/0x000F0000, rom/0x000C0000, vga/0x000A0000, ebda/\textasciitilde 0x0009FC00, free2/0x00007E00, bs/0x00007C00, free1/0x00000500, bda/0x00000400, ivt/0x00000000}
+    \node[a] at ([xshift=-4pt]\n.south west) {\t};
+\end{tikzpicture}
+\caption{The first megabyte of a PC's physical memory (not to scale). Addresses mark the bottom of each region.}
+\label{fig:lowmem}
+\end{figure}
+
+\begin{conceptbox}{The Multiboot contract}
+When GRUB or QEMU jumps to your kernel, the Multiboot specification (\S3.2, \emph{Machine state}) guarantees:
+EAX holds the magic value \code{0x2BADB002}; EBX holds the physical address of the \emph{Multiboot information}
+structure (memory size, memory map, boot modules); the CPU is in 32-bit protected mode with paging off; the segment
+registers describe flat 4\,GiB segments; interrupts are disabled. It also warns you of two things it does \emph{not}
+give you. \textbf{ESP is undefined}, so you must set up your own stack before calling any C function (Phase 2).
+And \textbf{the GDTR may be invalid}, so you must not reload a segment register until you have installed your own
+GDT (Phase 3). To be recognised, the kernel must contain a 12-byte Multiboot header (magic \code{0x1BADB002},
+flags, checksum) aligned to 4 bytes within the first 8\,KiB of the file.
+\end{conceptbox}
+
+\section{Reading plan}
+
+\begin{readingplan}
+\must & \LOB & Ch.~2 \emph{First Steps}: Booting, Hello Cafebabe (compiling, linking, GRUB, ISO, running) & 12--17 & The exact steps of Tasks 1.4--1.5. \\
+\must & \OSC & \S2.9 \emph{Building and Booting an Operating System} & 92--95 & Firmware, boot loaders and the boot sequence in general. \\
+\should & \MOS & \S1.3.1 \emph{Processors}; \S1.3.6 \emph{Booting the Computer} & 21--24, 34--35 & Registers, pipelines and privileged mode; the BIOS boot path. \\
+\should & \OSDI & \S2.6.6 \emph{Bootstrapping MINIX 3} & 156--160 & How a real x86 OS gets from the boot sector to its kernel. \\
+\could & \OSDI & \S4.6.2 \emph{Segmentation with Paging: The Intel Pentium} & 415--420 & First look at real versus protected mode addressing. \\
+\could & \OSC & \S9.6 \emph{Example: Intel 32- and 64-bit Architectures} & 379--383 & Preview of the address translation you will build in Phase 6. \\
+\end{readingplan}
+
+Three external references matter here. The \textbf{NASM manual}, chapters 2--3, covers syntax, labels and
+directives. The \textbf{Multiboot Specification 0.6.96}, section 3, defines the header and the machine state above.
+The \textbf{Intel SDM Volume 1}, chapter 3 (basic execution environment) and chapter 6 (procedure calls and the
+stack), is the authoritative version of Figure~\ref{fig:frame}.
+
+\begin{minixbox}
+MINIX 3 does not use GRUB. It ships its own boot monitor, and \OSDI\,\S2.6.6 walks through what it does: load the
+kernel and the system processes into memory, switch to protected mode, and jump to the kernel's assembly entry point
+in \texttt{kernel/mpx386.s (06300)}. Skim the first page of that file now. You won't understand all of it yet, but
+you will recognise the stack setup and the jump into C (\texttt{kernel/start.c (06900)}), which is exactly what you
+build in Phase 2.
+\end{minixbox}
+
+\section{Build it}
+
+\task{Learn to read compiler output}
+Continue the phrase book you started in Phase 0. For each C construct below, write the smallest function that uses
+it, compile with \code{i686-elf-gcc -O0 -S -masm=intel}, and annotate every instruction in your journal: a
+local variable, an \code{if}, a \code{for} loop, an array index, a struct field access, a pointer dereference, and a
+call with two arguments. Then compile the same code with \code{-O2} and notice what disappears.
+\verify{For the two-argument call, you can find the two \code{push} instructions, the \code{call}, and the
+\code{add esp, 8} that removes the arguments.}
+
+\task{Write assembly that C can call}
+Install the 32-bit C runtime on your host (\code{sudo dnf install glibc-devel.i686 libgcc.i686}) so you can build
+32-bit Linux test programs. Then write two functions in NASM and call them from a C test with \code{assert}. The
+first is a leaf function that reads its arguments straight from ESP. The second builds a proper frame and uses a
+callee-saved register, so it must preserve it.
+
+\begin{lst}{asm}{playground/funcs.s}
+; int max(int a, int b)      cdecl: a at [esp+4], b at [esp+8], result in eax
+global max
+global sum_array
+section .text
+max:
+    mov  eax, [esp + 4]     ; eax = a
+    mov  ecx, [esp + 8]     ; ecx = b   (ecx is caller-saved: free to use)
+    cmp  eax, ecx
+    jge  .done              ; if (a >= b) return a
+    mov  eax, ecx           ; else return b
+.done:
+    ret
+
+; int sum_array(const int *a, int n)
+sum_array:
+    push ebp
+    mov  ebp, esp           ; now [ebp+8] = a, [ebp+12] = n
+    push ebx                ; ebx is callee-saved: we must restore it
+    mov  ebx, [ebp + 8]     ; ebx = a
+    mov  ecx, [ebp + 12]    ; ecx = n
+    xor  eax, eax           ; sum = 0
+.loop:
+    test ecx, ecx
+    jz   .done
+    add  eax, [ebx]         ; sum += *a
+    add  ebx, 4             ; a++   (an int is 4 bytes)
+    dec  ecx
+    jmp  .loop
+.done:
+    pop  ebx
+    pop  ebp
+    ret
+\end{lst}
+
+\begin{lst}{sh}{terminal}
+nasm -f elf32 playground/funcs.s -o build/funcs.o
+gcc -m32 -g playground/test_funcs.c build/funcs.o -o build/test_funcs && ./build/test_funcs
+\end{lst}
+\verify{The asserts pass. Then step through \code{sum_array} in GDB with \code{layout asm}, \code{stepi} and
+\code{info registers}, and watch ESP change on every \code{push} and \code{pop}.}
+
+\task{A boot sector that says hello}
+This is a detour, and a valuable one. You will write the first 512 bytes a PC executes from disk, in 16-bit real
+mode, using a BIOS service to print. Turk-OS itself will not use this code; GRUB replaces it in the next task.
+
+\begin{lst}{asm}{playground/boot.s}
+bits 16                     ; the CPU is in 16-bit real mode
+org  0x7C00                 ; the BIOS loads us at this address
+
+start:
+    xor  ax, ax
+    mov  ds, ax             ; data segment = 0, so [si] means address si
+    mov  si, msg
+.next:
+    lodsb                   ; al = [ds:si], then si = si + 1
+    test al, al
+    jz   .halt              ; stop at the terminating zero
+    mov  ah, 0x0E           ; BIOS "teletype output" function
+    int  0x10               ; ask the BIOS video service to print al
+    jmp  .next
+.halt:
+    cli
+    hlt
+    jmp  .halt
+
+msg: db "Merhaba, Turk-OS!", 0
+
+times 510 - ($ - $$) db 0   ; pad with zeros up to byte 510
+dw 0xAA55                   ; boot signature: bytes 0x55, 0xAA
+\end{lst}
+
+\begin{lst}{sh}{terminal}
+nasm -f bin playground/boot.s -o build/boot.bin
+ls -l build/boot.bin             # exactly 512 bytes
+hexdump -C build/boot.bin | tail -n 2   # last bytes: 55 aa
+qemu-system-i386 -drive format=raw,file=build/boot.bin
+\end{lst}
+\verify{QEMU prints your message after the SeaBIOS banner. Delete the \code{dw 0xAA55} line and confirm that
+the BIOS now refuses to boot the disk.}
+
+\task{Hello Cafebabe: a Multiboot kernel}
+Now the real Turk-OS entry point, following \LOB chapter 2. The kernel only loads a recognisable value into EAX and
+spins, so you can prove your code is running by inspecting the register. Put the Multiboot header in its own section
+and have the linker place it first, which guarantees it lands in the first 8\,KiB of the file.
+
+\begin{lst}{asm}{boot/loader.s}
+global loader                   ; the entry symbol, named in link.ld
+
+MAGIC_NUMBER equ 0x1BADB002     ; tells GRUB this is a Multiboot kernel
+FLAGS        equ 0x0            ; no extra requests yet (Phase 2 changes this)
+CHECKSUM     equ -(MAGIC_NUMBER + FLAGS)   ; magic + flags + checksum == 0
+
+section .multiboot
+align 4
+    dd MAGIC_NUMBER
+    dd FLAGS
+    dd CHECKSUM
+
+section .text
+loader:
+    mov eax, 0xCAFEBABE         ; a value you will recognise in a register dump
+.loop:
+    jmp .loop                   ; spin forever
+\end{lst}
+
+\begin{lst}{plain}{link.ld}
+ENTRY(loader)                   /* where execution starts */
+SECTIONS
+{
+    . = 0x00100000;             /* load everything from 1 MiB upwards */
+
+    .text ALIGN(0x1000) : {
+        *(.multiboot)           /* Multiboot header first */
+        *(.text)
+    }
+    .rodata ALIGN(0x1000) : { *(.rodata*) }
+    .data   ALIGN(0x1000) : { *(.data) }
+    .bss    ALIGN(0x1000) : { *(COMMON) *(.bss) }
+}
+\end{lst}
+
+Build it with \code{nasm -f elf32 boot/loader.s -o build/loader.o}, then
+\code{i686-elf-ld -T link.ld -o build/kernel.elf build/loader.o}. Run it with QEMU's built-in Multiboot loader and
+open the monitor on your terminal:
+
+\begin{lst}{sh}{terminal}
+grub2-file --is-x86-multiboot build/kernel.elf && echo "multiboot header OK"
+qemu-system-i386 -kernel build/kernel.elf -monitor stdio
+(qemu) info registers
+\end{lst}
+\verify{\code{info registers} shows \code{EAX=cafebabe} and an \code{EIP} just above \code{0x00100000}.}
+
+\task{Boot through a real GRUB ISO}
+\LOB builds its ISO with GRUB Legacy's \code{stage2_eltorito}. On a current Fedora system, GRUB 2 does the whole job
+with \code{grub2-mkrescue}. Create a GRUB configuration and let the tool assemble a bootable CD image around your
+kernel:
+
+\begin{lst}{plain}{boot/grub.cfg}
+set timeout=0
+set default=0
+
+menuentry "Turk-OS" {
+    multiboot /boot/kernel.elf
+    boot
+}
+\end{lst}
+
+\begin{lst}{sh}{terminal}
+mkdir -p build/iso/boot/grub
+cp build/kernel.elf build/iso/boot/
+cp boot/grub.cfg build/iso/boot/grub/
+grub2-mkrescue -o build/turkos.iso build/iso
+qemu-system-i386 -cdrom build/turkos.iso -monitor stdio
+\end{lst}
+\verify{Same result as Task~1.4: \code{EAX=cafebabe}. You now boot exactly like a real PC would.}
+
+\task{A Makefile for the kernel}
+Typing these commands gets old fast. Write a Makefile with the targets \code{all}, \code{run}, \code{iso},
+\code{debug} and \code{clean}. Remember that recipe lines must start with a real Tab character.
+
+\begin{lst}{make}{Makefile}
+AS    := nasm
+LD    := i686-elf-ld
+BUILD := build
+OBJS  := $(BUILD)/loader.o
+
+all: $(BUILD)/kernel.elf
+
+$(BUILD)/kernel.elf: $(OBJS) link.ld
+	$(LD) -T link.ld -o $@ $(OBJS)
+
+$(BUILD)/%.o: boot/%.s
+	@mkdir -p $(BUILD)
+	$(AS) -f elf32 $< -o $@
+
+run: $(BUILD)/kernel.elf
+	qemu-system-i386 -kernel $< -monitor stdio
+
+iso: $(BUILD)/kernel.elf boot/grub.cfg
+	mkdir -p $(BUILD)/iso/boot/grub
+	cp $< $(BUILD)/iso/boot/kernel.elf
+	cp boot/grub.cfg $(BUILD)/iso/boot/grub/
+	grub2-mkrescue -o $(BUILD)/turkos.iso $(BUILD)/iso
+
+debug: $(BUILD)/kernel.elf
+	qemu-system-i386 -kernel $< -s -S &
+	gdb $< -ex "target remote localhost:1234" -ex "break loader" -ex "continue"
+
+clean:
+	rm -rf $(BUILD)
+
+.PHONY: all run iso debug clean
+\end{lst}
+\verify{\code{make clean && make run} rebuilds and boots from scratch.}
+
+\task{Your first kernel debugging session}
+Run \code{make debug}. QEMU starts frozen (\code{-S}) and waits for GDB on port 1234 (\code{-s}). GDB stops at
+\code{loader}. Try \code{info registers}, \code{stepi}, \code{x/4xw $esp} and \code{p/x $eax}, and use
+\code{layout asm} for a live disassembly view. You will use this workflow in every phase from now on, so practise it
+while the kernel is still two instructions long.
+\verify{After one \code{stepi}, \code{p/x $eax} prints \code{0xcafebabe}.}
+
+\section{Testing and debugging}
+
+\begin{pitfalls}
+QEMU or BIOS: ``No bootable device'' with your boot sector & File is not exactly 512 bytes, or the last two bytes are not \code{55 AA} & Check with \code{ls -l} and \code{hexdump -C}; keep the \code{times} padding line. \\
+Boot sector prints garbage & Missing \code{org 0x7C00} or \code{bits 16}, or DS not zero & All label addresses depend on \code{org}; set DS before \code{lodsb}. \\
+GRUB: ``no multiboot header found'' & Header not in the first 8\,KiB, not 4-byte aligned, or a bad checksum & Keep \code{*(.multiboot)} first in \code{.text}; run \code{grub2-file --is-x86-multiboot}. \\
+QEMU \code{-kernel}: ``Error loading uncompressed kernel without PVH ELF Note'' & QEMU found no Multiboot header, or the ELF is 64-bit & Same checks; make sure you used \code{nasm -f elf32} and the \code{i686-elf} linker. \\
+\code{objdump} output looks backwards & AT\&T syntax (source first) & Use \code{objdump -d -M intel} to match NASM. \\
+Your C test crashes after calling \code{sum_array} & A callee-saved register (EBX) was not restored, or the stack is unbalanced & Every \code{push} needs a matching \code{pop} before \code{ret}. \\
+\end{pitfalls}
+
+\section{Milestone}
+
+\begin{milestonebox}[The kernel boots]
+\begin{checklist}
+  \item \code{max} and \code{sum_array} in NASM pass their C tests, and you stepped through them in GDB.
+  \item Your boot sector prints ``Merhaba, Turk-OS!'' in QEMU and is exactly 512 bytes.
+  \item \code{kernel.elf} boots with \code{make run} and with the GRUB ISO; \code{EAX=0xCAFEBABE} in both.
+  \item \code{make debug} stops at \code{loader} and you can single-step.
+  \item You can draw the cdecl stack frame for a two-argument call from memory.
+\end{checklist}
+\end{milestonebox}
+
+\begin{questionbox}
+\begin{enumerate}
+  \item Why is the boot sector loaded at \code{0x7C00}, and why must it end with \code{0x55 0xAA}?
+  \item What does the Multiboot checksum guarantee? Compute it for \code{FLAGS = 0x3}.
+  \item Right after \code{call f}, what is at \code{[esp]}? Inside \code{f}, after \code{push ebp; mov ebp, esp}, where is the first argument?
+  \item Which registers must a cdecl function preserve, and which may it destroy?
+  \item Why is the kernel linked at 1\,MiB rather than at address 0?
+  \item What two things does the Multiboot contract explicitly \emph{not} set up for you?
+  \item How does a real-mode address like \code{0x07C0:0x0000} map to a physical address?
+\end{enumerate}
+\end{questionbox}
+
+\section{Going further}
+
+Extend the boot sector: read a key with BIOS \code{int 0x16} and echo it, write a routine that prints a register in
+hex, or load a second sector from disk with \code{int 0x13}. That last one is the first step of a custom boot loader.
+It is a fun rabbit hole, but only a detour for this project, so set yourself a time limit. For deeper assembly
+practice, read the Intel SDM Volume 1 chapter on procedure calls, then write \code{memcpy} and \code{strlen} in NASM
+and test them against your C versions from Phase 0.
+
+\nextphase{2}{Getting to C: Screen, Serial and kprintf}
+\booklegend
+\end{document}

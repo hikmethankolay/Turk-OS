@@ -1,0 +1,422 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{turkos}
+
+\begin{document}
+\phaseheader{6}{Paging and the Higher-Half Kernel}{Turn on the MMU, move the kernel to 0xC0000000, and build the virtual memory layer every later phase stands on}{34}{42}
+
+\ataglance{2--3 weeks}{5}{Phase 5: the PMM and its tests; confident GDB and QEMU monitor use}{Paging enabled, the kernel
+linked and running at \code{0xC0000000}, a direct map of the first 512\,MiB of physical memory, a VMM API
+(\code{vmm_map}, \code{vmm_unmap}, \code{vmm_virt_to_phys}), pre-allocated kernel page tables, and a page-fault
+handler that explains every fault.}
+
+\section{Why this phase}
+
+Paging is the mechanism behind almost everything a modern OS promises. It lets every process have its own private
+address space starting at zero (Phase 10), protects the kernel from user programs, shares one physical copy of memory
+between processes and copies it only when written (Phase 11), and lets the kernel find frames anywhere in RAM and make
+them look contiguous. This phase turns the MMU on and builds the kernel's side of it. You will not have user
+processes yet, but every design choice here decides how easy Phases 7--11 will be.
+
+It is also the phase where most hobby kernels stall. When paging is misconfigured, the CPU can't fetch the next
+instruction, which faults, and the fault handler can't be fetched either, so the machine resets with no message.
+Work in small steps, check each one in the QEMU monitor before taking the next, and commit after every step that
+works.
+
+\section{Concepts you need}
+
+\subsection{From address translation to paging}
+
+\OSTEP builds up to paging in stages, and it is worth following them in order. With \textbf{base and bounds}
+(chapter 15) the hardware adds a base to every address and checks a limit; it is simple but wastes the memory between
+a program's heap and stack. \textbf{Segmentation} (chapter 16, and your Phase 3 GDT) uses several base/bound pairs,
+but variable-sized segments fragment physical memory. \textbf{Paging} (chapter 18) cuts both virtual and physical
+memory into fixed 4\,KiB pieces and keeps a table per address space that maps each virtual page to a physical frame.
+Fixed sizes mean no external fragmentation, and each page can have its own permissions.
+
+\subsection{Two-level paging on x86}
+
+A flat table with an entry for every 4\,KiB page of a 4\,GiB space would take 4\,MiB per process. x86 uses two levels
+instead (Figure~\ref{fig:translate}), which \OSTEP chapter 20 explains as a way to avoid storing entries for unused
+regions. CR3 holds the physical address of a \textbf{page directory} of 1024 entries. Each present entry (PDE) points
+to a \textbf{page table} of 1024 entries (PTEs), and each present PTE points to a 4\,KiB frame. A 32-bit virtual
+address is split into a 10-bit directory index, a 10-bit table index and a 12-bit offset. With the PSE extension
+(CR4 bit 4), a PDE can instead map a whole 4\,MiB page directly, with no page table.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[x=0.4cm, y=1cm, every node/.style={font=\sffamily\scriptsize}]
+  \draw[draw=tkNavy!70, fill=tkBlue!12] (0,4) rectangle (10,4.7);
+  \draw[draw=tkNavy!70, fill=tkGreen!12] (10,4) rectangle (20,4.7);
+  \draw[draw=tkNavy!70, fill=tkAmber!14] (20,4) rectangle (32,4.7);
+  \node at (5,4.35) {directory index (bits 31--22)};
+  \node at (15,4.35) {table index (bits 21--12)};
+  \node at (26,4.35) {offset (bits 11--0)};
+  \node[font=\sffamily\scriptsize\bfseries, anchor=east] at (-0.3,4.35) {virtual address};
+  % structures
+  \node[tkhi, minimum width=1.6cm] (cr3) at (-1.5,1.2) {CR3};
+  \node[draw=tkNavy!70, fill=tkBlue!6, minimum width=2.2cm, minimum height=2.3cm, align=center] (pd) at (5,1.2) {page\\directory\\(1024 PDEs)};
+  \node[draw=tkNavy!70, fill=tkGreen!6, minimum width=2.2cm, minimum height=2.3cm, align=center] (pt) at (15,1.2) {page\\table\\(1024 PTEs)};
+  \node[draw=tkNavy!70, fill=tkAmber!8, minimum width=2.2cm, minimum height=2.3cm, align=center] (fr) at (26,1.2) {4\,KiB\\physical\\frame};
+  \draw[tkarrow] (cr3) -- (pd.west);
+  \draw[tkarrow] (5,4) -- node[right] {selects PDE} (pd.north);
+  \draw[tkarrow] (15,4) -- node[right] {selects PTE} (pt.north);
+  \draw[tkarrow] (26,4) -- node[right] {byte in frame} (fr.north);
+  \draw[tkarrow] (pd.east) -- node[above, align=center, font=\sffamily\tiny] {PDE:\\frame of table} (pt.west);
+  \draw[tkarrow] (pt.east) -- node[above, align=center, font=\sffamily\tiny] {PTE:\\frame of page} (fr.west);
+\end{tikzpicture}
+\caption{How the MMU translates a 32-bit virtual address with 4\,KiB pages. Every pointer in these tables is a \emph{physical} address.}
+\label{fig:translate}
+\end{figure}
+
+PDEs and PTEs share one format (Figure~\ref{fig:pte}). The top 20 bits are the frame number and the low 12 bits are
+flags. The three you set most often are \textbf{P} (present), \textbf{R/W} (writable) and \textbf{U/S} (accessible
+from ring 3). For user access, U/S must be set in both the PDE and the PTE. Bits 9--11 are free for the operating
+system; Phase 11 uses one of them to mark copy-on-write pages. By default ring 0 may write even to read-only pages;
+setting \textbf{CR0.WP} (bit 16) makes the kernel obey R/W too, which copy-on-write will need.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[x=0.4cm, y=1cm]
+  \draw[draw=tkNavy!70, fill=tkGray!10] (0,0) rectangle (20,0.7);
+  \node[font=\sffamily\scriptsize] at (10,0.35) {physical frame number (bits 31--12)};
+  \draw[draw=tkNavy!70, fill=tkGreen!15] (20,0) rectangle (23,0.7); \node[font=\sffamily\scriptsize] at (21.5,0.35) {AVL};
+  \foreach \x/\l in {23/G, 24/PS, 25/D, 26/A, 27/CD, 28/WT} {
+    \draw[draw=tkNavy!70, fill=tkGray!10] (\x,0) rectangle (\x+1,0.7);
+    \node[font=\sffamily\tiny] at (\x+0.5,0.35) {\l};
+  }
+  \foreach \x/\l in {29/U, 30/W, 31/P} {
+    \draw[draw=tkNavy!70, fill=tkRed!12] (\x,0) rectangle (\x+1,0.7);
+    \node[font=\sffamily\scriptsize\bfseries] at (\x+0.5,0.35) {\l};
+  }
+  \foreach \x/\b in {0.5/31, 19.5/12, 20.5/11, 22.5/9, 23.5/8, 24.5/7, 29.5/2, 30.5/1, 31.5/0}
+    \node[font=\sffamily\tiny, text=tkGray] at (\x,0.95) {\b};
+  \node[tknote, text width=12.6cm, align=left, anchor=north west] at (0,-0.1)
+    {P present \quad W writable \quad U user-accessible \quad WT, CD cache control (PWT, PCD) \quad A accessed \quad D dirty (PTE)
+     \quad PS 4\,MiB page (PDE) \quad G global \quad AVL free for the OS};
+\end{tikzpicture}
+\caption{The format of a page directory or page table entry.}
+\label{fig:pte}
+\end{figure}
+
+\subsection{The TLB}
+
+Walking two tables in memory for every access would be far too slow, so the CPU caches recent translations in the
+\textbf{TLB} (\OSTEP chapter 19). The TLB is \emph{not} kept coherent with your tables automatically. Whenever you
+change or remove an existing mapping, you must flush it: \code{invlpg [addr]} for one page, or reload CR3 to flush
+everything that is not marked global. Forgetting this is the classic source of heisenbugs: the old mapping keeps
+working for a while, and then it doesn't.
+
+\subsection{Why a higher-half kernel}
+
+Once user processes exist, each gets its own page directory, but the kernel must be reachable from all of them:
+interrupts and system calls arrive while a user address space is active. The standard solution is to map the kernel
+into the top of \emph{every} address space and give the bottom to user programs. Turk-OS uses the Linux-style split:
+0--3\,GiB for users and 3--4\,GiB for the kernel (Figure~\ref{fig:layout}). The kernel is linked to run at
+\code{0xC0100000} but still loaded by GRUB at physical \code{0x00100000}; \LOB chapter 9 explains why not to simply
+identity-map the kernel low instead.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[m/.style={draw=tkNavy!70, minimum width=7.2cm, font=\sffamily\scriptsize, align=center},
+  a/.style={font=\ttfamily\scriptsize, anchor=east}, n/.style={font=\sffamily\scriptsize, anchor=west, text=tkGray, align=left}]
+  \node[m, minimum height=0.5cm, fill=tkGray!15] (res) at (0,0) {reserved (recursive mapping, if you ever want one)};
+  \node[m, minimum height=0.8cm, fill=tkAmber!12, below=0pt of res] (vm) {kernel stacks and other kernel mappings};
+  \node[m, minimum height=0.8cm, fill=tkAmber!12, below=0pt of vm] (heap) {kernel heap (Phase 7)};
+  \node[m, minimum height=1.3cm, fill=tkRed!10, below=0pt of heap] (dm) {\textbf{direct map} of physical 0--512\,MiB\\kernel image at \code{0xC0100000}, VGA at \code{0xC00B8000}};
+  \node[m, minimum height=2.6cm, fill=tkGreen!8, below=0pt of dm] (user) {user space, private to each process (Phase 10)\\empty for now: address 0 is unmapped, so \code{NULL} faults};
+  \node[a] at ([xshift=-4pt]res.north west) {0xFFFFFFFF};
+  \node[a] at ([xshift=-4pt]res.south west) {0xFFC00000};
+  \node[a] at ([xshift=-4pt]vm.south west) {0xF0000000};
+  \node[a] at ([xshift=-4pt]heap.south west) {0xE0000000};
+  \node[a] at ([xshift=-4pt]dm.south west) {0xC0000000};
+  \node[a] at ([xshift=-4pt]user.south west) {0x00000000};
+  \draw[decorate, decoration={brace, amplitude=5pt}, tkRed] ([xshift=4pt]res.north east) -- ([xshift=4pt]dm.south east)
+    node[midway, right=6pt, n] {kernel half: the same page\\tables in every process\\(PDEs 768--1023)};
+  \draw[decorate, decoration={brace, amplitude=5pt}, tkGreen!70!black] ([xshift=4pt]user.north east) -- ([xshift=4pt]user.south east)
+    node[midway, right=6pt, n] {user half\\(PDEs 0--767)};
+\end{tikzpicture}
+\caption{The Turk-OS virtual address space.}
+\label{fig:layout}
+\end{figure}
+
+\subsection{Reaching physical memory once paging is on}
+
+After paging is enabled, the kernel can only touch memory that is mapped. Yet it constantly needs to write to frames
+it has just taken from the PMM: to zero a new page table, to copy a page, to load a program. \LOB chapter 10 lists the
+options. You can \textbf{map frames temporarily} into a reserved slot each time. You can use a \textbf{recursive
+mapping}, where the last PDE points at the directory itself, so the tables appear at \code{0xFFC00000}. Or you can
+keep a \textbf{direct map} of physical memory in the kernel half, so physical address $p$ is always visible at
+$p + \code{0xC0000000}$. Turk-OS uses the direct map, like xv6 and 32-bit Linux: it makes every later phase simpler,
+at the price of limiting usable RAM to 512\,MiB, which is plenty for this project. Two macros, \code{P2V} and
+\code{V2P}, convert between the two kinds of address.
+
+\section{Reading plan}
+
+\begin{readingplan}
+\must & \LOB & Ch.~8 \emph{A Short Introduction to Virtual Memory}; Ch.~9 \emph{Paging} (identity paging, enabling paging, higher-half linker script, entering and running in the higher half) & 51--59 & The practical route for Tasks 6.1--6.4. \\
+\must & \OSTEP & Ch.~15 \emph{Mechanism: Address Translation} & 135--148 & What translation is, before you build it. \\
+\must & \OSTEP & Ch.~18 \emph{Paging: Introduction}; Ch.~19 \emph{Paging: Faster Translations (TLBs)} & 179--210 & Page tables, PTE bits, why the TLB exists and when to flush it. \\
+\must & \OSTEP & Ch.~20 \emph{Paging: Smaller Tables} & 211--226 & Multi-level tables: exactly the x86 design. \\
+\should & \OSC & \S9.3 \emph{Paging}; \S9.4 \emph{Structure of the Page Table} & 360--376 & Second explanation with worked examples. \\
+\should & \OSC & \S9.6 \emph{Example: Intel 32- and 64-bit Architectures} & 379--383 & The real IA-32 paging hardware, including PAE. \\
+\should & \MOS & \S3.3 \emph{Virtual Memory} (paging, page tables, speeding up paging, large memories) & 194--209 & The same ground with more hardware detail. \\
+\could & \OSDI & \S4.3 \emph{Virtual Memory} & 383--396 & Another careful walk through page tables and TLBs. \\
+\could & \OSTEP & Ch.~23 \emph{The VAX/VMS Virtual Memory System} & 255--264 & A real system that also maps the kernel into every address space. \\
+\end{readingplan}
+
+Keep the Intel SDM Volume 3A chapter on paging open, specifically the part on 32-bit paging: it has the exact PDE
+and PTE formats, the CR0/CR3/CR4 bits, and the page-fault error code.
+
+\begin{minixbox}
+Here MINIX is a contrast rather than a model. The MINIX 3 version in \OSDI does not use paging: each process gets
+contiguous text and data segments described by its own local descriptor table, and protection comes from segment
+limits (\OSDI\,\S4.6.2 and \S4.7.1). Later MINIX releases added paging, for the reasons \MOS\,\S3.7.3 gives for
+why x86 systems abandoned segmentation. If you want a small paging kernel to compare with, look at the MIT xv6
+source (\code{vm.c}), which uses the same direct-map approach as Turk-OS.
+\end{minixbox}
+
+\section{Build it}
+
+\task{Warm-up: identity paging from C}
+Before moving anything, prove you can turn paging on without changing any address. In C, take one frame for a page
+directory and one for a page table, map the first 4\,MiB to itself (virtual = physical) with 4\,KiB pages, load CR3,
+and set CR0.PG. If the kernel keeps running, your table format is right. You will throw this code away in Task~6.3,
+but it isolates the ``is my PTE format correct?'' question from everything else.
+
+\begin{lst}{c}{kernel/arch/i386/paging.c (warm-up only)}
+static inline void load_cr3(uintptr_t pd_phys) { __asm__ volatile ("mov %0, %%cr3" : : "r"(pd_phys) : "memory"); }
+
+static inline void enable_paging(void)
+{
+    uint32_t cr0;
+    __asm__ volatile ("mov %%cr0, %0" : "=r"(cr0));
+    cr0 |= 0x80000000u;                     /* PG: paging on */
+    __asm__ volatile ("mov %0, %%cr0" : : "r"(cr0) : "memory");
+}
+\end{lst}
+\verify{After \code{enable_paging()}, \code{kprintf} still works, and the QEMU monitor's \code{info mem} shows one
+range \code{00000000-00400000} marked \code{-rw}.}
+
+\task{A page-fault handler that explains itself}
+Register a handler for vector 14 through \code{register_interrupt_handler}. Read CR2 and decode the error code:
+bit 0 tells a non-present page from a protection violation, bit 1 a write from a read, bit 2 user mode from kernel
+mode, bit 3 a reserved-bit error in a table entry. For now every page fault is fatal: print the decoded message and
+panic. From Phase 10 on, faults from user mode will kill only the process, and Phase 11 will fix some faults instead
+of reporting them.
+
+\begin{lst}{c}{kernel/mm/fault.c}
+static void page_fault_handler(struct regs *r)
+{
+    uint32_t addr;
+    __asm__ volatile ("mov %%cr2, %0" : "=r"(addr));
+    kprintf("Page fault at %08x: %s, %s, %s mode%s  (EIP=%08x)\n", addr,
+            (r->err_code & 1) ? "protection violation" : "page not present",
+            (r->err_code & 2) ? "write" : "read",
+            (r->err_code & 4) ? "user" : "kernel",
+            (r->err_code & 8) ? ", reserved bit set" : "", r->eip);
+    panic("unhandled page fault");
+}
+\end{lst}
+\verify{With identity paging on, reading \code{*(volatile int *)0x00800000} (beyond the mapped 4\,MiB) prints
+``page not present, read, kernel mode'' with that address.}
+
+\task{Move the kernel to the higher half}
+Now the real change. Link the kernel at \code{0xC0100000} but tell the linker to place each section at a load address
+3\,GiB lower, so GRUB still loads it at 1\,MiB. The entry point must be a physical address, because paging is off
+when GRUB jumps to it.
+
+\begin{lst}{plain}{link.ld}
+ENTRY(_start)
+KERNEL_VMA = 0xC0000000;
+
+SECTIONS
+{
+    . = 0xC0100000;                                     /* virtual: 3 GiB + 1 MiB */
+    kernel_start = .;
+    .text   ALIGN(4K) : AT(ADDR(.text)   - KERNEL_VMA) { *(.multiboot) *(.text*) }
+    .rodata ALIGN(4K) : AT(ADDR(.rodata) - KERNEL_VMA) { *(.rodata*) }
+    .data   ALIGN(4K) : AT(ADDR(.data)   - KERNEL_VMA) { *(.data*) }
+    .bss    ALIGN(4K) : AT(ADDR(.bss)    - KERNEL_VMA) { *(COMMON) *(.bss*) }
+    kernel_end = .;
+}
+\end{lst}
+
+The loader builds a boot page directory with 4\,MiB pages. It maps the first 4\,MiB twice: at 0 (so the instructions
+right after enabling paging can still be fetched) and at \code{0xC0000000}. The rest of the direct map (up to
+512\,MiB) goes in at the same time, so every frame the PMM hands out is reachable from the first moment. After jumping
+to the higher half, the loader removes the identity mapping.
+
+\begin{lst}{asm}{boot/loader.s (paging part)}
+KERNEL_VMA      equ 0xC0000000
+KERNEL_PDE      equ KERNEL_VMA >> 22        ; = 768
+DIRECT_MAP_PDES equ 128                     ; 128 x 4 MiB = 512 MiB
+PDE_4M_RW       equ 0x83                    ; present | writable | 4 MiB page
+
+global _start
+_start equ (loader - KERNEL_VMA)            ; physical entry address for GRUB/QEMU
+
+section .data
+align 4096
+global boot_page_directory
+boot_page_directory:
+    dd PDE_4M_RW                            ; PDE 0: identity map 0-4 MiB (temporary)
+    times (KERNEL_PDE - 1) dd 0             ; PDEs 1-767: user space, empty
+%assign i 0
+%rep DIRECT_MAP_PDES                        ; PDEs 768-895: 0xC0000000 + p -> p
+    dd (i << 22) | PDE_4M_RW
+%assign i i+1
+%endrep
+    times (1024 - KERNEL_PDE - DIRECT_MAP_PDES) dd 0
+
+section .text
+loader:                                     ; paging is OFF: we run at physical addresses
+    mov  ecx, (boot_page_directory - KERNEL_VMA)
+    mov  cr3, ecx                           ; CR3 needs the PHYSICAL address
+    mov  ecx, cr4
+    or   ecx, 0x00000010                    ; CR4.PSE: allow 4 MiB pages
+    mov  cr4, ecx
+    mov  ecx, cr0
+    or   ecx, 0x80010000                    ; CR0.PG (paging) and CR0.WP (write protect)
+    mov  cr0, ecx
+    lea  ecx, [higher_half]                 ; an absolute address above 0xC0000000
+    jmp  ecx
+
+higher_half:                                ; from here on we run in the higher half
+    mov  dword [boot_page_directory], 0     ; drop the identity mapping of 0-4 MiB
+    invlpg [0]
+    mov  esp, kernel_stack_top              ; a virtual address now
+    add  ebx, KERNEL_VMA                    ; Multiboot info pointer: physical -> virtual
+    push ebx
+    push eax
+    call kmain
+\end{lst}
+\verify{The kernel boots as before. In the QEMU monitor, \code{info mem} shows \code{c0000000-e0000000} and nothing
+below it, and \code{info registers} shows EIP above \code{0xc0100000}.}
+
+\task{Fix every address that assumed physical = virtual}
+Add \code{P2V} and \code{V2P} to a header, then go through the kernel and fix each place that used a physical
+address directly. The VGA buffer is now at \code{P2V(0xB8000)}. The \code{mmap_addr}, \code{mods_addr} and command
+line fields of the Multiboot information are physical, so read them through \code{P2V}. The PMM receives
+\code{V2P(kernel_start)} and \code{V2P(kernel_end)} when reserving the kernel image, stores its bitmap at a virtual
+address, and ignores any RAM above 512\,MiB.
+
+\begin{lst}{c}{include/mm.h}
+#define KERNEL_VMA      0xC0000000u
+#define DIRECT_MAP_SIZE (512u * 1024 * 1024)
+
+/* Valid only for physical addresses below DIRECT_MAP_SIZE. */
+#define P2V(pa) ((void *)((uintptr_t)(pa) + KERNEL_VMA))
+#define V2P(va) ((uintptr_t)(va) - KERNEL_VMA)
+\end{lst}
+\verify{All Phase 5 tests pass again. \code{mem} reports at most 512\,MiB even with \code{-m 1G}.}
+
+\task{The VMM: mapping 4 KiB pages}
+Write \code{kernel/mm/vmm.c}. The core is a function that finds, and optionally creates, the PTE for a virtual
+address in a given page directory. On top of it, \code{vmm_map} installs a mapping, \code{vmm_unmap} removes one and
+flushes the TLB, and \code{vmm_virt_to_phys} walks the tables. Every function takes the page directory as a parameter,
+because in Phase 10 you will use the same code on user address spaces.
+
+\begin{lst}{c}{kernel/mm/vmm.c}
+#define PG_PRESENT 0x001
+#define PG_WRITE   0x002
+#define PG_USER    0x004
+#define PG_4MB     0x080
+typedef uint32_t pde_t, pte_t;
+
+static pte_t *get_pte(pde_t *pd, uintptr_t va, bool create, uint32_t flags)
+{
+    pde_t *pde = &pd[va >> 22];
+    if (!(*pde & PG_PRESENT)) {
+        if (!create)
+            return NULL;
+        uintptr_t pt = pmm_alloc_frame();
+        if (!pt)
+            return NULL;
+        memset(P2V(pt), 0, PAGE_SIZE);                   /* direct map makes this easy */
+        *pde = pt | PG_PRESENT | PG_WRITE | (flags & PG_USER);
+    }
+    ASSERT(!(*pde & PG_4MB));                             /* not inside a 4 MiB page */
+    pte_t *table = P2V(*pde & ~0xFFFu);
+    return &table[(va >> 12) & 0x3FF];
+}
+
+void vmm_map(pde_t *pd, uintptr_t va, uintptr_t pa, uint32_t flags)
+{
+    pte_t *pte = get_pte(pd, va, true, flags);
+    ASSERT(pte != NULL && !(*pte & PG_PRESENT));          /* never remap silently */
+    *pte = (pa & ~0xFFFu) | (flags & 0xFFF) | PG_PRESENT;
+    __asm__ volatile ("invlpg (%0)" : : "r"(va) : "memory");
+}
+\end{lst}
+\verify{Map a fresh frame at \code{0xF0000000}, write a pattern through it, and read the same pattern through
+\code{P2V} of the frame's physical address. After \code{vmm_unmap}, \code{vmm_virt_to_phys} returns 0 and an access
+page-faults with ``page not present''.}
+
+\task{Pre-allocate the kernel's page tables}
+In Phase 10 every process gets its own page directory, created by copying PDEs 768--1023 from the kernel's. If the
+kernel later creates a new page table in its own directory (say, because the heap grew into a new 4\,MiB region),
+existing processes would not see it. Avoid the whole problem now: at boot, allocate an empty page table for every PDE
+from \code{0xE0000000} to \code{0xFFBFFFFF} (127 tables, about half a megabyte). After that, kernel PDEs never change,
+and copying them is always enough.
+\verify{\code{info mem} is unchanged (empty tables map nothing), and a loop over PDEs 896--1022 finds all of them
+present.}
+
+\task{Test the fault paths deliberately}
+Add \code{crash null} (read address 0), \code{crash kwrite} (write to a page you mapped read-only, which only faults
+because CR0.WP is set) and \code{crash unmapped} (read \code{0xF8000000}) to the monitor, and add VMM tests to the
+suite: map and unmap many pages, check \code{vmm_virt_to_phys} after each, and check that the PMM free count returns to
+its starting value.
+\verify{Each crash command gives a correctly decoded page-fault report, and \code{make test} passes.}
+
+\section{Testing and debugging}
+
+The QEMU monitor is your best friend in this phase. \code{info mem} lists mapped virtual ranges with their
+permissions, \code{info tlb} lists individual page mappings, and \code{info registers} shows CR0, CR2, CR3 and CR4.
+Run with \code{-d int,cpu_reset -no-reboot} so a triple fault stops QEMU and shows the last exceptions instead of
+rebooting.
+
+\begin{pitfalls}
+Triple fault the instant \code{CR0.PG} is set & The next instruction isn't mapped (no identity mapping), or CR3 got a virtual address & Keep PDE 0 until after the jump; load CR3 with \code{boot_page_directory - KERNEL_VMA}. \\
+Triple fault right after the jump to \code{higher_half} & The linker script VMA/LMA split is wrong, or PSE wasn't enabled so \code{0x83} entries were read as table pointers & Check \code{i686-elf-readelf -l}: VirtAddr \code{0xC01...}, PhysAddr \code{0x001...}; check CR4 bit 4. \\
+GRUB or QEMU refuses the kernel after the move & The entry point is a virtual address & Use the physical \code{_start} symbol as \code{ENTRY}. \\
+Page fault inside the page-fault handler, then reset & The handler, its stack or \code{kprintf}'s data touches unmapped memory & Everything the fault path uses must be in the kernel half, which is always mapped. \\
+Old data appears after changing a mapping, or a fault after unmapping arrives late or never & Stale TLB entry & \code{invlpg} after every change to an existing entry. \\
+Garbage when reading Multiboot data or boot modules & Physical addresses used as pointers & Read them through \code{P2V}; make sure they lie below 512\,MiB. \\
+\end{pitfalls}
+
+\section{Milestone}
+
+\begin{milestonebox}[Virtual memory is on]
+\begin{checklist}
+  \item The kernel runs at \code{0xC0100000}; \code{info mem} shows no mapping below \code{0xC0000000}.
+  \item The direct map covers 512\,MiB, and \code{P2V}/\code{V2P} are used everywhere a physical address is needed.
+  \item \code{vmm_map}, \code{vmm_unmap} and \code{vmm_virt_to_phys} work on any page directory and flush the TLB.
+  \item Kernel page tables for \code{0xE0000000}--\code{0xFFBFFFFF} are pre-allocated.
+  \item A null-pointer read, a write to a read-only page and an unmapped access each produce a clear report.
+  \item All PMM and VMM tests pass.
+\end{checklist}
+\end{milestonebox}
+
+\begin{questionbox}
+\begin{enumerate}
+  \item Translate \code{0xC0101234} by hand: which PDE index, which PTE index, which offset? With the Turk-OS boot directory, which physical address does it reach?
+  \item Why must the code that enables paging be identity-mapped at that moment?
+  \item What do CR2 and CR3 hold? Why does CR3 need a physical address?
+  \item When exactly must you execute \code{invlpg}? When is reloading CR3 better?
+  \item Why do both the PDE and the PTE need the U/S bit for user access?
+  \item Why put the kernel in the higher half, and why share the same kernel page tables between all processes?
+  \item Compare a direct map, a recursive mapping and temporary mappings. What does each cost?
+\end{enumerate}
+\end{questionbox}
+
+\section{Going further}
+
+Map the kernel image with 4\,KiB pages instead of one 4\,MiB page, so \code{.text} and \code{.rodata} can be read-only;
+with CR0.WP set, a stray write into kernel code then faults immediately instead of corrupting it. Mark kernel mappings
+\emph{global} (PTE bit 8, enabled by CR4.PGE) so they survive CR3 reloads, which makes the context switches of Phase 8
+cheaper. If you want NX protection (no execution from data pages), read about PAE paging, which has three levels and
+64-bit entries.
+
+\nextphase{7}{Kernel Heap and Core Data Structures}
+\booklegend
+\end{document}

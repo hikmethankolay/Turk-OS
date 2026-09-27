@@ -1,0 +1,295 @@
+% turkos.sty -- shared look and macros for the Turk-OS study-plan documents.
+% Every phase document does \usepackage{turkos}; .latexmkrc puts common/ on TEXINPUTS.
+\NeedsTeXFormat{LaTeX2e}
+\ProvidesPackage{turkos}[2026/09/25 Turk-OS study-plan style]
+
+% ---------------------------------------------------------------- page, fonts
+\RequirePackage[a4paper,top=2.4cm,bottom=2.4cm,left=2.3cm,right=2.3cm,headheight=15pt]{geometry}
+\RequirePackage[T1]{fontenc}
+\RequirePackage[utf8]{inputenc}
+\RequirePackage{XCharter}
+\RequirePackage[scaled=0.9]{helvet}
+\RequirePackage[varqu,varl,scaled=0.92]{zi4}
+\RequirePackage{microtype}
+\DisableLigatures{encoding = *, family = tt*}
+\RequirePackage[skip=0.55em plus 0.15em]{parskip}
+
+% ---------------------------------------------------------------- colours
+\RequirePackage[table]{xcolor}
+\definecolor{tkRed}{HTML}{C8102E}
+\definecolor{tkNavy}{HTML}{1B2A4A}
+\definecolor{tkGray}{HTML}{5F6B7A}
+\definecolor{tkLight}{HTML}{F3F5F9}
+\definecolor{tkCode}{HTML}{F7F7F9}
+\definecolor{tkGreen}{HTML}{1E7B4F}
+\definecolor{tkAmber}{HTML}{B7791F}
+\definecolor{tkBlue}{HTML}{1F4E9C}
+\definecolor{bkLOB}{HTML}{D35400}
+\definecolor{bkOSTEP}{HTML}{1E8449}
+\definecolor{bkOSC}{HTML}{1F5FAD}
+\definecolor{bkMOS}{HTML}{7D3C98}
+\definecolor{bkOSDI}{HTML}{117A65}
+
+% ---------------------------------------------------------------- packages
+\RequirePackage{graphicx}
+\RequirePackage{array,booktabs,tabularx,xltabular,multirow}
+\RequirePackage{float}
+\RequirePackage{enumitem}
+\RequirePackage{amsmath,amssymb}
+\RequirePackage[most]{tcolorbox}
+\RequirePackage{listings}
+\RequirePackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,shapes.geometric,shapes.multipart,calc,fit,backgrounds,decorations.pathreplacing,matrix}
+\RequirePackage{fontawesome5}
+\RequirePackage{titlesec}
+\RequirePackage{fancyhdr}
+\RequirePackage{etoolbox}
+\RequirePackage{xspace}
+\RequirePackage{caption}
+\RequirePackage{needspace}
+\RequirePackage[colorlinks=true,linkcolor=tkNavy,urlcolor=tkBlue,citecolor=tkNavy,pdfstartview=FitH]{hyperref}
+\RequirePackage{bookmark}
+
+% ---------------------------------------------------------------- typography
+\widowpenalty=10000
+\clubpenalty=10000
+\brokenpenalty=10000
+\setlength{\emergencystretch}{2.5em}
+\setlength{\@fptop}{0pt}
+\setlength{\@fpsep}{16pt plus 2pt}
+\setlength{\@fpbot}{0pt plus 1fil}
+\renewcommand{\floatpagefraction}{0.6}
+\setlist[itemize]{nosep, leftmargin=1.4em, topsep=3pt, partopsep=0pt}
+\setlist[enumerate]{nosep, leftmargin=1.7em, topsep=3pt, partopsep=0pt}
+\newlist{checklist}{itemize}{1}
+\setlist[checklist]{label=\textcolor{tkNavy}{$\square$}, leftmargin=1.8em, itemsep=2pt, topsep=3pt}
+
+\DeclareCaptionFont{tknavy}{\color{tkNavy}}
+\captionsetup{font={small,sf}, labelfont={bf,tknavy}, margin=1em}
+
+\titleformat{\section}{\sffamily\Large\bfseries\color{tkNavy}}{\textcolor{tkRed}{\thesection}}{0.6em}{}
+\titlespacing*{\section}{0pt}{1.5em}{0.5em}
+\titleformat{\subsection}{\sffamily\large\bfseries\color{tkNavy}}{\textcolor{tkRed}{\thesubsection}}{0.5em}{}
+\titlespacing*{\subsection}{0pt}{1.1em}{0.35em}
+\titleformat{\subsubsection}{\sffamily\normalsize\bfseries\color{tkNavy}}{}{0em}{}
+% keep headings with what follows them (done before the heading, outside titlesec's boxes)
+\pretocmd{\section}{\Needspace*{8\baselineskip}}{}{}
+\pretocmd{\subsection}{\Needspace*{5\baselineskip}}{}{}
+
+% inline code; \detokenize lets identifiers like task_create pass unescaped
+\newcommand{\code}[1]{\texttt{\detokenize{#1}}}
+
+% ---------------------------------------------------------------- header, footer
+\newcommand{\phasenum}{}
+\newcommand{\phasetitle}{}
+\newcommand{\headlabel}{}
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\sffamily\footnotesize\textcolor{tkGray}{Turk-OS Study Plan}}
+\fancyhead[R]{\sffamily\footnotesize\textcolor{tkGray}{\headlabel}}
+\fancyfoot[C]{\sffamily\footnotesize\textcolor{tkGray}{\thepage}}
+\renewcommand{\headrulewidth}{0.4pt}
+\renewcommand{\headrule}{{\color{tkGray!40}\hrule\@height\headrulewidth\@width\headwidth\vskip-\headrulewidth}}
+\fancypagestyle{plain}{\fancyhf{}\fancyfoot[C]{\sffamily\footnotesize\textcolor{tkGray}{\thepage}}\renewcommand{\headrulewidth}{0pt}}
+
+% ---------------------------------------------------------------- chips
+% \tkchip[text colour]{fill colour}{label}
+\newcommand{\tkchip}[3][white]{%
+  \tikz[baseline=(chip.base)]\node[fill=#2, text=#1, rounded corners=1.6pt, inner xsep=2.6pt,
+    inner ysep=1.3pt, text height=1.5ex, text depth=.35ex, font=\sffamily\bfseries\scriptsize](chip){#3};}
+\newcommand{\LOB}{\tkchip{bkLOB}{LOB}\xspace}
+\newcommand{\OSTEP}{\tkchip{bkOSTEP}{OSTEP}\xspace}
+\newcommand{\OSC}{\tkchip{bkOSC}{OSC}\xspace}
+\newcommand{\MOS}{\tkchip{bkMOS}{MOS}\xspace}
+\newcommand{\OSDI}{\tkchip{bkOSDI}{OSDI}\xspace}
+\newcommand{\must}{\tkchip{tkRed}{REQUIRED}\xspace}
+\newcommand{\should}{\tkchip{tkAmber}{RECOMMENDED}\xspace}
+\newcommand{\could}{\tkchip[tkGray]{tkGray!15}{OPTIONAL}\xspace}
+
+% ---------------------------------------------------------------- title banner
+% \phaseheader{number}{title}{subtitle}{progress from}{progress to}
+\newcommand{\phaseheader}[5]{%
+  \renewcommand{\phasenum}{#1}\renewcommand{\phasetitle}{#2}%
+  \renewcommand{\headlabel}{Phase #1 \textperiodcentered\ #2}%
+  \hypersetup{pdftitle={Turk-OS Phase #1: #2}, pdfauthor={Turk-OS Study Plan}}%
+  \thispagestyle{plain}%
+  \noindent\begin{tikzpicture}
+    \path[use as bounding box] (0,0) rectangle (\linewidth,3.3cm);
+    \fill[tkNavy, rounded corners=5pt] (0,0) rectangle (\linewidth,3.3cm);
+    \fill[tkRed, rounded corners=5pt] (0,0) rectangle (0.2\linewidth,3.3cm);
+    \fill[tkRed] (0.15\linewidth,0) rectangle (0.2\linewidth,3.3cm);
+    \node[font=\sffamily\bfseries\footnotesize, text=white, anchor=north] at (0.1\linewidth,3.0cm) {PHASE};
+    \node[font=\sffamily\bfseries\fontsize{42}{42}\selectfont, text=white] at (0.1\linewidth,1.45cm) {#1};
+    \node[font=\sffamily\bfseries\LARGE, text=white, anchor=north west, text width=0.74\linewidth, align=left, execute at begin node={\hyphenpenalty=10000\exhyphenpenalty=10000\relax}] at (0.23\linewidth,2.95cm) {#2};
+    \node[font=\sffamily\small, text=white!78!tkNavy, anchor=south west, text width=0.74\linewidth, align=left] at (0.23\linewidth,0.35cm) {#3};
+  \end{tikzpicture}\par\vspace{0.3em}%
+  \noindent\tkprogress{#4}{#5}\par\vspace{0.2em}%
+}
+
+% \tkprogress{from}{to} -- overall progress bar, this phase highlighted in red
+\newcommand{\tkprogress}[2]{%
+  \begin{tikzpicture}
+    \path[use as bounding box] (0cm,-0.45cm) rectangle (\linewidth,0.25cm);
+    \fill[tkGray!18, rounded corners=1.5pt] (0cm,0cm) rectangle (\linewidth,0.22cm);
+    \ifdim #1pt>0pt \fill[tkNavy!65, rounded corners=1.5pt] (0cm,0cm) rectangle ({#1/100*\linewidth},0.22cm);\fi
+    \fill[tkRed] ({#1/100*\linewidth},0cm) rectangle ({#2/100*\linewidth},0.22cm);
+    \node[font=\sffamily\scriptsize, text=tkGray, anchor=north west, inner sep=0pt] at (0cm,-0.12cm) {Overall progress toward Turk-OS 1.0 (this phase in red)};
+    \node[font=\sffamily\scriptsize\bfseries, text=tkRed, anchor=north east, inner sep=0pt] at (\linewidth,-0.12cm) {#1\,\% $\rightarrow$ #2\,\%};
+  \end{tikzpicture}}
+
+\newcommand{\tkstars}[1]{%
+  \foreach \s in {1,...,5}{\ifnum\s>#1\relax\textcolor{tkGray!45}{\faStar[regular]}\else\textcolor{tkRed}{\faStar}\fi\,}%
+  \enspace\textcolor{tkGray}{\footnotesize(#1/5)}}
+
+% \ataglance{duration}{difficulty 1-5}{prerequisites}{outcome}
+\newcommand{\ataglance}[4]{%
+  \begin{tcolorbox}[enhanced, colback=tkLight, colframe=tkNavy!20, boxrule=0.5pt, arc=2pt,
+      left=8pt, right=8pt, top=4pt, bottom=4pt, before skip=6pt, after skip=10pt]
+  \small\renewcommand{\arraystretch}{1.3}%
+  \begin{tabularx}{\linewidth}{@{}>{\leavevmode\sffamily\bfseries\color{tkNavy}}p{0.21\linewidth} X@{}}
+    \faClock[regular]\enspace Duration & #1 \\
+    \faStar\enspace Difficulty & \tkstars{#2} \\
+    \faTools\enspace You need & #3 \\
+    \faRocket\enspace You will have & #4 \\
+  \end{tabularx}
+  \end{tcolorbox}}
+
+% ---------------------------------------------------------------- boxes
+\tcbset{tkbase/.style={enhanced, breakable, arc=2pt, boxrule=0.7pt, left=7pt, right=7pt,
+    top=4pt, bottom=4pt, fonttitle=\sffamily\bfseries\small, before skip=8pt, after skip=8pt}}
+\newtcolorbox{conceptbox}[1]{tkbase, colback=tkBlue!4, colframe=tkBlue!75!black,
+  title={\faBookOpen\enspace #1}}
+\newtcolorbox{tipbox}[1][Hint]{tkbase, colback=tkGreen!4, colframe=tkGreen!80!black,
+  title={\faLightbulb\enspace #1}}
+\newtcolorbox{warnbox}[1][Watch out]{tkbase, colback=tkAmber!6, colframe=tkAmber!90!black,
+  title={\faExclamationTriangle\enspace #1}}
+\newtcolorbox{minixbox}[1][Real-system lens: how MINIX 3 does it]{tkbase, colback=bkOSDI!4,
+  colframe=bkOSDI!85!black, title={\faSearch\enspace #1}}
+\newtcolorbox{decisionbox}[1]{tkbase, colback=tkNavy!3, colframe=tkNavy!80,
+  title={\faBalanceScale\enspace #1}}
+\newtcolorbox{milestonebox}[1][Exit criteria]{tkbase, colback=tkRed!3, colframe=tkRed!80!black,
+  title={\faFlagCheckered\enspace Milestone: #1}}
+\newtcolorbox{questionbox}[1][Self-check questions]{tkbase, colback=bkMOS!3, colframe=bkMOS!80!black,
+  title={\faQuestionCircle\enspace #1}}
+
+% code listing with a file-name title bar:  \begin{lst}{c}{kernel/kmain.c} ... \end{lst}
+\tcbuselibrary{listings}
+\newtcblisting{lst}[2]{enhanced, breakable, listing only, arc=2pt, boxrule=0.5pt,
+  colback=tkCode, colframe=tkNavy!45, colbacktitle=tkNavy!85, coltitle=white,
+  fonttitle=\ttfamily\footnotesize\bfseries, title={\detokenize{#2}},
+  left=6pt, right=4pt, top=1pt, bottom=1pt, before skip=8pt, after skip=8pt,
+  listing options={style=#1}}
+
+% ---------------------------------------------------------------- listings
+\lstdefinelanguage{nasm}{
+  alsoletter={.,\%},
+  morekeywords={mov,movzx,movsx,add,sub,inc,dec,mul,imul,div,idiv,and,or,xor,not,neg,shl,shr,sar,
+    cmp,test,jmp,je,jne,jz,jnz,jl,jle,jg,jge,ja,jb,call,ret,push,pop,pusha,popa,pushad,popad,
+    pushf,popf,pushfd,popfd,lea,int,iret,iretd,hlt,cli,sti,in,out,lgdt,lidt,ltr,lodsb,stosb,
+    rep,xchg,nop,invlpg,loop},
+  morekeywords=[2]{eax,ebx,ecx,edx,esi,edi,ebp,esp,ax,bx,cx,dx,al,ah,bl,bh,cl,ch,dl,dh,si,di,sp,
+    bp,cs,ds,es,fs,gs,ss,cr0,cr2,cr3,cr4,byte,word,dword},
+  morekeywords=[3]{section,global,extern,equ,db,dw,dd,dq,resb,resw,resd,align,bits,times,org,
+    \%macro,\%endmacro,\%rep,\%endrep,\%assign},
+  sensitive=false,
+  morecomment=[l];,
+  morestring=[b]",
+  morestring=[b]',
+}
+\lstdefinestyle{tkcode}{
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{tkBlue}\bfseries,
+  keywordstyle=[2]\color{bkMOS},
+  keywordstyle=[3]\color{tkRed!80!black}\bfseries,
+  commentstyle=\color{tkGray},
+  stringstyle=\color{tkGreen},
+  breaklines=true, postbreak=\mbox{\textcolor{tkGray}{$\hookrightarrow$}\space},
+  showstringspaces=false, tabsize=4, columns=fullflexible, keepspaces=true, upquote=true,
+  aboveskip=2pt, belowskip=2pt}
+\lstdefinestyle{c}{style=tkcode, language=C,
+  morekeywords={uint8_t,uint16_t,uint32_t,uint64_t,int8_t,int16_t,int32_t,int64_t,size_t,
+    uintptr_t,bool,true,false,inline,__attribute__,__asm__,asm,NULL}}
+\lstdefinestyle{asm}{style=tkcode, language=nasm}
+\lstdefinestyle{sh}{style=tkcode, language=bash, morekeywords={sudo,dnf,make,nasm,qemu-system-i386,gdb}}
+\lstdefinestyle{make}{style=tkcode, language=make}
+\lstdefinestyle{plain}{style=tkcode}
+
+% ---------------------------------------------------------------- tasks
+\newcounter{tktask}
+\newcommand{\task}[1]{%
+  \refstepcounter{tktask}%
+  \par\vspace{0.5em}\noindent
+  \pdfbookmark[2]{Task \phasenum.\arabic{tktask}: #1}{task.\phasenum.\arabic{tktask}}%
+  {\sffamily\bfseries\color{tkRed}Task \phasenum.\arabic{tktask}}\enspace
+  {\sffamily\bfseries\color{tkNavy}#1}\par\nopagebreak\vspace{0.1em}}
+\newcommand{\verify}[1]{\par\noindent{\color{tkGreen}\sffamily\bfseries\small\faCheckCircle\enspace Verify:}\enspace #1\par}
+
+% ---------------------------------------------------------------- tables
+\newcommand{\tkth}[1]{\leavevmode\sffamily\bfseries\footnotesize\color{tkNavy}#1}
+
+% reading plan: \must & \OSTEP & Ch.~6 ... & 49--62 & reason \\
+\newenvironment{readingplan}{%
+  \par\small\renewcommand{\arraystretch}{1.35}\setlength{\tabcolsep}{4pt}%
+  \begin{longtable}{@{}l l >{\raggedright\arraybackslash}p{0.315\linewidth} >{\raggedleft\arraybackslash}p{0.1\linewidth} >{\raggedright\arraybackslash}p{0.31\linewidth}@{}}
+    \toprule
+    \tkth{Priority} & \tkth{Book} & \tkth{What to read} & \tkth{Pages} & \tkth{Why now} \\
+    \midrule
+    \endfirsthead
+    \toprule
+    \tkth{Priority} & \tkth{Book} & \tkth{What to read} & \tkth{Pages} & \tkth{Why now} \\
+    \midrule
+    \endhead
+    \bottomrule
+    \endlastfoot
+}{\end{longtable}}
+
+% pitfalls: symptom & likely cause & fix \\
+\newenvironment{pitfalls}{%
+  \par\small\renewcommand{\arraystretch}{1.3}\setlength{\tabcolsep}{4pt}%
+  \begin{longtable}{@{}>{\raggedright\arraybackslash}p{0.3\linewidth} >{\raggedright\arraybackslash}p{0.33\linewidth} >{\raggedright\arraybackslash}p{0.33\linewidth}@{}}
+    \toprule
+    \tkth{Symptom} & \tkth{Likely cause} & \tkth{What to do} \\
+    \midrule
+    \endfirsthead
+    \toprule
+    \tkth{Symptom} & \tkth{Likely cause} & \tkth{What to do} \\
+    \midrule
+    \endhead
+    \bottomrule
+    \endlastfoot
+}{\end{longtable}}
+
+% ---------------------------------------------------------------- tikz styles
+\tikzset{
+  tkbox/.style={draw=tkNavy!70, fill=tkLight, rounded corners=2pt, font=\sffamily\small,
+    align=center, inner sep=4pt, line width=0.6pt},
+  tkhi/.style={draw=tkRed!80!black, fill=tkRed!8, rounded corners=2pt, font=\sffamily\small,
+    align=center, inner sep=4pt, line width=0.7pt},
+  tkok/.style={draw=tkGreen!80!black, fill=tkGreen!8, rounded corners=2pt, font=\sffamily\small,
+    align=center, inner sep=4pt, line width=0.7pt},
+  tkarrow/.style={-{Stealth[length=2.2mm]}, line width=0.7pt, draw=tkNavy!80},
+  tknote/.style={font=\sffamily\scriptsize, text=tkGray, align=center},
+  cell/.style={draw=tkNavy!70, minimum height=0.62cm, font=\sffamily\scriptsize, align=center, inner sep=1pt},
+}
+
+% ---------------------------------------------------------------- closing blocks
+\newcommand{\booklegend}{%
+  \begin{tcolorbox}[tkbase, unbreakable, colback=white, colframe=tkGray!60, title={\faBookOpen\enspace Books used in this plan}]
+  \footnotesize\renewcommand{\arraystretch}{1.25}%
+  \begin{tabularx}{\linewidth}{@{}l X@{}}
+  \LOB & Erik Helin, Adam Renberg. \emph{The little book about OS development}, 2015. The hands-on x86 guide (\texttt{Books/book.pdf}). \\
+  \OSTEP & Remzi H.\ Arpaci-Dusseau, Andrea C.\ Arpaci-Dusseau. \emph{Operating Systems: Three Easy Pieces}, v0.90. Main theory text. \\
+  \OSC & A.\ Silberschatz, P.\,B.\ Galvin, G.\ Gagne. \emph{Operating System Concepts}, 10th ed., Wiley, 2018. Reference theory text. \\
+  \MOS & Andrew S.\ Tanenbaum, Herbert Bos. \emph{Modern Operating Systems}, 4th ed., Pearson, 2015. Hardware, I/O, design, security. \\
+  \OSDI & Andrew S.\ Tanenbaum, Albert S.\ Woodhull. \emph{Operating Systems: Design and Implementation}, 3rd ed., 2006. MINIX 3 with full source listing. \\
+  \end{tabularx}\par\smallskip
+  Page numbers are the \emph{printed} page numbers from each book's table of contents, not PDF page indices.
+  MINIX source references like \texttt{kernel/proc.c (07400)} give the file and its starting line in \OSDI Appendix B.
+  \end{tcolorbox}}
+
+% \nextphase{number}{title}
+\newcommand{\nextphase}[2]{%
+  \par\vspace{0.6em}\noindent\hfill{\sffamily\small\textcolor{tkGray}{Next:}\enspace
+  \textcolor{tkRed}{\bfseries Phase #1}\enspace\textcolor{tkNavy}{\bfseries #2}\enspace\textcolor{tkRed}{\faArrowRight}}\par}
+
+\endinput

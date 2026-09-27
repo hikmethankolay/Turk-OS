@@ -1,0 +1,341 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{turkos}
+
+\begin{document}
+\phaseheader{14}{Userland: libc, Shell and Utilities}{Build the user-space half of the system: a C library, pipes, a real terminal, the Turk shell, and the everyday commands}{90}{96}
+
+\ataglance{3 weeks}{4}{Phase 13: VFS, descriptors, TurkFS; Phase 11: \code{fork}/\code{exec}/\code{wait}, signals}{Turk-libc
+(system call wrappers with \code{errno}, strings, \code{malloc}, buffered \code{stdio} with \code{printf}), a
+\code{pipe} system call, a terminal line discipline with echo, line editing, Ctrl+C and Ctrl+D, basic ANSI escape
+codes on the console, \code{tsh} (the Turk shell) with pipelines, redirection and background jobs, about fifteen core
+utilities, and a boot that ends at a shell prompt.}
+
+\section{Why this phase}
+
+Until now you have been talking to Turk-OS through a monitor built into the kernel. A real UNIX has no such thing: the
+shell is an ordinary user program, and so are \code{ls}, \code{cat} and everything else you type. That design is only
+possible because of the system calls you built in Phases 10--13, and this phase is where you find out whether they
+really work together. \OSTEP chapter 5 argues that \code{fork}, \code{exec}, \code{wait} and file descriptors are
+exactly the right primitives for a shell; now you get to confirm it by writing one.
+
+Most of the code in this phase runs in ring 3. The kernel gains two things: \textbf{pipes}, which connect one
+process's output to another's input, and a proper \textbf{terminal} that edits lines and turns Ctrl+C into a signal.
+Everything else is user space: a C library so programs can be written normally, the shell, and the utilities. When
+you finish, Turk-OS boots to a prompt, and you can type \code{ls /bin | wc -l > count.txt}.
+
+\section{Concepts you need}
+
+\subsection{The C library}
+
+User programs don't make system calls directly; they call the \textbf{C library}, which provides the standard
+interface (\texttt{string.h}, \texttt{stdio.h}, \texttt{stdlib.h}, \texttt{unistd.h}, \dots) on top of system calls.
+Some functions are thin wrappers: \code{write} puts its arguments in registers and executes \code{int 0x80}. Others do
+real work in user space: \code{printf} formats into a buffer and calls \code{write} only when the buffer fills or a
+line ends, and \code{malloc} manages a heap that it grows with \code{brk}, reusing your Phase 7 allocator almost
+unchanged. System calls return a negative error code (\code{-ENOENT}); by convention the library stores the positive
+code in the global \code{errno} and returns $-1$, which is what programs expect.
+
+\subsection{Pipes and redirection}
+
+A \textbf{pipe} is a kernel buffer with two file descriptors: whatever is written to one end can be read from the
+other. The shell builds a pipeline with the \code{fork}/\code{exec} gap that \OSTEP chapter 5 describes: it creates a
+pipe, forks two children, and in each child uses \code{dup2} to move the right end of the pipe onto descriptor 0 or 1
+before calling \code{exec} (Figure~\ref{fig:pipe}). The programs never know. Redirection (\code{> file}) is the same
+trick with a file instead of a pipe. A reader sees end-of-file only when \emph{every} write end is closed, so every
+process, the shell included, must close the ends it doesn't use. Forgetting that is the classic pipe bug: the
+pipeline never finishes.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[pr/.style={draw=tkNavy!70, fill=tkLight, rounded corners=2pt, font=\sffamily\scriptsize, align=left, text width=3.4cm, minimum height=1.5cm},
+  every node/.style={font=\sffamily\scriptsize}]
+  \node[pr, fill=tkGreen!10] (ls) at (0,0) {\textbf{child 1: \code{ls}}\\fd 0: \code{/dev/tty}\\fd 1: pipe \textbf{write} end\\fd 2: \code{/dev/tty}};
+  \node[draw=tkAmber!90!black, fill=tkAmber!14, rounded corners=2pt, minimum width=2.8cm, minimum height=1.0cm, align=center] (p) at (5.3,0) {\textbf{pipe}\\4\,KiB buffer in the kernel};
+  \node[pr, fill=tkGreen!10] (wc) at (10.6,0) {\textbf{child 2: \code{wc -l}}\\fd 0: pipe \textbf{read} end\\fd 1: \code{/dev/tty}\\fd 2: \code{/dev/tty}};
+  \node[pr, fill=tkBlue!8, text width=5.4cm, minimum height=1.0cm] (sh) at (5.3,2.2) {\textbf{tsh}: \code{pipe(fds)}, fork twice, close both ends itself, then \code{waitpid} for both children};
+  \draw[tkarrow] (ls.east) -- node[above] {\code{write(1, ...)}} (p.west);
+  \draw[tkarrow] (p.east) -- node[above] {\code{read(0, ...)}} (wc.west);
+  \draw[tkarrow, dashed] (sh.south west) -- node[left] {fork} (ls.north);
+  \draw[tkarrow, dashed] (sh.south east) -- node[right] {fork} (wc.north);
+\end{tikzpicture}
+\caption{How \code{ls | wc -l} is wired. Each child \code{dup2}s its pipe end onto fd 0 or 1 and closes the originals before \code{exec}.}
+\label{fig:pipe}
+\end{figure}
+
+\subsection{The terminal line discipline}
+
+When you type at a UNIX prompt, the program doesn't see each key. The kernel's terminal driver collects a whole line,
+echoes characters, handles Backspace (erase) and Ctrl+U (kill the line), and hands the line over only when you press
+Enter. This is \textbf{canonical} (cooked) mode. Special keys become actions: Ctrl+D at the start of a line means
+end-of-file, and Ctrl+C sends \code{SIGINT} to the \textbf{foreground} process instead of being passed as input.
+Programs like editors switch the terminal to \textbf{raw} mode to get every key at once. \OSDI\,\S3.8.2 describes all
+of this, and \MOS\,\S5.6 covers the output side, including the escape sequences (such as \code{ESC [2J} to clear the
+screen) that let programs move the cursor and change colours.
+
+\subsection{Every layer at once}
+
+This is the phase where a single \texttt{printf("merhaba\textbackslash n")} passes through almost everything you have built
+(Figure~\ref{fig:layers}). When something prints the wrong thing, walk down this list and check each layer on its own.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[node distance=0.18cm, st/.style={draw=tkNavy!60, rounded corners=2pt, minimum width=10.5cm, minimum height=0.5cm, font=\sffamily\scriptsize, align=center}]
+  \node[st, fill=tkGreen!10] (a) {\code{printf} formats into the \code{stdout} buffer (Turk-libc)};
+  \node[st, fill=tkGreen!10, below=of a] (b) {newline on a terminal: \code{fflush} calls \code{write(1, buf, n)} (Turk-libc)};
+  \node[st, fill=tkRed!8, below=of b] (c) {\code{int 0x80}, \code{syscall_handler}, \code{sys_write}, \code{copy_from_user} (Phase 10)};
+  \node[st, fill=tkBlue!8, below=of c] (d) {descriptor 1 $\rightarrow$ \code{struct file} $\rightarrow$ devfs inode \code{/dev/tty} (Phase 13)};
+  \node[st, fill=tkAmber!12, below=of d] (e) {tty driver: output processing, ANSI escapes (this phase)};
+  \node[st, fill=tkAmber!12, below=of e] (f) {console: VGA text buffer and serial port, under \code{console_lock} (Phases 2 and 9)};
+  \foreach \x/\y in {a/b,b/c,c/d,d/e,e/f} \draw[tkarrow] (\x) -- (\y);
+\end{tikzpicture}
+\caption{The path of one \code{printf} in Turk-OS.}
+\label{fig:layers}
+\end{figure}
+
+\section{Reading plan}
+
+\begin{readingplan}
+\must & \OSTEP & Ch.~5 \emph{Interlude: Process API}; re-read \S5.4 on why \code{fork}/\code{exec} suits a shell, redirection and pipes & 37--48 & The design of \code{tsh} in a few pages. \\
+\must & \LOB & Ch.~11, sections \emph{Using C for User Mode Programs} and \emph{A C Library} & 67--68 & What a minimal libc needs. \\
+\should & \OSDI & \S1.3.3 \emph{The Shell}; \S1.4 \emph{System Calls} & 25--42 & The POSIX calls your library wraps, with a sketch of a shell. \\
+\should & \OSDI & \S5.6.9 \emph{Pipes and Special Files} & 563--565 & How MINIX implements pipes and device files. \\
+\should & \OSDI & \S3.8.2 \emph{Terminal Software}; \S3.8.4 \emph{Implementation of the Device-Independent Terminal Driver} & 307--316, 331--350 & Canonical mode, special characters, and a working line discipline. \\
+\should & \MOS & \S5.6.1--5.6.2 \emph{Input Software}, \emph{Output Software} & 394--405 & Cooked versus raw input, escape sequences. \\
+\should & \OSC & \S2.1--2.2 \emph{Services}, \emph{User and OS Interface}; \S2.4 \emph{System Services} & 55--62, 74--75 & Where shells and utilities fit. \\
+\could & \MOS & \S1.5.6 \emph{The Shell}; \S10.2 \emph{Overview of Linux} (interfaces, shell, utility programs) & 45--46, 723--733 & The user's view of a UNIX system. \\
+\could & \MOS & \S12.2 \emph{Interface Design} & 985--993 & Keep the library and shell simple and orthogonal. \\
+\end{readingplan}
+
+\begin{minixbox}
+The MINIX terminal driver, \texttt{drivers/tty/tty.c (13600)}, implements canonical mode in \code{in_process}: it
+checks every incoming character against the special characters in the terminal's settings (erase, kill, EOF,
+interrupt, \dots), edits the input queue, echoes, and completes a pending \code{read} when a line is ready. Pipes live
+in the file-system server, \texttt{servers/fs/pipe.c (25900)}: a pipe is an inode whose data blocks act as the
+buffer, and \code{suspend}/\code{release} put readers and writers to sleep and wake them, just as your wait queues
+will.
+\end{minixbox}
+
+\section{Build it}
+
+\task{Turk-libc: the skeleton}
+Create \code{user/libc/} with headers in \code{user/include/}, built into a static \code{libc.a} with
+\code{i686-elf-ar}. Every program links \code{crt0.o}, its own objects and \code{libc.a}. Start with system call
+wrappers that follow the \code{errno} convention, then \texttt{string.h} and \texttt{ctype.h} (copy them from the
+kernel's \code{lib/}; you wrote them in Phase 0).
+
+\begin{lst}{c}{user/libc/unistd.c}
+int errno;
+
+static int ret_errno(int32_t r)             /* kernel returns -E...; libc returns -1 */
+{
+    if (r < 0) {
+        errno = -r;
+        return -1;
+    }
+    return r;
+}
+
+int read(int fd, void *buf, size_t n)  { return ret_errno(syscall3(SYS_read,  fd, (uint32_t)buf, n)); }
+int write(int fd, const void *buf, size_t n) { return ret_errno(syscall3(SYS_write, fd, (uint32_t)buf, n)); }
+int open(const char *path, int flags)  { return ret_errno(syscall3(SYS_open, (uint32_t)path, flags, 0)); }
+int pipe(int fds[2])                   { return ret_errno(syscall3(SYS_pipe, (uint32_t)fds, 0, 0)); }
+\end{lst}
+
+\task{malloc in user space}
+Port your Phase 7 heap: replace \code{ksbrk} with the \code{brk} system call and \code{ASSERT} with an
+\code{abort()} that prints a message and exits with \code{SIGABRT}. Add \code{calloc}, \code{realloc} and \code{free}.
+Because \code{brk} allocates lazily (Phase 11), a program that asks for a large heap but touches little of it stays
+cheap.
+\verify{The heap stress test from Phase 7, compiled as a user program, passes.}
+
+\task{stdio}
+Implement \code{FILE} with a buffer, a mode (unbuffered, line-buffered, fully buffered) and a descriptor, plus
+\code{stdin}, \code{stdout} and \code{stderr}. \code{stdout} is line-buffered when it is a terminal (check with an
+\code{isatty} built on \code{fstat}) and fully buffered otherwise; \code{stderr} is unbuffered. Port your \code{kvprintf}
+engine for \code{printf}, \code{fprintf}, \code{sprintf} and \code{snprintf}, and add \code{fopen}, \code{fclose},
+\code{fgets}, \code{fputs}, \code{fread}, \code{fwrite}, \code{fflush}, \code{getchar} and \code{putchar}. Make
+\code{exit} flush all open \code{FILE}s before calling the system call, while \code{_exit} doesn't.
+\verify{\code{printf} output appears without an explicit \code{fflush} when printing to the terminal, and is
+complete in a file even when the program ends with \code{return 0} from \code{main}.}
+
+\task{Pipes in the kernel}
+Add \code{sys_pipe}: create a pipe object with a 4\,KiB ring buffer, counts of open readers and writers, a spinlock and
+two wait queues, then two \code{struct file}s (read end and write end) and two descriptors. A read from an empty pipe
+sleeps until data arrives, or returns 0 (end-of-file) if there are no writers left. A write to a full pipe sleeps until
+there is room; if no readers are left, it sends \code{SIGPIPE} to the writer and returns \code{-EPIPE}. Closing an end
+decrements its count and wakes the other side.
+
+\begin{lst}{c}{kernel/fs/pipe.c}
+#define PIPE_SIZE 4096
+
+struct pipe {
+    uint8_t           buf[PIPE_SIZE];
+    uint32_t          rpos, wpos;          /* bytes in pipe = wpos - rpos */
+    int               readers, writers;    /* open ends                   */
+    spinlock_t        lock;
+    struct wait_queue can_read, can_write;
+};
+
+int32_t pipe_read(struct pipe *p, uint8_t *dst, uint32_t n)
+{
+    spin_lock(&p->lock);
+    while (p->wpos == p->rpos) {           /* empty */
+        if (p->writers == 0) {             /* nobody can ever write again */
+            spin_unlock(&p->lock);
+            return 0;                      /* end-of-file */
+        }
+        sleep_on(&p->can_read, &p->lock);
+    }
+    uint32_t got = 0;
+    while (got < n && p->rpos != p->wpos)
+        dst[got++] = p->buf[p->rpos++ % PIPE_SIZE];
+    wake_up_all(&p->can_write);
+    spin_unlock(&p->lock);
+    return got;
+}
+\end{lst}
+The loop copies into a kernel buffer; \code{sys_read} then hands it to the user with \code{copy_to_user} after the lock
+is released, because \code{copy_to_user} can fault and sleep.
+\verify{A test program writes 1\,MiB into a pipe from a child and reads it back in the parent, checking every byte;
+the writer blocks whenever the buffer is full.}
+
+\task{A real terminal}
+Turn \code{/dev/tty} into a proper terminal driver. Keyboard characters go into an input queue. In canonical mode, echo
+them; Backspace removes the last character from the current line and from the screen; Ctrl+U removes the whole line;
+Enter completes the line and wakes readers; Ctrl+D on an empty line makes the pending \code{read} return 0; Ctrl+C
+sends \code{SIGINT} to the foreground process group and discards the line. Add an \code{ioctl} (number 54) so a program
+can read and set a flags word (canonical on or off, echo on or off) and set the foreground process group, which the
+shell does before running a job and after it finishes. On the output side, teach the console the few ANSI sequences
+programs need: \code{ESC [2J} (clear), \code{ESC [H} and \code{ESC [row;colH} (move the cursor), \code{ESC [K} (clear to
+end of line) and \code{ESC [...m} (colours).
+\verify{A program that reads lines and prints them in capitals works like a normal UNIX filter: editing works, Ctrl+D
+ends it, Ctrl+C interrupts it.}
+
+\task{tsh, the Turk shell}
+Write \code{user/sh/tsh.c}. Read a line, split it into words (honouring single and double quotes), and parse it into
+one or more pipelines separated by \code{;}. Each pipeline is a list of commands, each with its own redirections (\code{<}, \code{>}, \code{>>}), plus an optional \code{&} for
+background. Built-ins run inside the shell because they must change its own state: \code{cd}, \code{pwd}, \code{exit},
+\code{export} and \code{help}. Everything else runs with \code{fork} and \code{exec}, looked up in the directories of
+\code{PATH} (default \code{/bin}). Before each prompt, reap finished background jobs with
+\code{waitpid(-1, &status, WNOHANG)}. The shell ignores \code{SIGINT} itself and makes each foreground job the
+terminal's foreground group, so Ctrl+C reaches only the job. The core of the pipeline code looks like this:
+
+\begin{lst}{c}{user/sh/tsh.c (running a pipeline)}
+static void run_pipeline(struct cmd *cmds, int n, bool background)
+{
+    int   prev_read = -1;
+    pid_t pids[MAX_CMDS];
+
+    for (int i = 0; i < n; i++) {
+        int fds[2] = { -1, -1 };
+        if (i < n - 1 && pipe(fds) < 0) { perror("pipe"); return; }
+
+        pid_t pid = fork();
+        if (pid == 0) {                                   /* child */
+            if (prev_read != -1) { dup2(prev_read, 0); close(prev_read); }
+            if (i < n - 1)       { dup2(fds[1], 1); close(fds[0]); close(fds[1]); }
+            apply_redirections(&cmds[i]);                 /* <, >, >> override the pipe */
+            execvp(cmds[i].argv[0], cmds[i].argv);
+            perror(cmds[i].argv[0]);
+            _exit(127);                                   /* exec failed */
+        }
+        pids[i] = pid;
+        if (prev_read != -1) close(prev_read);            /* the shell keeps no pipe ends */
+        if (i < n - 1) { close(fds[1]); prev_read = fds[0]; }
+    }
+    if (!background)
+        for (int i = 0; i < n; i++)
+            waitpid(pids[i], NULL, 0);
+}
+\end{lst}
+\verify{\code{echo merhaba | wc -c} prints 8; \code{ls /bin > /mnt/list.txt} followed by \code{cat < /mnt/list.txt}
+shows the listing; \code{sleep 5 &} returns to the prompt at once and is reaped later.}
+
+\task{Core utilities}
+Write each as a small program in \code{user/bin/}. Keep them simple and predictable; they double as tests for the
+kernel.
+
+\begin{center}
+\small\renewcommand{\arraystretch}{1.25}
+\begin{tabularx}{\linewidth}{@{}l X@{}}
+\toprule
+\tkth{Group} & \tkth{Programs and what they exercise} \\
+\midrule
+text & \code{echo}, \code{cat} (files or stdin), \code{wc} (\code{-l -w -c}), \code{hexdump}: read, write, pipes \\
+files & \code{ls} (with \code{-l}), \code{mkdir}, \code{rm}, \code{cp}, \code{mv}, \code{touch}: \code{getdents}, \code{stat}, \code{open} flags, \code{unlink}, \code{rename} \\
+processes & \code{ps}, \code{kill}, \code{sleep}: a \code{getprocs} system call that copies a table of task information to the user, signals, timers \\
+system & \code{uptime}, \code{clear} (ANSI escape), \code{sync}, \code{shutdown} (sync, then power off QEMU with \code{outw(0x604, 0x2000)} in the kernel) \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\task{Boot into the shell}
+Make \code{init} open \code{/dev/tty} for descriptors 0--2, print a banner, start \code{tsh}, and start a new one
+whenever it exits, while still reaping orphans. Keep the old kernel monitor reachable for emergencies, for example on
+the serial port or with a \code{monitor} boot option. Code page 437 has no ş, so a banner like ``Turk-OS 1.0 -- Hos
+geldiniz!'' stays ASCII until Phase 15.
+\verify{Turk-OS boots straight to \code{turk@os:/$}, and typing \code{exit} brings back a fresh shell.}
+
+\task{Test the userland}
+Add a \code{-c} option to \code{tsh} (run one command line and exit) and a test runner that executes a list of command
+lines and compares their output with expected text. Put these cases in \code{make test}.
+
+\begin{center}
+\small\renewcommand{\arraystretch}{1.25}
+\begin{tabularx}{\linewidth}{@{}l l@{}}
+\toprule
+\tkth{Command line} & \tkth{Expected output} \\
+\midrule
+\code{echo a b c} & \code{a b c} \\
+\code{echo merhaba | wc -c} & \code{8} \\
+\code{echo x > /mnt/t; cat /mnt/t; rm /mnt/t} & \code{x} \\
+\code{cat /etc/motd | cat | cat | wc -l} & the number of lines in \code{motd} \\
+\code{nosuchprogram} & an error message, exit status 127 \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\section{Testing and debugging}
+
+\begin{pitfalls}
+A pipeline never finishes & Some process (often the shell) still holds a pipe write end, so the reader never sees end-of-file & Close every unused end in every process; list open descriptors with a debug command. \\
+Output from \code{printf} is missing & Buffered data never flushed, because the program called \code{_exit} or crashed & \code{exit} must flush; use \code{stderr} for debug output. \\
+Ctrl+C kills the shell & The shell didn't ignore \code{SIGINT}, or it stayed the foreground group & Ignore \code{SIGINT} in \code{tsh}; set the job as foreground before \code{exec} and take it back after \code{wait}. \\
+\code{ls} in a pipe prints nothing, but works alone & The program writes to the terminal directly instead of to descriptor 1 & All output goes through \code{write(1, ...)}; only the tty driver knows about the screen. \\
+Zombies accumulate after background jobs & Background children are never waited for & Reap with \code{WNOHANG} before every prompt. \\
+Arguments arrive garbled in \code{main} & Wrong \code{argv} layout on the initial stack or missing NULL terminator & Compare the stack with the Phase 11 diagram in GDB. \\
+\end{pitfalls}
+
+\section{Milestone}
+
+\begin{milestonebox}[A usable system]
+\begin{checklist}
+  \item Turk-libc provides system call wrappers with \code{errno}, strings, \code{malloc} and buffered \code{stdio}.
+  \item Pipes, the terminal line discipline and ANSI output work.
+  \item Turk-OS boots to a \code{tsh} prompt; pipelines, redirection, background jobs and Ctrl+C work.
+  \item The core utilities are present and pass the scripted tests.
+  \item No zombies remain after a long interactive session.
+\end{checklist}
+\end{milestonebox}
+
+\begin{questionbox}
+\begin{enumerate}
+  \item Why does the shell \code{fork} before \code{exec}? What would break if it called \code{exec} directly?
+  \item Explain exactly how \code{ls | wc} is wired with \code{pipe}, \code{fork} and \code{dup2}.
+  \item Why must unused pipe ends be closed, and by whom?
+  \item Why is \code{cd} a built-in and not a program in \code{/bin}?
+  \item Canonical versus raw mode: who implements line editing in Turk-OS, and why not the shell?
+  \item List every layer a \code{printf} passes through on its way to the screen.
+\end{enumerate}
+\end{questionbox}
+
+\section{Going further}
+
+Add job control: process groups, \code{fg}, \code{bg} and \code{jobs}, and Ctrl+Z sending \code{SIGTSTP}. Give
+\code{tsh} variables, \code{if}, \code{for} and scripts run from files. Write a small full-screen text editor that uses
+raw mode and ANSI escapes. Or port an existing program with modest needs; a small interpreter such as Lua is a
+classic target, and the missing libc functions it asks for will show you what your library still lacks.
+
+\nextphase{15}{Hardening, Polish and Release: Turk-OS 1.0}
+\booklegend
+\end{document}

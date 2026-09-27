@@ -1,0 +1,369 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{turkos}
+
+\begin{document}
+\phaseheader{4}{Hardware Interrupts: PIC, Timer and Keyboard}{Let devices interrupt the CPU, keep time with the PIT, read the keyboard, and give Turk-OS its first interactive prompt}{22}{28}
+
+\ataglance{2 weeks}{3}{Phase 3: GDT, IDT, exception stubs, \code{register_interrupt_handler}}{A remapped 8259 PIC, IRQ
+dispatch with end-of-interrupt handling, a 100\,Hz timer with uptime and \code{sleep_ms}, a PS/2 keyboard driver
+(shift, caps lock, optionally the Turkish Q layout), and a kernel monitor prompt with commands like \code{help},
+\code{uptime}, \code{mem} and \code{reboot}.}
+
+\section{Why this phase}
+
+So far the kernel only does what \code{kmain} tells it, in order. Real systems are driven by events: a key press, a
+timer tick, a disk finishing a read. Devices announce these events with \textbf{interrupts}, and in this phase you
+connect the first two devices to the IDT you built in Phase 3.
+
+The timer matters more than it looks. A periodic tick is how the kernel gets control back from a running program,
+which makes preemptive multitasking possible in Phase 8, and it is also the kernel's clock for timeouts and
+\code{sleep}. The keyboard gives you input, and together with the screen that makes Turk-OS interactive for the first
+time. You will end the phase with a small command monitor inside the kernel. It is not a real shell, since that has
+to be a user program (Phase 14), but you will use it constantly as a test console from now on.
+
+\section{Concepts you need}
+
+\subsection{The 8259 Programmable Interrupt Controller}
+
+Devices don't wire straight into the CPU. On a PC they raise an \textbf{IRQ} line on an interrupt controller, the
+classic 8259A PIC, which forwards one interrupt at a time to the CPU along with a vector number. There are two PICs in
+a cascade: the master handles IRQ 0--7, and the slave handles IRQ 8--15 and reports through the master's IRQ 2
+(Figure~\ref{fig:pic}).
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[node distance=0.4cm and 1.2cm, every node/.style={font=\sffamily\scriptsize}]
+  \node[tkhi, minimum width=2.2cm, minimum height=1.4cm] (cpu) {\textbf{CPU}\\INTR pin};
+  \node[tkbox, minimum width=2.6cm, minimum height=2.0cm, left=2.7cm of cpu] (m) {\textbf{Master PIC}\\ports \code{0x20}/\code{0x21}\\vectors 32--39};
+  \node[tkbox, minimum width=2.6cm, minimum height=2.0cm, below=0.9cm of m] (s) {\textbf{Slave PIC}\\ports \code{0xA0}/\code{0xA1}\\vectors 40--47};
+  \draw[tkarrow] (m) -- node[above, tknote] {interrupt + vector} (cpu);
+  \draw[tkarrow] (s.north) -- node[right, tknote] {cascade on IRQ 2} (m.south);
+  \node[tknote, align=right, anchor=east] (mi) at ([xshift=-0.3cm]m.west) {IRQ 0 timer (PIT)\\IRQ 1 keyboard\\IRQ 2 cascade\\IRQ 3--4 serial\\IRQ 7 printer / spurious};
+  \node[tknote, align=right, anchor=east] (si) at ([xshift=-0.3cm]s.west) {IRQ 8 real-time clock\\IRQ 12 PS/2 mouse\\IRQ 14 primary ATA disk\\IRQ 15 secondary ATA / spurious};
+  \draw[tkarrow] (mi.east) -- (m.west);
+  \draw[tkarrow] (si.east) -- (s.west);
+\end{tikzpicture}
+\caption{The two cascaded PICs after Turk-OS remaps them. IRQ 14 returns in Phase 12.}
+\label{fig:pic}
+\end{figure}
+
+Three things about the PIC trip everyone up. First, the BIOS programs the master to use vectors 8--15, which collide
+with CPU exceptions: the timer's IRQ 0 would arrive as vector 8 and look exactly like a double fault. So the very
+first job is to \textbf{remap} the PICs to vectors 32--47. Second, after handling an IRQ you must send an
+\textbf{end-of-interrupt} (EOI) command, or the PIC never delivers that IRQ again; for IRQs 8--15, both the slave
+and the master need one. Third, each PIC has a \textbf{mask} register where a set bit disables an IRQ line. You will
+unmask only the devices you have drivers for.
+
+\subsection{Timekeeping with the PIT}
+
+The 8253/8254 Programmable Interval Timer counts down from a value you choose, driven by a fixed
+1\,193\,182\,Hz oscillator, and raises IRQ 0 each time the count reaches zero. For a 100\,Hz tick the divisor is
+$1\,193\,182 / 100 \approx 11\,932$. Each tick the kernel increments a counter, and everything else follows from it:
+uptime, \code{sleep}, timeouts, and in Phase 8 the scheduler's time slices. \MOS\,\S5.5 separates \emph{clock
+hardware} from \emph{clock software} the same way, and also describes soft timers, a useful idea for later.
+
+\subsection{The PS/2 keyboard}
+
+A keyboard controller (the 8042) sits between the keyboard and the CPU. When you press or release a key it puts a
+\textbf{scan code} in its data port \code{0x60} and raises IRQ 1. Scan codes identify physical keys, not characters.
+In the default scan code set 1, pressing a key sends its \emph{make code} and releasing it sends the same code with
+bit 7 set (the \emph{break code}). Some keys send an \code{0xE0} prefix first. Turning key events into characters is
+your job, and it needs a little state: which modifiers (shift, ctrl, alt) are held and whether caps lock is on. The
+last step is a \textbf{layout} table from key to character, and a Turkish Q keyboard needs a different table from a US
+one. The controller will not report another key until you have read port \code{0x60}.
+
+\subsection{Doing as little as possible in an interrupt}
+
+An interrupt handler runs at an unpredictable moment, with interrupts disabled by the interrupt gate, on top of
+whatever the CPU was doing. It should therefore do the minimum and get out: read the hardware, store the data, send
+the EOI. The slow work (translating keys, echoing, parsing commands) happens outside, in normal code that takes data
+from a buffer. \MOS\,\S5.3.1 and \OSDI\,\S3.2.2 describe this split, and Figure~\ref{fig:key} shows it for a key
+press. The ring buffer between the two halves is your first shared data structure between interrupt context and
+normal code. Phase 9 comes back to making that safe in general.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[node distance=0.35cm and 0.42cm, every node/.style={font=\sffamily\scriptsize}]
+  \node[tkbox, text width=1.1cm] (k) {key press};
+  \node[tkbox, text width=1.6cm, right=of k] (c) {8042 puts scan code in \code{0x60}};
+  \node[tkbox, text width=1.5cm, right=of c] (p) {PIC: IRQ 1 $\rightarrow$ vector 33};
+  \node[tkbox, text width=1.9cm, right=of p] (s) {stub + \code{isr_handler} + EOI};
+  \node[tkhi, text width=2.8cm, right=of s] (h) {\code{keyboard_handler}:\\read port, store};
+  \node[tkok, text width=1.5cm, below=0.7cm of h] (rb) {ring buffer};
+  \node[tkbox, text width=2.6cm, left=0.9cm of rb] (m) {monitor: \code{kbd_getchar()}, echo, parse};
+  \draw[tkarrow] (k) -- (c); \draw[tkarrow] (c) -- (p); \draw[tkarrow] (p) -- (s); \draw[tkarrow] (s) -- (h);
+  \draw[tkarrow] (h) -- (rb); \draw[tkarrow] (rb) -- (m);
+  \node[tknote, above=0.1cm of s] {interrupt context};
+  \node[tknote, below=0.1cm of m] {normal kernel code};
+\end{tikzpicture}
+\caption{A key press, from the keyboard to the monitor. Only the red box runs with interrupts off.}
+\label{fig:key}
+\end{figure}
+
+\section{Reading plan}
+
+\begin{readingplan}
+\must & \LOB & Ch.~6, rest: \emph{Programmable Interrupt Controller (PIC)}, \emph{Reading Input from the Keyboard} & 43--45 & Tasks 4.1, 4.2 and 4.4. \\
+\must & \LOB & Ch.~14, section \emph{Programmable Interval Timer} & 74 & Task 4.3. \\
+\must & \MOS & \S5.5 \emph{Clocks}: clock hardware, clock software, soft timers & 388--394 & What a tick is for, and what to build on it. \\
+\must & \OSTEP & Ch.~36 \S36.3--36.4 (the canonical protocol; lowering CPU overhead with interrupts) & 407--409 & Polling versus interrupts, now with real devices. \\
+\should & \MOS & \S5.2 \emph{Principles of I/O Software}; \S5.3.1 \emph{Interrupt Handlers} & 351--357 & Programmed versus interrupt-driven I/O; what a handler must do. \\
+\should & \MOS & \S5.6.1 \emph{Input Software} (keyboard software) & 394--399 & Scan codes, raw versus cooked input, line editing. \\
+\should & \OSDI & \S2.8 \emph{The Clock Task in MINIX 3} & 204--214 & A real clock driver: tick handling, alarms, accounting. \\
+\should & \OSDI & \S3.8.5 \emph{Implementation of the Keyboard Driver} & 350--357 & Scan code processing and keymaps in MINIX. \\
+\could & \OSDI & \S3.1.4 \emph{Interrupts}; \S3.2.2 \emph{Interrupt Handlers} & 226--227, 231 & Short, clear summary of the hardware side. \\
+\could & \OSDI & \S3.8.1--3.8.2 \emph{Terminal Hardware}, \emph{Terminal Software} & 303--316 & Canonical mode and special keys, preview of Phase 14. \\
+\end{readingplan}
+
+\begin{minixbox}
+MINIX programs the PIC in \texttt{kernel/i8259.c (08100)} with the same ICW1--ICW4 sequence as Task~4.1. Its clock
+interrupt handler in \texttt{kernel/clock.c (10400)} does almost nothing: it updates the time, charges the tick to
+the running process, and only wakes the clock task if something (an expired alarm or time slice) needs attention.
+That is the ``do little in the handler'' rule in a real kernel. The keyboard driver in
+\texttt{drivers/tty/keyboard.c (15200)} buffers raw scan codes in its interrupt handler and translates them later
+through a loadable keymap, which is how MINIX supports many layouts.
+\end{minixbox}
+
+\section{Build it}
+
+\task{Remap and mask the PIC}
+Send the four initialisation words to both PICs, moving IRQ 0--7 to vectors 32--39 and IRQ 8--15 to 40--47, then mask
+everything except the timer and keyboard. Give each write a moment with \code{io_wait()}; old hardware needed it and
+it costs nothing.
+
+\begin{lst}{c}{kernel/arch/i386/pic.c}
+#define PIC1_CMD  0x20
+#define PIC1_DATA 0x21
+#define PIC2_CMD  0xA0
+#define PIC2_DATA 0xA1
+
+void pic_remap(void)
+{
+    outb(PIC1_CMD,  0x11); io_wait();   /* ICW1: begin initialisation, ICW4 follows */
+    outb(PIC2_CMD,  0x11); io_wait();
+    outb(PIC1_DATA, 0x20); io_wait();   /* ICW2: master vector offset = 32          */
+    outb(PIC2_DATA, 0x28); io_wait();   /* ICW2: slave vector offset  = 40          */
+    outb(PIC1_DATA, 0x04); io_wait();   /* ICW3: a slave is attached to IRQ 2       */
+    outb(PIC2_DATA, 0x02); io_wait();   /* ICW3: slave's cascade identity is 2      */
+    outb(PIC1_DATA, 0x01); io_wait();   /* ICW4: 8086/88 mode                       */
+    outb(PIC2_DATA, 0x01); io_wait();
+    outb(PIC1_DATA, 0xFC);              /* mask: only IRQ 0 and IRQ 1 enabled       */
+    outb(PIC2_DATA, 0xFF);              /* mask every slave IRQ for now             */
+}
+
+void pic_send_eoi(uint8_t irq)
+{
+    if (irq >= 8)
+        outb(PIC2_CMD, 0x20);           /* slave first for IRQ 8..15 */
+    outb(PIC1_CMD, 0x20);
+}
+\end{lst}
+
+\task{IRQ stubs and dispatch}
+Add sixteen stubs for vectors 32--47 to \code{isr.s}. They push a dummy error code and the vector, then reuse
+\code{isr_common}, so IRQs get the same \code{struct regs} as exceptions. Install them in \code{idt_init} with type
+\code{0x8E}. In \code{isr_handler}, route vectors 32--47 to the registered handler and then send the EOI.
+
+\begin{lst}{asm}{kernel/arch/i386/isr.s (additions)}
+%macro IRQ 2
+irq%1:
+    push dword 0            ; IRQs have no error code
+    push dword %2           ; vector number = 32 + IRQ
+    jmp  isr_common
+%endmacro
+
+IRQ 0, 32
+IRQ 1, 33
+; ... one line per IRQ ...
+IRQ 15, 47
+\end{lst}
+
+\begin{lst}{c}{kernel/arch/i386/isr.c (addition at the top of isr_handler)}
+if (r->int_no >= 32 && r->int_no < 48) {
+    if (handlers[r->int_no])
+        handlers[r->int_no](r);
+    pic_send_eoi(r->int_no - 32);
+    return;
+}
+\end{lst}
+
+\task{The timer}
+Program PIT channel 0 for 100\,Hz and count ticks in a handler. Build \code{timer_ticks()},
+\code{uptime_ms()} and \code{sleep_ms()} on top. Keep the counter a \code{volatile uint32_t}: on a 32-bit CPU, a
+64-bit counter is read in two halves, and a tick can land between them and give a torn value. At 100\,Hz a 32-bit
+counter lasts about 497 days.
+
+\begin{lst}{c}{kernel/drivers/pit.c}
+#define PIT_BASE_HZ 1193182
+
+static volatile uint32_t ticks;
+
+static void timer_handler(struct regs *r) { (void)r; ticks++; }
+
+void pit_init(uint32_t hz)
+{
+    uint16_t divisor = PIT_BASE_HZ / hz;
+    outb(0x43, 0x36);                   /* channel 0, low byte then high byte, mode 3 */
+    outb(0x40, divisor & 0xFF);
+    outb(0x40, divisor >> 8);
+    register_interrupt_handler(32, timer_handler);
+}
+
+void sleep_ms(uint32_t ms)
+{
+    uint32_t end = ticks + ms / 10;     /* 10 ms per tick at 100 Hz */
+    while ((int32_t)(end - ticks) > 0)  /* this comparison survives wrap-around */
+        __asm__ volatile ("hlt");       /* sleep until the next interrupt */
+}
+\end{lst}
+
+Enable interrupts only after everything they might touch is ready. The order in \code{kmain} is:
+\code{gdt_init()}, \code{idt_init()}, \code{pic_remap()}, \code{pit_init(100)}, \code{keyboard_init()}, then
+\code{__asm__ volatile ("sti")}.
+\verify{Print the tick count once a second for a minute; it goes up by 100 each time. Compare \code{sleep_ms(5000)}
+with a stopwatch.}
+
+\task{The keyboard driver}
+Write \code{kernel/drivers/keyboard.c}. The handler reads the scan code, updates modifier state on make and break
+codes, and for ordinary key presses translates through a layout table and puts the character in a ring buffer (your
+Phase 0 code). Start with the US layout; the table below covers the main block of keys in scan code set 1.
+
+\begin{lst}{c}{kernel/drivers/keyboard.c}
+static const char keymap_us[128] = {
+    0, 27, '1','2','3','4','5','6','7','8','9','0','-','=','\b',   /* 0x00-0x0E */
+    '\t','q','w','e','r','t','y','u','i','o','p','[',']','\n',      /* 0x0F-0x1C */
+    0,  'a','s','d','f','g','h','j','k','l',';','\'','`',           /* 0x1D-0x29 */
+    0,  '\\','z','x','c','v','b','n','m',',','.','/', 0, '*',       /* 0x2A-0x37 */
+    0,  ' ',                                                        /* 0x38-0x39 */
+};
+/* keymap_us_shift[] is the same table with the shifted characters. */
+
+static bool shift, ctrl, caps;
+static struct ringbuf kbd_buf;
+
+static void keyboard_handler(struct regs *r)
+{
+    (void)r;
+    uint8_t sc = inb(0x60);             /* always read, or no further keys arrive */
+    bool released = sc & 0x80;
+    sc &= 0x7F;
+
+    switch (sc) {
+    case 0x2A: case 0x36: shift = !released; return;   /* left / right shift */
+    case 0x1D:            ctrl  = !released; return;   /* left ctrl          */
+    case 0x3A: if (!released) caps = !caps;  return;   /* caps lock toggles  */
+    }
+    if (released)
+        return;
+
+    char c = keymap_us[sc];
+    bool letter = (c >= 'a' && c <= 'z');
+    if (shift ^ (caps && letter))
+        c = keymap_us_shift[sc];
+    if (c)
+        rb_put(&kbd_buf, c);
+}
+\end{lst}
+
+The consumer side waits for a key with the processor halted. Checking the buffer and then halting has a tiny race:
+if the key arrives between the check and \code{hlt}, you sleep until the next tick. On x86 the classic cure is to
+disable interrupts for the check and use \code{sti; hlt} together, because \code{sti} only takes effect after the
+following instruction, so no interrupt can slip in between them.
+
+\begin{lst}{c}{kernel/drivers/keyboard.c (consumer)}
+char kbd_getchar(void)
+{
+    char c;
+    for (;;) {
+        __asm__ volatile ("cli");
+        if (rb_get(&kbd_buf, &c)) {
+            __asm__ volatile ("sti");
+            return c;
+        }
+        __asm__ volatile ("sti; hlt");  /* enable interrupts and sleep, atomically */
+    }
+}
+\end{lst}
+\verify{Letters, digits, punctuation, shift and caps lock all produce the right characters. Holding a key produces
+auto-repeat, because the keyboard itself resends the make code.}
+
+\task{The Turkish Q layout (optional)}
+Add a second table and a way to switch between them, for example a \code{layout tr} command. On a Turkish Q
+keyboard the letter keys sit on the same scan codes as their US neighbours: \code{0x17} gives ı (and I with shift),
+\code{0x1A} ğ, \code{0x1B} ü, \code{0x27} ş, \code{0x28} i (and İ with shift), \code{0x33} ö and \code{0x34} ç.
+Because several of these characters are outside ASCII, let the keyboard produce Unicode code points instead of
+\code{char}, and let the console convert them for the screen. Code page 437 can show ç, ö and ü directly; print a
+placeholder for ğ, ş and ı until Phase 15 gives you a font that has them.
+
+\task{Line input and the kernel monitor}
+Write \code{readline(buf, size)}, which echoes characters, handles backspace (it uses your VGA driver's
+\texttt{\textbackslash b}) and returns on Enter. Then write the monitor loop: print a prompt, read a line, split it at
+spaces, and look the first word up in a command table. Every later phase adds commands here.
+
+\begin{center}
+\small\renewcommand{\arraystretch}{1.25}
+\begin{tabularx}{\linewidth}{@{}l X@{}}
+\toprule
+\tkth{Command} & \tkth{What it does} \\
+\midrule
+\code{help} & list all commands with one-line descriptions (from the command table itself) \\
+\code{clear}, \code{echo <text>}, \code{color <fg> <bg>} & exercise the VGA driver \\
+\code{uptime}, \code{ticks} & show time since boot from the PIT counter \\
+\code{mem} & memory size from the Multiboot information (a real report arrives in Phase 5) \\
+\code{crash <kind>} & run one of your Phase 3 exception tests \\
+\code{reboot} & wait until \code{inb(0x64) & 0x02} is clear, then \code{outb(0x64, 0xFE)} to pulse the CPU reset line \\
+\bottomrule
+\end{tabularx}
+\end{center}
+\verify{A session like \code{turk> uptime} prints the right time; backspace edits the line; \code{reboot} restarts
+QEMU and you see the boot banner again.}
+
+\section{Testing and debugging}
+
+Run with \code{-d int -no-reboot} once to watch the interrupts arrive: you should see a stream of \code{v=20} (timer)
+entries and a \code{v=21} for every key event. The QEMU monitor command \code{info pic} shows the PIC state,
+including the mask and in-service registers.
+
+\begin{pitfalls}
+Exactly one timer interrupt ever arrives & No EOI sent, so the PIC never delivers IRQ 0 again & Send the EOI after every IRQ, including when no handler is registered. \\
+Double fault (vector 8) as soon as you run \code{sti} & PIC not remapped: IRQ 0 arrives as vector 8 & Remap before \code{sti}. This is the classic first-IRQ bug. \\
+The keyboard works for one key, then stops & Port \code{0x60} not read in the handler, or no EOI & Read the scan code unconditionally at the start of the handler. \\
+Timer much too fast or slow & Divisor wrong, or overflowed 16 bits & For 100\,Hz it is 11\,931; the minimum frequency is about 19\,Hz. \\
+Random characters appear or disappear & The handler and the reader race on the ring buffer indices & One producer and one consumer with \code{volatile} indices is safe here; Phase 9 generalises it. \\
+Occasional interrupt on vector 39 (IRQ 7) or 47 & Spurious IRQ from the PIC & Read the in-service register (OCW3 \code{0x0B}); if the bit is clear, it was spurious: skip the EOI (for IRQ 15, send it to the master only). \\
+\end{pitfalls}
+
+\section{Milestone}
+
+\begin{milestonebox}[Turk-OS is interactive]
+\begin{checklist}
+  \item PIC remapped to 32--47; only the timer and keyboard are unmasked; every IRQ gets an EOI.
+  \item Ticks arrive at 100\,Hz; \code{uptime} is accurate and \code{sleep_ms} works.
+  \item Typing echoes correctly with shift, caps lock and backspace.
+  \item The monitor runs \code{help}, \code{clear}, \code{uptime}, \code{mem}, \code{crash} and \code{reboot}.
+  \item Left idle for ten minutes at the prompt, the kernel neither crashes nor spins: it halts between interrupts.
+\end{checklist}
+\end{milestonebox}
+
+\begin{questionbox}
+\begin{enumerate}
+  \item Why must the PICs be remapped, and what exactly goes wrong if you skip it?
+  \item What is an EOI, and why do IRQs 8--15 need two of them?
+  \item Compute the PIT divisor for 1000\,Hz. What would that frequency cost and what would it buy you?
+  \item How is a key release distinguished from a key press in scan code set 1?
+  \item Why should an interrupt handler do as little as possible? Where does the rest of the work go?
+  \item Why is \code{sti; hlt} safe while \code{sti} followed later by \code{hlt} is not?
+\end{enumerate}
+\end{questionbox}
+
+\section{Going further}
+
+Read the real-time clock (CMOS ports \code{0x70}/\code{0x71}) and add a \code{date} command that prints the date in
+Turkish format (\code{25.09.2026 14:05}). Make the PC speaker beep using PIT channel 2. Add arrow-key history to
+\code{readline} (arrows send \code{0xE0}-prefixed codes). If you want to prepare for multiprocessor support, read
+about the local APIC and I/O APIC, which replace the PIC on modern machines; you will need them only if you take the
+SMP track in Phase 15.
+
+\nextphase{5}{Physical Memory Management}
+\booklegend
+\end{document}

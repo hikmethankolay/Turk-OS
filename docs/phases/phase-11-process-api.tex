@@ -1,0 +1,320 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{turkos}
+
+\begin{document}
+\phaseheader{11}{Process API: fork, exec, wait and exit}{Implement the UNIX process model, and use the page-fault handler to make fork cheap and memory grow on demand}{70}{77}
+
+\ataglance{3 weeks}{5}{Phase 10: user processes in their own address spaces, system calls, ELF loading, \code{copy_from_user}}{\code{fork}
+with copy-on-write, \code{execve} with \code{argc}/\code{argv}, \code{waitpid}, \code{exit} with zombies and orphan
+reparenting, \code{getppid}, \code{brk} with lazy allocation, a stack that grows on demand, minimal signals
+(\code{kill}, \code{SIGSEGV}, \code{SIGINT}), and a user-space \code{init} process that starts and reaps other programs.}
+
+\section{Why this phase}
+
+UNIX creates processes in an unusual way, and it turned out to be one of its best ideas. Instead of one call that
+starts a program, there are two. \code{fork} makes an exact copy of the calling process. \code{exec} replaces the
+calling process's program with a new one. The parent then uses \code{wait} to learn when its child has finished.
+\OSTEP chapter 5 explains why the split is so powerful: between \code{fork} and \code{exec}, the child can rearrange
+its own environment (redirect its output to a file, connect a pipe, change directory) without the program it is about
+to run knowing anything about it. Your shell in Phase 14 depends on exactly that.
+
+A naive \code{fork} copies every page of the parent, only for \code{exec} to throw the copy away a moment later. The
+fix is \textbf{copy-on-write} (COW): share the pages and copy each one only when someone writes to it. COW is your
+first use of a page fault as a \emph{feature} rather than an error, and the same idea gives you lazily allocated heaps
+and stacks that grow on demand. After this phase, the page-fault handler is one of the most important functions in
+the kernel.
+
+\section{Concepts you need}
+
+\subsection{The four calls and their contracts}
+
+\textbf{\code{fork()}} creates a child that is a copy of the parent: same memory contents, same registers, same open
+files later. It returns twice: the child's PID in the parent and 0 in the child. \textbf{\code{execve(path, argv,
+envp)}} loads a new program into the current process, keeping its PID and open files; on success it never returns.
+\textbf{\code{exit(status)}} ends the process, but it can't vanish entirely: its exit status must be kept until the
+parent collects it, so it becomes a \textbf{zombie}. \textbf{\code{waitpid(pid, &status, options)}} blocks until a
+child exits, collects its status and frees what is left of it. If a parent exits first, its children become
+\textbf{orphans} and are adopted by \code{init} (PID 1), whose job includes reaping them (Figure~\ref{fig:tree}).
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[proc/.style={draw=tkNavy!70, fill=tkLight, rounded corners=2pt, font=\sffamily\scriptsize, align=center, minimum width=2.2cm, minimum height=0.8cm},
+  zomb/.style={proc, fill=tkGray!18, dashed}, level distance=1.35cm, sibling distance=3.0cm, edge from parent/.style={draw=tkNavy!70, -{Stealth[length=2mm]}}]
+  \node[proc, fill=tkRed!10] {\textbf{init} (pid 1)\\reaps orphans}
+    child {node[proc] {\textbf{tsh} (pid 5)\\the shell}
+      child {node[proc] {\textbf{ls} (pid 9)\\\code{fork} + \code{exec}}}
+      child {node[zomb] {\textbf{cat} (pid 8)\\zombie until \code{wait}}}}
+    child {node[proc] {\textbf{daemon} (pid 7)\\parent exited:\\adopted by init}};
+\end{tikzpicture}
+\caption{A Turk-OS process tree in Phase 14. Every process except init has a parent that must eventually \code{wait} for it.}
+\label{fig:tree}
+\end{figure}
+
+\subsection{Copy-on-write}
+
+At \code{fork}, instead of copying the parent's pages, the kernel makes the child's page tables point to the same
+frames and marks every writable page \emph{read-only} in \emph{both} processes, with a spare PTE bit (one of the AVL
+bits 9--11) recording that it is really a COW page. Reading works as normal. The first write by either process causes
+a page fault; the handler sees the COW bit, copies that one page to a fresh frame, maps the copy writable for the
+faulting process, and returns. The CPU retries the write, which now succeeds (Figure~\ref{fig:cow}). A per-frame
+\textbf{reference count} tells the handler how many address spaces share a frame: if it is already down to one, the
+handler just makes the page writable again. \OSC\,\S10.3 describes COW, and \OSC\,\S10.2 describes the demand paging
+it builds on.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[pt/.style={draw=tkNavy!70, fill=tkLight, minimum width=2.4cm, minimum height=0.55cm, font=\sffamily\scriptsize},
+  fr/.style={draw=tkNavy!70, minimum width=1.9cm, minimum height=0.9cm, font=\sffamily\scriptsize, align=center}]
+  \node[font=\sffamily\small\bfseries, text=tkNavy] at (2.4,1.6) {right after \code{fork}};
+  \node[pt] (a1) at (0,0.6) {parent PTE: R, COW};
+  \node[pt] (b1) at (0,-0.6) {child PTE: R, COW};
+  \node[fr, fill=tkAmber!15] (f1) at (4.3,0) {frame X\\refcount 2};
+  \draw[tkarrow] (a1.east) -- (f1); \draw[tkarrow] (b1.east) -- (f1);
+  \node[font=\sffamily\small\bfseries, text=tkNavy] at (11.0,1.6) {after the child writes};
+  \node[pt] (a2) at (8.6,0.6) {parent PTE: R, COW};
+  \node[pt] (b2) at (8.6,-0.6) {child PTE: R/W};
+  \node[fr, fill=tkAmber!15] (f2) at (12.9,0.6) {frame X\\refcount 1};
+  \node[fr, fill=tkGreen!12] (f3) at (12.9,-0.6) {frame Y (copy)\\refcount 1};
+  \draw[tkarrow] (a2.east) -- (f2); \draw[tkarrow] (b2.east) -- (f3);
+  \draw[tkarrow, tkRed, line width=0.9pt] (5.5,0) -- node[above, font=\sffamily\scriptsize, text=tkRed] {write fault} (7.1,0);
+\end{tikzpicture}
+\caption{Copy-on-write for one page. The parent's next write finds refcount 1 and only needs its PTE made writable.}
+\label{fig:cow}
+\end{figure}
+
+\subsection{Faults as a feature}
+
+\MOS\,\S3.6.2 lists the steps of page-fault handling in a real kernel, and \OSTEP chapters 21--22 go further: when
+memory runs out, pages can be written to disk and brought back by a fault (swapping), which needs a replacement
+policy such as the clock algorithm. Turk-OS uses faults for three things in this phase. \textbf{COW}: a write to a
+present page marked COW. \textbf{Lazy heap}: \code{brk} only moves the heap's end, and a fault inside the heap maps a
+zeroed page. \textbf{Stack growth}: a fault just below the stack maps a new page, up to a limit. Anything else from
+user mode is a real error and ends the process with \code{SIGSEGV}. Swapping is a stretch goal once you have a disk.
+
+\section{Reading plan}
+
+\begin{readingplan}
+\must & \OSTEP & Ch.~5 \emph{Interlude: Process API} (\code{fork}, \code{wait}, \code{exec}, why the split, redirection). Do its homework on Linux first & 37--48 & The exact semantics you must reproduce. \\
+\must & \OSDI & \S4.7 \emph{Overview of the MINIX 3 Process Manager}: memory layout, \code{fork}/\code{exit}/\code{wait} (\S4.7.4), \code{exec} (\S4.7.5), \code{brk} (\S4.7.6), signals (\S4.7.7) & 420--447 & A complete UNIX process model, explained step by step. \\
+\must & \OSDI & \S4.8.3--4.8.6 \emph{Implementation of fork, exit, wait, exec, brk, signal handling} & 455--471 & The real code for the same calls. \\
+\must & \OSC & \S10.2 \emph{Demand Paging}; \S10.3 \emph{Copy-on-Write} & 392--401 & Page faults as the mechanism behind COW and lazy allocation. \\
+\should & \OSC & \S3.3 \emph{Operations on Processes} & 116--123 & Creation, termination, zombies and orphans. \\
+\should & \MOS & \S3.6 \emph{Implementation Issues} (page fault handling, instruction backup, locking pages, backing store) & 233--240 & What a page-fault handler really has to deal with. \\
+\should & \OSTEP & Ch.~21--22 \emph{Beyond Physical Memory: Mechanisms}, \emph{Policies} & 227--254 & Swapping and replacement policies, for the stretch goal. \\
+\could & \MOS & \S3.4 \emph{Page Replacement Algorithms} & 209--222 & Optimal, NRU, FIFO, second chance, clock, LRU, working set. \\
+\could & \MOS & \S10.3 \emph{Processes in Linux} & 733--753 & \code{fork}, \code{clone} and \code{exec} in a production kernel. \\
+\end{readingplan}
+
+\begin{minixbox}
+The MINIX process manager is a user-space server, and its handlers read almost like pseudo-code:
+\code{do_fork}, \code{do_pm_exit} and \code{do_waitpid} in \texttt{servers/pm/forkexit.c (18400)}, \code{do_exec} in
+\texttt{servers/pm/exec.c (18700)}, \code{do_brk} in \texttt{servers/pm/break.c (19300)}, and signal handling in
+\texttt{servers/pm/signal.c (19500)}. Notice how \code{exec} builds the new stack with the argument strings and then
+patches the pointers in it: you will do the same in Task~11.6. One difference is fundamental: MINIX 3 has no paging,
+so its \code{fork} must copy the child's whole data segment immediately. With paging you can share and copy lazily.
+\end{minixbox}
+
+\section{Build it}
+
+\task{Processes, parents and the trap frame}
+Extend \code{struct task} with \code{ppid}, a list of children, \code{exit_code}, a wait queue for ``one of my children
+exited'', \code{heap_start} and \code{brk}, and \code{tf}: a pointer to the \code{struct regs} that the current system
+call entered with. Set \code{current->tf = r} at the top of the syscall handler; \code{fork}, \code{exec} and signals
+all need to read or change the saved user registers. Put a limit on the number of processes (say 64), so that a fork
+bomb fails with \code{-EAGAIN} instead of exhausting memory.
+
+\task{Frame reference counts}
+Add a reference count per physical frame to the PMM: a \code{uint16_t} array covers the 512\,MiB direct map with
+256\,KiB. \code{pmm_ref(pa)} increments; \code{pmm_unref(pa)} decrements and frees the frame when the count reaches
+zero. From now on, freeing a user page means unreferencing it.
+
+\task{fork, the simple version}
+Get \code{fork} right before making it fast. Create the child task and a new address space, and for every present
+user page in the parent, allocate a frame, copy the page through the direct map, and map it at the same address with
+the same flags. The difficult part is returning to user mode in the child. Copy the parent's trap frame to the top of
+the child's kernel stack and set its EAX to 0. Below it, build a \code{switch_context} frame whose return address is
+the exit path of \code{isr_common}, the instructions after \code{call isr_handler}. Give that point a label,
+\code{isr_return}. When the child is first scheduled, it ``returns'' through that path and \code{iret}s into user mode,
+at the instruction after \code{int 0x80}, with EAX = 0.
+
+\begin{lst}{c}{kernel/proc/fork.c (the tricky part)}
+extern void isr_return(void);               /* label in isr.s, just after "add esp, 4" */
+
+static void setup_child_stack(struct task *child, const struct regs *parent_tf)
+{
+    char *top = (char *)child->kstack + KSTACK_SIZE;
+    struct regs *tf = (struct regs *)(top - sizeof(struct regs));
+    *tf = *parent_tf;                        /* same user registers as the parent ...  */
+    tf->eax = 0;                             /* ... except fork() returns 0 in the child */
+
+    uint32_t *sp = (uint32_t *)tf;
+    *--sp = (uint32_t)isr_return;            /* switch_context's ret goes here */
+    *--sp = 0;                               /* ebp */
+    *--sp = 0;                               /* ebx */
+    *--sp = 0;                               /* esi */
+    *--sp = 0;                               /* edi */
+    child->esp = (uint32_t)sp;
+    child->tf  = tf;
+}
+\end{lst}
+\verify{A test where the parent sets a variable to 1 and the child sets it to 2 shows each process keeping its own
+value, and \code{fork} returns the child's PID in the parent.}
+
+\task{Copy-on-write}
+Replace the copying loop. For every present user PTE in the parent: if it is writable, clear R/W and set your
+\code{PG_COW} bit (\code{0x200}) in the parent's PTE; copy the PTE into the child; call \code{pmm_ref} on the frame.
+When the loop is done, reload CR3 in the parent: you changed many of its live mappings, and its TLB still holds the
+old writable ones. Then extend the page-fault handler.
+
+\begin{lst}{c}{kernel/mm/fault.c (COW case)}
+/* A write to a present page (error bits P and W set) below the kernel. The fault can come
+ * from user mode or from the kernel writing through copy_to_user (CR0.WP is set). */
+if ((r->err_code & 3) == 3 && addr < KERNEL_VMA) {
+    pte_t *pte = vmm_get_pte(current->pgdir, addr);
+    if (pte && (*pte & PG_COW)) {
+        uintptr_t old = *pte & ~0xFFFu;
+        if (pmm_refcount(old) == 1) {                    /* last user: just take it back */
+            *pte = (*pte | PG_WRITE) & ~PG_COW;
+        } else {
+            uintptr_t copy = pmm_alloc_frame();
+            if (!copy) { kill_current(SIGKILL); return; }
+            memcpy(P2V(copy), P2V(old), PAGE_SIZE);
+            *pte = copy | (*pte & 0xFFF & ~PG_COW) | PG_WRITE;
+            pmm_unref(old);
+        }
+        __asm__ volatile ("invlpg (%0)" : : "r"(addr) : "memory");
+        return;                                          /* the CPU retries the write */
+    }
+}
+\end{lst}
+\verify{Right after forking a process with a 1\,MiB array, the PMM free count drops only by a few frames (page tables
+and the kernel stack). Each write to a new page of the array in the child costs exactly one more frame.}
+
+\task{exit and waitpid}
+\code{sys_exit} frees the user pages and page tables (unreferencing frames), gives every child to \code{init}, marks
+the task as a zombie with its exit code, wakes the parent's wait queue, and schedules away. Keep the page directory
+itself and the kernel stack for the parent to free: the exiting task is still running on both. \code{sys_waitpid}
+looks for a zombie child that matches (\code{pid == -1} means any): if it finds one, it copies the status out with
+\code{copy_to_user}, frees the child completely and returns its PID. If there are no children at all it returns
+\code{-ECHILD}; with \code{WNOHANG} it returns 0; otherwise it sleeps on its wait queue and looks again.
+\verify{1000 iterations of fork, exit and wait bring the PMM free count and the heap statistics back to exactly their
+starting values. A child whose parent exits first is reaped by \code{init}.}
+
+\task{execve with arguments}
+The arguments live in the old address space, which you are about to throw away, so copy the path and the
+\code{argv}/\code{envp} strings into kernel buffers first (with size limits). Build a complete new address space and
+load the ELF into it. Only when everything has succeeded, switch to it, free the old one, and edit the trap frame:
+EIP is the new entry point, the user ESP is the new stack pointer. That way a failed \code{exec} returns an error to a
+process that still works. Lay out the new stack the way the System V i386 ABI does, and update \code{crt0}.
+
+\begin{lst}{plain}{initial user stack built by execve (higher addresses at the top)}
+0xC0000000  +-----------------------------------+
+            | argument and environment strings  |  "hello\0" "-v\0" "PATH=/bin\0"
+            +-----------------------------------+
+            | NULL                              |
+            | envp[0]                           |  pointers into the strings above
+            | NULL                              |
+            | argv[1], argv[0]                  |
+ESP  -->    | argc                              |  _start reads this first
+            +-----------------------------------+
+\end{lst}
+
+\begin{lst}{asm}{user/crt0.s (new version)}
+_start:
+    mov  eax, [esp]             ; argc
+    lea  ebx, [esp + 4]         ; argv
+    lea  ecx, [ebx + eax*4 + 4] ; envp = argv + argc + 1
+    push ecx
+    push ebx
+    push eax
+    call main                   ; main(argc, argv, envp)
+    push eax
+    call exit
+\end{lst}
+Until Phase 13 brings a file system, \code{execve} finds programs by name in the table of boot modules, so
+\code{execve("/bin/hello", ...)} looks up the module called \code{hello}.
+\verify{A program that prints its arguments shows exactly what its parent passed to \code{execve}. A failing
+\code{execve} (unknown program) returns \code{-ENOENT} and the caller continues normally.}
+
+\task{brk and a growing stack}
+\code{sys_brk(addr)} returns the current end of the heap when \code{addr} is 0, and otherwise moves the end, refusing
+to grow into the stack region; when the heap shrinks, unmap and unreference the pages beyond the new end. Don't map
+anything when it grows: in the page-fault handler, a not-present fault inside \code{[heap_start, brk)} maps a zeroed
+page. Similarly, a fault less than 8\,MiB below \code{0xC0000000} and near the current stack maps a new stack page.
+\verify{A user program that \code{brk}s 64\,MiB but touches only three pages costs three frames.}
+
+\task{Minimal signals}
+Add a pending-signal bitmask to each task, and \code{sys_kill(pid, sig)}. Before returning to user mode (in
+\code{isr_handler}, when the saved CS has RPL 3), check pending signals and apply the default action; for now every
+signal Turk-OS supports terminates the process, with exit status $128 + \text{signal}$ so the parent can tell. Turn
+user-mode exceptions into signals (\code{SIGSEGV} for page faults and \#GP, \code{SIGFPE} for divide errors,
+\code{SIGILL} for invalid opcodes). Make Ctrl+C on the console send \code{SIGINT} to a designated foreground process;
+Phase 14 formalises this with the terminal driver.
+
+\task{init, and the tests}
+Write \code{user/init.c}: the kernel starts it as PID 1 once the boot is done. For now it forks and execs the test
+programs one after another and loops on \code{waitpid(-1, ...)} forever, which also reaps orphans. Add these tests to
+\code{make test}.
+
+\begin{center}
+\small\renewcommand{\arraystretch}{1.25}
+\begin{tabularx}{\linewidth}{@{}l X@{}}
+\toprule
+\tkth{Test} & \tkth{What must hold} \\
+\midrule
+\code{fork_values} & parent and child see different return values and keep separate copies of variables \\
+\code{cow_frames} & forking a large process costs a few frames; each written page costs exactly one more \\
+\code{fork_exec_wait} & a child execs a program that exits with 42; \code{waitpid} reports 42 \\
+\code{orphans} & grandchildren of an exited process are reaped by init; no zombies remain \\
+\code{no_leaks} & 1000 fork/exec/exit/wait cycles leave PMM and heap statistics unchanged \\
+\code{fork_bomb} & forking without limit ends with \code{-EAGAIN}, and the system recovers when the processes exit \\
+\code{signals} & \code{kill(child, SIGKILL)} ends a looping child; \code{waitpid} reports status $128+9$ \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\section{Testing and debugging}
+
+\begin{pitfalls}
+The child crashes as soon as it runs & Its kernel stack doesn't match what \code{isr_return} pops, or the trap frame wasn't copied & Check in GDB that ESP at \code{isr_return} equals the address of the child's \code{struct regs}. \\
+Parent and child see each other's writes after \code{fork} & The parent's TLB still holds writable entries for pages now marked COW & Reload CR3 in the parent after the COW loop. \\
+A write by the kernel to user memory corrupts another process & CR0.WP not set, so the kernel wrote straight through a COW page & Set CR0.WP (Phase 6); the fault handler then copies the page for the kernel too. \\
+Free memory shrinks a little with every fork & A reference count isn't dropped somewhere: exit, exec's old address space, or a COW copy & Run \code{no_leaks}; print the counts before and after one cycle. \\
+Zombies pile up & Nobody waits: the shell or init doesn't reap & init loops on \code{waitpid(-1)}; later the shell reaps background jobs. \\
+A failed \code{exec} leaves a broken process & The old address space was freed before the load succeeded & Build first, swap last. \\
+\end{pitfalls}
+
+\section{Milestone}
+
+\begin{milestonebox}[The UNIX process model]
+\begin{checklist}
+  \item \code{fork} with copy-on-write, \code{execve} with arguments, \code{waitpid}, \code{exit}, \code{getpid}, \code{getppid} and \code{brk} work.
+  \item The page-fault handler resolves COW, lazy heap and stack growth, and turns everything else into \code{SIGSEGV}.
+  \item \code{init} runs as PID 1, starts programs and reaps every orphan.
+  \item All seven tests pass, including 1000 cycles without leaks.
+\end{checklist}
+\end{milestonebox}
+
+\begin{questionbox}
+\begin{enumerate}
+  \item Why does UNIX separate \code{fork} and \code{exec}? Give an example the split makes easy.
+  \item How does one call to \code{fork} return two different values? Point to the line in your kernel that does it.
+  \item Walk through copy-on-write for one page, including every TLB flush and reference count change.
+  \item What is a zombie, what is an orphan, and who cleans each up?
+  \item Why must \code{execve} copy its arguments into the kernel before building the new address space?
+  \item What does \code{exec} keep from the old process, and what does it replace?
+  \item Why does a lazy \code{brk} make programs that over-allocate cheap? What is the risk?
+\end{enumerate}
+\end{questionbox}
+
+\section{Going further}
+
+Once Phase 12 gives you a disk, add swapping: when the PMM runs low, pick a victim page with the clock algorithm
+(\OSTEP chapter 22, \MOS\,\S3.4.5), write it to a swap partition, mark the PTE not present with the disk slot in the
+free bits, and read it back on the next fault. Add user-level signal handlers with \code{sigaction} and a
+\code{sigreturn} trampoline on the user stack. Or implement threads inside a process with a \code{clone}-style call
+that shares the address space.
+
+\nextphase{12}{Storage: Block Devices, ATA Driver and Buffer Cache}
+\booklegend
+\end{document}

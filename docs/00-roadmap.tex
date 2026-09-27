@@ -1,0 +1,397 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{turkos}
+\renewcommand{\headlabel}{Roadmap}
+\hypersetup{pdftitle={Turk-OS Study Plan: Roadmap}, pdfauthor={Turk-OS Study Plan}}
+
+\begin{document}
+\thispagestyle{plain}
+
+\noindent\begin{tikzpicture}
+  \path[use as bounding box] (0,0) rectangle (\linewidth,4.2cm);
+  \fill[tkNavy, rounded corners=5pt] (0,0) rectangle (\linewidth,4.2cm);
+  \fill[tkRed, rounded corners=5pt] (0,0) rectangle (0.2\linewidth,4.2cm);
+  \fill[tkRed] (0.15\linewidth,0) rectangle (0.2\linewidth,4.2cm);
+  \node[font=\sffamily\bfseries\footnotesize, text=white, anchor=north] at (0.1\linewidth,3.85cm) {PHASES};
+  \node[font=\sffamily\bfseries\fontsize{34}{34}\selectfont, text=white] at (0.1\linewidth,2.05cm) {0--15};
+  \node[font=\sffamily\bfseries\fontsize{26}{28}\selectfont, text=white, anchor=north west] at (0.23\linewidth,3.8cm) {Turk-OS};
+  \node[font=\sffamily\bfseries\Large, text=white, anchor=north west] at (0.23\linewidth,2.65cm) {Roadmap: from zero to a working OS};
+  \node[font=\sffamily\small, text=white!78!tkNavy, anchor=south west, text width=0.74\linewidth, align=left] at (0.23\linewidth,0.35cm)
+    {A 16-phase study and build plan for a UNIX-like 32-bit x86 kernel, based on the five books in \texttt{Books/}};
+\end{tikzpicture}
+
+\vspace{0.4em}
+\noindent\tkprogress{0}{100}
+
+\tableofcontents
+
+\section{How to use this plan}
+
+You know basic C, you have never written assembly, and you have never built an operating system. That is a normal
+starting point: the authors of \LOB were in a similar position when they wrote it. This plan takes you from an empty
+folder to \textbf{Turk-OS 1.0}, a small UNIX-like operating system for 32-bit x86 PCs. It boots with GRUB, runs
+preemptive multitasking with separate address spaces, loads ELF programs from its own on-disk file system, and drops
+you into a shell with pipes and redirection. Everything runs in QEMU first. Real hardware is optional.
+
+The route has sixteen phases, numbered 0 to 15. Each phase has its own PDF in \texttt{docs/pdf/} and ends with a
+concrete, testable milestone. The percentages in each phase header (``0\,\% $\rightarrow$ 5\,\%'') estimate how much of
+the whole journey is behind you when that milestone is met. Phase 15 ends at 100\,\%, and it also lists optional
+tracks for going further.
+
+Every phase document follows the same layout, so you always know where to look. An \emph{at a glance} box gives the
+duration, difficulty, prerequisites and result. \emph{Why this phase} explains where it fits. \emph{Concepts} explains
+the ideas you must understand before you write code. The \emph{reading plan} lists book chapters with printed page
+numbers, each marked \must, \should or \could. \emph{Build it} breaks the work into numbered tasks with starter
+snippets and a way to verify each one. The document ends with a debugging table, the milestone checklist, self-check
+questions, and stretch goals.
+
+\subsection{The study loop}
+
+The same loop works in every phase. Keep to it, because skipping the reading makes the coding much slower.
+
+\begin{enumerate}
+  \item \textbf{Read the theory first}, usually \OSTEP, then the \must items from the other books.
+  \item \textbf{Read the practical chapter} in \LOB (when there is one) to see the concrete x86 steps.
+  \item \textbf{Look at a real system.} The MINIX lens box points to the matching \OSDI section and source file.
+  \item \textbf{Build in small steps.} One task at a time, boot after each change, commit when it works.
+  \item \textbf{Verify.} Every task has a \emph{Verify} line. A task is not finished until you have checked it.
+  \item \textbf{Write it down.} Keep a lab journal (\texttt{docs/journal.md}) with what you tried, what broke and why.
+  \item \textbf{Answer the self-check questions} without looking. If you can't, go back to the reading.
+\end{enumerate}
+
+\subsection{Time budget}
+
+The estimates assume about 10--12 hours a week, which adds up to roughly 43 weeks (about ten months). Some phases
+will go faster than planned and some much slower; paging (Phase 6) and processes (Phase 8) are where most people get
+stuck. What counts is meeting each phase's exit criteria. Never start a phase while the previous milestone is still
+shaky, because every later phase builds on top of it.
+
+\section{Your five books and how each one is used}
+
+The books in \texttt{Books/} complement each other. Only \LOB tells you what to type. The others explain why it works
+and show how real systems do it. The file \texttt{Konrul\_LIFT-UP\_Niyet\_Mektubu.pdf} in the same folder is an FPGA
+project application, not an OS text, so this plan does not use it.
+
+\begin{table}[htbp]
+\centering\small\renewcommand{\arraystretch}{1.4}
+\begin{tabularx}{\linewidth}{@{}l >{\raggedright\arraybackslash}p{0.2\linewidth} >{\raggedright\arraybackslash}X >{\raggedright\arraybackslash}X@{}}
+\toprule
+\tkth{Code} & \tkth{Book} & \tkth{Role in this plan} & \tkth{How to read it} \\
+\midrule
+\LOB & The little book about OS development (78 pp.) & The practical spine. Its 14 short chapters are the build order for Phases 1--14. &
+  Read each chapter right before its phase. It uses GRUB Legacy and Bochs; the phase docs give the modern QEMU and GRUB 2 equivalents. \\
+\OSTEP & Operating Systems: Three Easy Pieces & Main theory text. Short, friendly chapters built around one problem each. &
+  Your first theory read in every phase. Do the homework simulators when a phase suggests it. \\
+\OSC & Operating System Concepts, 10th ed. & Encyclopedic reference. Good second explanation and exam-style depth. &
+  Use it when an \OSTEP chapter didn't click, or when you want the complete picture of a topic. \\
+\MOS & Modern Operating Systems, 4th ed. & Strongest on hardware, I/O, clocks, disks, security and OS design (Ch.~12). &
+  Read the hardware and I/O sections closely; they explain the devices you will program. \\
+\OSDI & OS: Design and Implementation, 3rd ed. & The only book with a complete real x86 kernel: MINIX 3, printed line by line. &
+  After you understand a topic, read how MINIX implements it. Don't copy it: MINIX is a microkernel, Turk-OS is monolithic. \\
+\bottomrule
+\end{tabularx}
+\caption{Roles of the five books.}
+\end{table}
+
+\subsection{References outside the five books}
+
+Books explain ideas, but writing a kernel also needs exact hardware facts. Keep these four free references at hand,
+and note that \LOB relies on them too. The \textbf{Intel 64 and IA-32 Architectures Software Developer's Manual,
+Volume 3A} (System Programming Guide) is the definitive source for protection, segmentation, paging, interrupts and
+the TSS; you will read chapters 2--7 in pieces. The \textbf{OSDev Wiki} (\url{https://wiki.osdev.org}) has
+practical pages on nearly every device in this plan, plus lists of common mistakes. The \textbf{Multiboot
+Specification 0.6.96} defines the contract between GRUB and your kernel. The \textbf{NASM manual} covers assembler
+syntax. The MIT \textbf{xv6} teaching kernel is a good optional companion: it is small and UNIX-like, and \OSTEP
+refers to it.
+
+\section{Key technical decisions}
+
+These choices hold for the whole plan. Each one follows from the books you have, which keeps your reading and your
+code in step.
+
+\begin{table}[htbp]
+\centering\small\renewcommand{\arraystretch}{1.4}
+\begin{tabularx}{\linewidth}{@{}>{\raggedright\arraybackslash}p{0.17\linewidth} >{\raggedright\arraybackslash}p{0.27\linewidth} X@{}}
+\toprule
+\tkth{Decision} & \tkth{Choice} & \tkth{Why} \\
+\midrule
+Target CPU & IA-32 (i386), 32-bit protected mode, BIOS boot & \LOB, \OSDI (MINIX 3) and the Intel examples in \OSC\,\S9.6 are all 32-bit x86. Two-level paging is the simplest real MMU to learn. A 64-bit port is a Phase 15 track. \\
+Boot loader & GRUB via Multiboot~1; \texttt{qemu -kernel} for quick runs & Writing a boot loader is a detour. You write one 512-byte boot sector in Phase 1 to learn how booting works, then let GRUB do the job. \\
+Languages & C (gnu11) plus NASM (Intel syntax) & Assembly only where C cannot work: the entry point, descriptor table loads, interrupt stubs, context switch and entering user mode. That is under 5\,\% of the code. \\
+Toolchain & \texttt{i686-elf} cross GCC and binutils, GNU Make, Git & A cross compiler never assumes a Linux target, which prevents a family of confusing bugs (Phase 0). \\
+Emulator, debugger & QEMU and GDB (remote stub); Bochs is optional & QEMU is fast, scriptable, and has a monitor for inspecting registers and page tables. \LOB uses Bochs, whose debugger is still handy for descriptor-table bugs. \\
+Kernel structure & Monolithic, modular source tree & Simplest to get right for a first kernel. MINIX's microkernel is studied as a contrast, with an optional experiment in Phase 15. \\
+On-disk file system & MINIX V3 layout with 1\,KiB blocks, named TurkFS & The format described in \OSDI\,\S5.6, with source. Linux's \texttt{mkfs.minix -3} and \texttt{fsck.minix} create and check your images, and Linux can even mount them. \\
+Testing & In-kernel \texttt{ktest} suites, headless QEMU, \texttt{isa-debug-exit} & \texttt{make test} boots, runs every test and exits with a pass or fail code, so regressions show up at once (Phase 7). \\
+\bottomrule
+\end{tabularx}
+\caption{Technical decisions for Turk-OS.}
+\end{table}
+
+\begin{decisionbox}{Why monolithic, when one of your books is about a microkernel?}
+In a monolithic kernel, drivers, the file system and the scheduler all run in ring 0 and call each other as plain C
+functions. In a microkernel like MINIX 3 they run as separate user-space processes that talk by message passing
+(\OSDI\,\S1.5.5, \S2.5.1; \MOS\,\S1.7). Microkernels isolate faults better, but they force you to build IPC,
+servers and a protocol for every operation before anything works. For a first kernel, plain function calls keep
+the path from idea to running code short. You will still read the MINIX code in every phase, and noticing where the
+two designs differ is one of the best ways to understand both.
+\end{decisionbox}
+
+\section{The phase map}
+
+The sixteen phases fall into four stages. Arrows show the build order. Each phase depends on everything before it.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  ph/.style={draw, rounded corners=3pt, line width=0.7pt, minimum width=3.45cm, minimum height=1.3cm,
+    text width=3.2cm, align=center, font=\sffamily\scriptsize, inner sep=3pt},
+  s1/.style={ph, draw=tkRed!80!black, fill=tkRed!7},
+  s2/.style={ph, draw=tkAmber!90!black, fill=tkAmber!9},
+  s3/.style={ph, draw=tkBlue!80!black, fill=tkBlue!7},
+  s4/.style={ph, draw=tkGreen!80!black, fill=tkGreen!8},
+  flow/.style={-{Stealth[length=2mm]}, line width=0.8pt, draw=tkNavy!70},
+]
+\node[s1] (p0) at (0,0)      {\textbf{P0\enspace Foundations}\\toolchain, C for kernels};
+\node[s1] (p1) at (4.1,0)    {\textbf{P1\enspace Assembly \& boot}\\NASM, BIOS, Multiboot};
+\node[s1] (p2) at (8.2,0)    {\textbf{P2\enspace Getting to C}\\VGA, serial, kprintf};
+\node[s1] (p3) at (12.3,0)   {\textbf{P3\enspace GDT \& IDT}\\CPU exceptions};
+\node[s1] (p4) at (12.3,-2)  {\textbf{P4\enspace Hardware IRQs}\\PIC, timer, keyboard};
+\node[s2] (p5) at (8.2,-2)   {\textbf{P5\enspace Physical memory}\\page-frame allocator};
+\node[s2] (p6) at (4.1,-2)   {\textbf{P6\enspace Paging}\\higher-half kernel};
+\node[s2] (p7) at (0,-2)     {\textbf{P7\enspace Kernel heap}\\kmalloc, lists, tests};
+\node[s3] (p8) at (0,-4)     {\textbf{P8\enspace Processes}\\context switch, scheduler};
+\node[s3] (p9) at (4.1,-4)   {\textbf{P9\enspace Synchronization}\\locks, semaphores};
+\node[s3] (p10) at (8.2,-4)  {\textbf{P10\enspace User mode}\\ring 3, system calls};
+\node[s3] (p11) at (12.3,-4) {\textbf{P11\enspace Process API}\\fork, exec, wait, COW};
+\node[s4] (p12) at (12.3,-6) {\textbf{P12\enspace Storage}\\ATA driver, buffer cache};
+\node[s4] (p13) at (8.2,-6)  {\textbf{P13\enspace File systems}\\VFS, initrd, TurkFS};
+\node[s4] (p14) at (4.1,-6)  {\textbf{P14\enspace Userland}\\libc, shell, pipes};
+\node[s4] (p15) at (0,-6)    {\textbf{P15\enspace Turk-OS 1.0}\\hardening, release};
+\foreach \a/\b in {p0/p1,p1/p2,p2/p3,p3/p4,p4/p5,p5/p6,p6/p7,p7/p8,p8/p9,p9/p10,p10/p11,p11/p12,p12/p13,p13/p14,p14/p15}
+  \draw[flow] (\a) -- (\b);
+\end{tikzpicture}
+
+\vspace{0.6em}
+{\sffamily\scriptsize
+\begin{tabular}{@{}l@{\hspace{3em}}l@{}}
+\tikz\fill[tkRed!60] (0,0) rectangle (0.25,0.25); Stage I: Bare metal (0--28\,\%) &
+\tikz\fill[tkAmber!70] (0,0) rectangle (0.25,0.25); Stage II: Memory (28--48\,\%) \\[2pt]
+\tikz\fill[tkBlue!60] (0,0) rectangle (0.25,0.25); Stage III: Processes and protection (48--77\,\%) &
+\tikz\fill[tkGreen!60] (0,0) rectangle (0.25,0.25); Stage IV: Persistence and userland (77--100\,\%) \\
+\end{tabular}}
+\caption{The sixteen phases, grouped into four stages.}
+\end{figure}
+
+\textbf{Stage I, Bare metal (Phases 0--4).} You learn the tools, enough assembly to be dangerous, and how a PC boots.
+By the end the kernel runs C code, prints to the screen and the serial port, survives CPU exceptions with a readable
+error report, and reacts to the timer and the keyboard through a small built-in command monitor.
+
+\textbf{Stage II, Memory (Phases 5--7).} The kernel learns which RAM exists and hands it out page by page, turns on
+paging, moves itself to the top gigabyte of the address space, and gets a \texttt{kmalloc} heap. You also set up the
+automated test harness that protects you from regressions for the rest of the project.
+
+\textbf{Stage III, Processes and protection (Phases 8--11).} Multitasking arrives: kernel threads, context switches,
+a preemptive scheduler, then the locks that make concurrency safe. Programs move to ring 3 with their own address
+spaces and talk to the kernel through system calls. The stage ends with the UNIX process model: \texttt{fork} with
+copy-on-write, \texttt{exec}, \texttt{wait} and \texttt{exit}.
+
+\textbf{Stage IV, Persistence and userland (Phases 12--15).} A disk driver and buffer cache give you storage, a VFS
+and TurkFS give you files, and a C library, shell and utilities give you a usable system. The last phase hardens,
+measures and documents it, tags version 1.0, and lays out the optional tracks.
+
+\section{Phase summary}
+
+\begin{center}
+\small\renewcommand{\arraystretch}{1.35}\setlength{\tabcolsep}{4pt}
+\begin{longtable}{@{}c >{\raggedright\arraybackslash}p{0.24\linewidth} >{\raggedright\arraybackslash}p{0.43\linewidth} c c@{}}
+\toprule
+\tkth{Phase} & \tkth{Title} & \tkth{You finish with} & \tkth{Weeks} & \tkth{Progress} \\
+\midrule
+\endfirsthead
+\toprule
+\tkth{Phase} & \tkth{Title} & \tkth{You finish with} & \tkth{Weeks} & \tkth{Progress} \\
+\midrule
+\endhead
+\bottomrule
+\endlastfoot
+0  & Foundations and toolchain & Cross compiler, QEMU, GDB and a Git repo; C warm-up library with unit tests & 2--3 & 0\,\%\,$\rightarrow$\,5\,\% \\
+1  & x86 assembly and booting & A 512-byte boot sector; a Multiboot kernel that GRUB and QEMU boot & 2--3 & 5\,\%\,$\rightarrow$\,10\,\% \\
+2  & Getting to C: screen, serial, kprintf & VGA text driver, serial logging, \texttt{kprintf}, \texttt{panic} & 1--2 & 10\,\%\,$\rightarrow$\,16\,\% \\
+3  & Segmentation, IDT and exceptions & Your own GDT and IDT; register dump on every CPU exception & 2 & 16\,\%\,$\rightarrow$\,22\,\% \\
+4  & Hardware interrupts & PIC, 100\,Hz timer, keyboard driver, kernel command monitor & 2 & 22\,\%\,$\rightarrow$\,28\,\% \\
+5  & Physical memory management & Memory map parsing, bitmap page-frame allocator, first kernel tests & 1--2 & 28\,\%\,$\rightarrow$\,34\,\% \\
+6  & Paging and the higher-half kernel & Paging on, kernel at \texttt{0xC0000000}, VMM API, page-fault reports & 2--3 & 34\,\%\,$\rightarrow$\,42\,\% \\
+7  & Kernel heap and data structures & \texttt{kmalloc}/\texttt{kfree}, intrusive lists, \texttt{make test} in headless QEMU & 1--2 & 42\,\%\,$\rightarrow$\,48\,\% \\
+8  & Processes and scheduling & Kernel threads, context switch, preemptive round-robin, sleep & 3 & 48\,\%\,$\rightarrow$\,56\,\% \\
+9  & Synchronization & Spinlocks, wait queues, mutexes, semaphores; blocking keyboard input & 2 & 56\,\%\,$\rightarrow$\,62\,\% \\
+10 & User mode and system calls & TSS, ring 3, \texttt{int 0x80}, ELF loader, first user programs & 3 & 62\,\%\,$\rightarrow$\,70\,\% \\
+11 & Process API & \texttt{fork} (copy-on-write), \texttt{exec}, \texttt{wait}, \texttt{exit}, \texttt{brk}, basic signals & 3 & 70\,\%\,$\rightarrow$\,77\,\% \\
+12 & Storage & ATA PIO driver, block layer, MBR partitions, buffer cache & 2 & 77\,\%\,$\rightarrow$\,83\,\% \\
+13 & File systems & VFS, file descriptors, tar initrd, writable TurkFS & 3--4 & 83\,\%\,$\rightarrow$\,90\,\% \\
+14 & Userland & Turk-libc, pipes, tty line discipline, \texttt{tsh} shell, coreutils & 3 & 90\,\%\,$\rightarrow$\,96\,\% \\
+15 & Hardening and release & Fuzzing, permissions, benchmarks, docs, v1.0 ISO; optional tracks & 3--4+ & 96\,\%\,$\rightarrow$\,100\,\% \\
+\end{longtable}
+\end{center}
+
+\section{Timeline}
+
+The bars in Figure~\ref{fig:timeline} place each phase on a calendar at 10--12 hours a week. Stage colors match the phase map. Expect
+Phases 6, 8 and 13 to run over; that is normal, and the rest of the schedule usually absorbs it.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[x=0.265cm, y=0.37cm]
+  \foreach \w in {0,4,...,44} {
+    \draw[tkGray!25] (\w,0.7) -- (\w,-15.6);
+    \node[tknote, above] at (\w,0.7) {\w};
+  }
+  \node[tknote, anchor=south west] at (45,0.7) {weeks};
+  \foreach \n/\s/\e/\c [count=\i from 0] in {
+      P0 Foundations/0/3/tkRed, P1 Assembly and boot/3/6/tkRed, P2 Getting to C/6/8/tkRed,
+      P3 GDT and IDT/8/10/tkRed, P4 Hardware IRQs/10/12/tkRed,
+      P5 Physical memory/12/14/tkAmber, P6 Paging/14/17/tkAmber, P7 Kernel heap/17/19/tkAmber,
+      P8 Processes/19/22/tkBlue, P9 Synchronization/22/24/tkBlue, P10 User mode/24/27/tkBlue,
+      P11 Process API/27/30/tkBlue,
+      P12 Storage/30/32/tkGreen, P13 File systems/32/36/tkGreen, P14 Userland/36/39/tkGreen,
+      P15 Turk-OS 1.0/39/43/tkGreen} {
+    \node[font=\sffamily\scriptsize, anchor=east] at (-0.4,-\i) {\n};
+    \fill[\c!70, rounded corners=1pt] (\s,-\i-0.32) rectangle (\e,-\i+0.32);
+  }
+  \draw[tkRed, line width=0.8pt, dashed] (43,0.7) -- (43,-15.6) node[below, font=\sffamily\scriptsize\bfseries, text=tkRed] {v1.0};
+\end{tikzpicture}
+\caption{Planned timeline at 10--12 hours per week. Treat it as a guide, not a deadline.}
+\label{fig:timeline}
+\end{figure}
+
+\section{What Turk-OS 1.0 looks like}
+
+Figure~\ref{fig:arch} shows the finished system and the phase that builds each part. It is worth coming back to this
+picture whenever you lose track of where a piece fits.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  layer/.style={draw=tkNavy!60, rounded corners=2pt, minimum height=1.05cm, font=\sffamily\scriptsize,
+    align=center, inner sep=2pt, line width=0.6pt, anchor=north west},
+  ph/.style={text=tkRed, font=\sffamily\scriptsize\bfseries},
+]
+\node[layer, fill=tkGreen!10, minimum width=4.2cm, text width=4.0cm] at (0,0)    {init, \texttt{tsh} shell, coreutils\\{\color{tkRed}\bfseries P11, P14}};
+\node[layer, fill=tkGreen!10, minimum width=4.2cm, text width=4.0cm] at (4.35,0) {Turk-libc: stdio, malloc, string\\{\color{tkRed}\bfseries P14}};
+\node[layer, fill=tkGreen!10, minimum width=4.3cm, text width=4.1cm] at (8.7,0)  {your own ELF programs\\{\color{tkRed}\bfseries P10, P11}};
+\node[layer, fill=tkRed!8, minimum width=13cm, text width=12.8cm, minimum height=0.8cm] at (0,-1.25)
+  {System call interface: \texttt{int 0x80}, argument checks, \texttt{copy\_from\_user} / \texttt{copy\_to\_user}\quad{\color{tkRed}\bfseries P10}};
+\node[layer, fill=tkBlue!7, minimum width=3.1cm, text width=2.95cm, minimum height=1.25cm] at (0,-2.25)    {Processes and scheduler\\fork, exec, signals\\{\color{tkRed}\bfseries P8, P11}};
+\node[layer, fill=tkBlue!7, minimum width=3.1cm, text width=2.95cm, minimum height=1.25cm] at (3.3,-2.25)  {Memory\\PMM, VMM, heap, COW\\{\color{tkRed}\bfseries P5--P7, P11}};
+\node[layer, fill=tkBlue!7, minimum width=3.1cm, text width=2.95cm, minimum height=1.25cm] at (6.6,-2.25)  {VFS\\tarfs, TurkFS, devfs, pipes\\{\color{tkRed}\bfseries P13, P14}};
+\node[layer, fill=tkBlue!7, minimum width=3.1cm, text width=2.95cm, minimum height=1.25cm] at (9.9,-2.25)  {Synchronization\\spinlocks, mutexes, sems\\{\color{tkRed}\bfseries P9}};
+\node[layer, fill=tkAmber!10, minimum width=13cm, text width=12.8cm, minimum height=0.8cm] at (0,-3.7)
+  {Drivers: VGA, serial, keyboard, PIT, tty, ATA, RAM disk, block layer, buffer cache\quad{\color{tkRed}\bfseries P2, P4, P12, P14}};
+\node[layer, fill=tkAmber!10, minimum width=13cm, text width=12.8cm, minimum height=0.8cm] at (0,-4.7)
+  {i386 layer: Multiboot entry, GDT, IDT and ISR stubs, PIC, TSS, paging, context switch\quad{\color{tkRed}\bfseries P1--P4, P6, P8, P10}};
+\node[layer, fill=tkGray!12, minimum width=13cm, text width=12.8cm, minimum height=0.8cm] at (0,-5.9)
+  {PC hardware (QEMU): CPU, RAM, VGA, 8259 PIC, 8254 PIT, 8042 keyboard controller, IDE disk, 16550 UART};
+\draw[decorate, decoration={brace, amplitude=5pt, mirror}, tkGray, line width=0.7pt] (-0.15,0) -- (-0.15,-1.05)
+  node[midway, left=6pt, font=\sffamily\scriptsize\bfseries, text=tkGray, align=right] {user\\space\\(ring 3)};
+\draw[decorate, decoration={brace, amplitude=5pt, mirror}, tkGray, line width=0.7pt] (-0.15,-1.25) -- (-0.15,-5.5)
+  node[midway, left=6pt, font=\sffamily\scriptsize\bfseries, text=tkGray, align=right] {kernel\\(ring 0)};
+\draw[decorate, decoration={brace, amplitude=5pt, mirror}, tkGray, line width=0.7pt] (-0.15,-5.9) -- (-0.15,-6.7)
+  node[midway, left=6pt, font=\sffamily\scriptsize\bfseries, text=tkGray, align=right] {hardware};
+\end{tikzpicture}
+\caption{Layers of Turk-OS 1.0, with the phase that builds each part.}
+\label{fig:arch}
+\end{figure}
+
+The source tree grows into the layout below. You don't need to create it all on day one; each phase document says
+which folders it adds.
+
+\begin{lst}{plain}{Turk-OS/ (final layout)}
+Turk-OS/
+|-- Books/                 the five reference books
+|-- docs/                  this study plan (LaTeX), journal.md, architecture notes
+|-- boot/                  loader.s (Multiboot entry), grub.cfg
+|-- kernel/
+|   |-- arch/i386/         gdt.c idt.c isr.s irq.c pic.c pit.c tss.c paging.c switch.s
+|   |-- mm/                pmm.c vmm.c heap.c
+|   |-- proc/              task.c sched.c fork.c exec.c signal.c
+|   |-- sync/              spinlock.c mutex.c semaphore.c waitq.c
+|   |-- fs/                vfs.c file.c tarfs.c turkfs.c devfs.c pipe.c
+|   |-- drivers/           vga.c serial.c keyboard.c tty.c ata.c ramdisk.c blockdev.c bcache.c
+|   |-- syscall/           syscall.c uaccess.c
+|   `-- kmain.c
+|-- lib/                   libk: string.c printf.c bitmap.c ringbuf.c list.h
+|-- include/               kernel headers
+|-- user/
+|   |-- libc/              Turk-libc
+|   |-- init/ sh/ bin/     init, tsh, coreutils
+|   `-- user.ld
+|-- tests/                 ktest suites
+|-- tools/                 mkturkfs.c and helper scripts
+|-- link.ld
+`-- Makefile
+\end{lst}
+
+\section{Risks, and what to do when you are stuck}
+
+Everyone who writes a kernel hits days where the machine silently reboots and nothing makes sense. The table lists
+the predictable risks. The protocol after it is how you get unstuck without losing a week.
+
+\begin{center}
+\small\renewcommand{\arraystretch}{1.35}\setlength{\tabcolsep}{4pt}
+\begin{longtable}{@{}>{\raggedright\arraybackslash}p{0.33\linewidth} c >{\raggedright\arraybackslash}p{0.5\linewidth}@{}}
+\toprule
+\tkth{Risk} & \tkth{Likelihood} & \tkth{Mitigation} \\
+\midrule
+\endfirsthead
+\toprule
+\tkth{Risk} & \tkth{Likelihood} & \tkth{Mitigation} \\
+\midrule
+\endhead
+\bottomrule
+\endlastfoot
+Triple faults (instant reboot) with no output & High & Serial logging from Phase 2 on; run QEMU with \texttt{-d int,cpu\_reset -no-reboot}; GDB; small commits so \texttt{git bisect} can find the change that broke it. \\
+Assembly learning curve & High & Phase 1 is dedicated to it. Read compiler output instead of writing assembly from scratch, and keep assembly to tiny stubs. \\
+Memory corruption that shows up far from its cause & High & Assertions everywhere, magic numbers in headers, guard pages, \texttt{heap\_check()}, deterministic tests. \\
+Stuck on one bug for days & High & Use the protocol below. Time-box the bug, then change approach. \\
+Scope creep (GUI or networking too early) & Medium & Exit criteria are the definition of done. New ideas go on a ``later'' list for Phase 15. \\
+Toolchain trouble (cross-GCC build, Flatpak sandbox) & Medium & Phase 0 checklist, a host terminal, documented fallback compiler flags. \\
+Outdated instructions in \LOB & High & The phase docs give current equivalents (\texttt{grub2-mkrescue}, QEMU); the OSDev Wiki has errata. \\
+Losing motivation & Medium & A visible milestone every 2--3 weeks. Record a short demo at each milestone and keep the journal. \\
+\end{longtable}
+\end{center}
+
+\begin{tipbox}[The getting-unstuck protocol]
+\begin{enumerate}
+  \item \textbf{Reproduce it reliably}, then make it smaller: comment code out until you find the shortest path to the bug.
+  \item \textbf{Look, don't guess.} Use the serial log, \texttt{-d int}, the QEMU monitor (\texttt{info registers}, \texttt{info mem}), and GDB breakpoints.
+  \item \textbf{Write the hypothesis down} in your journal before you change code. Change one thing at a time.
+  \item \textbf{Re-read the section} of the Intel manual or the book chapter for the exact hardware rule involved.
+  \item \textbf{Compare with MINIX} (\OSDI source) or xv6: how does a working kernel do the same step?
+  \item \textbf{After two sessions without progress}, ask for help (OSDev forum, a classmate, your advisor) and include your journal notes. Explaining the problem often solves it.
+\end{enumerate}
+\end{tipbox}
+
+\section{Master milestone tracker}
+
+Print this page and tick each box when that phase's exit criteria are fully met.
+
+\begin{checklist}
+  \item \textbf{P0}\enspace \texttt{i686-elf-gcc}, NASM, QEMU and GDB work; repo created; C warm-up library passes its tests.
+  \item \textbf{P1}\enspace Boot sector prints a message; Multiboot kernel boots via \texttt{-kernel} and via a GRUB ISO.
+  \item \textbf{P2}\enspace Colored banner on screen, same log on the serial port, \texttt{kprintf} and \texttt{panic} tested.
+  \item \textbf{P3}\enspace Own GDT and IDT loaded; divide-by-zero shows a register dump; \texttt{int3} returns cleanly.
+  \item \textbf{P4}\enspace Timer ticks at 100\,Hz; keyboard input with shift and caps; monitor commands run.
+  \item \textbf{P5}\enspace Memory map printed; frame allocator passes its tests from 16\,MiB to 3\,GiB of RAM.
+  \item \textbf{P6}\enspace Kernel runs at \texttt{0xC0000000}; null dereference produces a clean page-fault report.
+  \item \textbf{P7}\enspace 10\,000-operation heap stress test passes; \texttt{make test} runs headless.
+  \item \textbf{P8}\enspace Several kernel threads preempt each other; \texttt{sleep} works; no leaks over 1000 task cycles.
+  \item \textbf{P9}\enspace Race demo fixed by locks; bounded buffer and dining philosophers run without deadlock.
+  \item \textbf{P10}\enspace Ring-3 program prints through \texttt{write}; faulty programs are killed, the kernel survives.
+  \item \textbf{P11}\enspace \texttt{fork}/\texttt{exec}/\texttt{wait} chain works; copy-on-write verified; no leaks over 1000 forks.
+  \item \textbf{P12}\enspace QEMU disk identified; data survives reboot; partitions detected; buffer cache in use.
+  \item \textbf{P13}\enspace Files written by Turk-OS pass \texttt{fsck.minix} on the host; file descriptor semantics tested.
+  \item \textbf{P14}\enspace Boots to the \texttt{tsh} prompt; pipes, redirection and Ctrl+C work; coreutils present.
+  \item \textbf{P15}\enspace One hour of fuzzing without a panic; benchmarks and docs written; v1.0 tagged.
+\end{checklist}
+
+\booklegend
+\end{document}

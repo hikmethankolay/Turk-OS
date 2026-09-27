@@ -1,0 +1,395 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{turkos}
+
+\begin{document}
+\phaseheader{10}{User Mode and System Calls}{Run programs in ring 3, each in its own address space, and let them ask the kernel for services through a single, carefully guarded door}{62}{70}
+
+\ataglance{3 weeks}{5}{Phase 9: locks and wait queues; Phase 6: VMM that works on any page directory; Phase 3: GDT with ring 3 segments}{A TSS, per-process
+page directories that share the kernel half, a first jump into ring 3, a system call gate on \code{int 0x80} with a
+dispatch table, an ELF loader for programs passed as GRUB modules, a tiny user runtime (\code{crt0}, syscall
+wrappers), pointer validation for every user buffer, and faulty programs that get killed while the kernel survives.}
+
+\section{Why this phase}
+
+Everything so far has run in ring 0, where any bug can corrupt anything. An operating system's core promise is
+\textbf{protection}: a buggy or malicious program can crash itself, but not the kernel and not other programs. That
+promise rests on three pieces of hardware you have already met: privilege rings (Phase 3), paging with the U/S bit
+(Phase 6), and the interrupt mechanism as the only way back into ring 0 (Phase 3). This phase connects them.
+
+You will also design the \textbf{system call interface}, the boundary between user programs and the kernel. Every
+file operation, every process operation and every byte of output from now on crosses it. Two habits established here
+protect you for the rest of the project: every argument from user space is treated as hostile, and every user pointer
+is checked before the kernel touches it.
+
+\section{Concepts you need}
+
+\subsection{Limited direct execution}
+
+\OSTEP chapter 6 frames the problem exactly. For speed, user programs should run directly on the CPU. For safety, they
+must not be able to do everything. The answer is to run them in \textbf{user mode}, where privileged instructions
+(\code{cli}, \code{hlt}, \code{lgdt}, \code{out}, loading CR3) raise \#GP and pages without the U/S bit are
+unreachable. When a program needs something only the kernel can do, it executes a \textbf{trap} instruction that
+enters the kernel at an address the kernel chose at boot. On x86 that is \code{int 0x80} through an IDT gate whose DPL
+is 3, the only gate user code is allowed to invoke. \MOS\,\S1.6 walks through the steps of a \code{read} call, from
+the library wrapper down to the kernel and back.
+
+\subsection{What the CPU does on a ring change}
+
+When an interrupt or trap arrives while the CPU is in ring 3, it can't keep using the user's stack: the user controls
+that memory, and ESP might point anywhere. So the CPU switches to a kernel stack first, and it finds that stack in the
+\textbf{task state segment} (TSS): fields \code{ss0} and \code{esp0}. Then it pushes the user's SS and ESP followed by
+the usual EFLAGS, CS and EIP (Figure~\ref{fig:ringchange}); these are the \code{useresp} and \code{ss} fields you left
+at the top of \code{struct regs} in Phase 3. \code{iret} reverses the whole thing. Turk-OS uses the TSS only for this;
+x86 hardware task switching is ignored. Because each task has its own kernel stack, the scheduler must update
+\code{esp0} on every context switch.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[node distance=0.35cm and 0.5cm, every node/.style={font=\sffamily\scriptsize}]
+  \node[tkok, text width=3.0cm] (u) {\textbf{ring 3}: \code{write(1, msg, 5)}\\EAX=4, EBX=1, ECX=msg, EDX=5\\\code{int 0x80}};
+  \node[tkbox, text width=3.1cm, right=of u] (g) {IDT entry \code{0x80}: gate DPL 3, so user code may use it};
+  \node[tkbox, text width=3.1cm, right=of g] (t) {CPU loads SS:ESP from TSS (\code{ss0}, \code{esp0}) = current task's kernel stack};
+  \node[tkbox, text width=3.2cm, below=0.6cm of t] (p) {pushes user SS, ESP, EFLAGS, CS, EIP; jumps to \code{isr128}; CPL = 0};
+  \node[tkhi, text width=3.1cm, left=of p] (d) {\code{isr_common} $\rightarrow$ \code{syscall_handler}: \code{table[EAX](EBX, ECX, EDX)}, result in EAX};
+  \node[tkok, text width=3.0cm, left=of d] (r) {\code{iret} pops EIP, CS, EFLAGS, ESP, SS: back in ring 3 with EAX = result};
+  \draw[tkarrow] (u) -- (g); \draw[tkarrow] (g) -- (t); \draw[tkarrow] (t) -- (p);
+  \draw[tkarrow] (p) -- (d); \draw[tkarrow] (d) -- (r);
+\end{tikzpicture}
+\caption{The round trip of a system call.}
+\label{fig:ringchange}
+\end{figure}
+
+\subsection{An address space per process}
+
+Each process gets its own page directory. Entries 0--767 (the user half) are private; entries 768--1023 are copied
+from the kernel's directory, and because you pre-allocated every kernel page table in Phase 6, those copies stay
+correct forever. Switching processes means loading the new directory into CR3. Figure~\ref{fig:uas} shows the layout
+of one process. User pages carry the U/S bit in both their PDE and PTE; kernel pages never do, so even though the
+kernel is mapped in every address space, user code can't touch it.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[m/.style={draw=tkNavy!70, minimum width=6.4cm, font=\sffamily\scriptsize, align=center},
+  a/.style={font=\ttfamily\scriptsize, anchor=east}]
+  \node[m, minimum height=0.8cm, fill=tkRed!10] (k) at (0,0) {kernel half (supervisor only, same in every process)};
+  \node[m, minimum height=0.7cm, fill=tkGreen!12, below=0pt of k] (st) {user stack (grows down)};
+  \node[m, minimum height=1.4cm, fill=white, below=0pt of st] (gap) {unmapped};
+  \node[m, minimum height=0.6cm, fill=tkAmber!12, below=0pt of gap] (hp) {heap, grows up with \code{brk} (Phase 11)};
+  \node[m, minimum height=0.9cm, fill=tkBlue!10, below=0pt of hp] (img) {program image from the ELF file:\\\code{.text .rodata .data .bss}};
+  \node[m, minimum height=0.6cm, fill=tkGray!15, below=0pt of img] (z) {unmapped: catches \code{NULL} and small offsets};
+  \node[a] at ([xshift=-4pt]k.south west) {0xC0000000};
+  \node[a] at ([xshift=-4pt]st.south west) {0xBFFFC000};
+  \node[a] at ([xshift=-4pt]img.south west) {0x00400000};
+  \node[a] at ([xshift=-4pt]z.south west) {0x00000000};
+\end{tikzpicture}
+\caption{The address space of a Turk-OS user process.}
+\label{fig:uas}
+\end{figure}
+
+\subsection{Never trust a user pointer}
+
+When a program calls \code{write(1, buf, len)}, \code{buf} is just a number the program chose. It could point into
+the kernel (to trick the kernel into printing a secret), be unmapped (to crash the kernel), or wrap around the end of
+the address space. Every user pointer must be checked before use: the whole range lies below \code{0xC0000000},
+doesn't overflow, and every page in it is present and user-accessible. \code{copy_from_user} and
+\code{copy_to_user} do those checks and return \code{-EFAULT} instead of faulting. \MOS\,\S9.7 shows what happens
+to kernels that skip this.
+
+\subsection{Loading a program}
+
+A user program is an \textbf{ELF} executable. Its header gives the entry point and a table of \textbf{program
+headers}, and each \code{PT_LOAD} header says: take \code{p_filesz} bytes at offset \code{p_offset} in the file, place
+them at virtual address \code{p_vaddr}, and zero the rest up to \code{p_memsz} (that tail is \code{.bss}). The loader
+allocates and maps pages, copies, zeroes, sets up a user stack, and jumps. \OSC\,\S2.5 covers linkers and loaders.
+Until Turk-OS has a file system (Phase 13), programs arrive as \textbf{Multiboot modules}: GRUB (or QEMU's
+\code{-initrd}) loads extra files into memory and lists them in the Multiboot information, just as \LOB chapter 7 does.
+
+\section{Reading plan}
+
+\begin{readingplan}
+\must & \LOB & Ch.~7 \emph{The Road to User Mode} (GRUB modules, executing a program); Ch.~11 \emph{User Mode}; Ch.~13 \emph{System Calls} & 47--49, 65--68, 71--72 & The x86 steps of Tasks 10.1--10.6. \\
+\must & \OSTEP & Ch.~6 \S6.1--6.2 \emph{Basic Technique}, \emph{Restricted Operations} (re-read) & 49--55 & User mode, kernel mode, traps and the trap table. \\
+\must & \MOS & \S1.6 \emph{System Calls} (process, file and directory calls; the steps of \code{read}) & 50--62 & What a system call interface looks like, and a model to copy. \\
+\should & \OSC & \S2.1--2.5 \emph{Services}, \emph{Interface}, \emph{System Calls}, \emph{Linkers and Loaders} & 55--77 & Parameter passing, API versus system call, loaders. \\
+\should & \OSC & \S1.4 \emph{Operating-System Operations} (dual mode, timers) & 21--27 & Why the timer is part of protection. \\
+\should & \OSDI & \S1.4 \emph{System Calls} & 26--42 & The POSIX calls a UNIX needs, in one tour. \\
+\should & \OSDI & \S2.7 \emph{The System Task in MINIX 3} & 192--204 & How MINIX lets user-space servers request privileged work. \\
+\could & \MOS & \S12.2 \emph{Interface Design} & 985--993 & Principles for choosing your system calls. \\
+\could & \MOS & \S9.7 \emph{Exploiting Software} & 639--657 & Why every user pointer must be checked. \\
+\could & \OSC & \S17.3 \emph{Protection Rings} & 669--671 & Rings in general, and why most OSes use only two. \\
+\end{readingplan}
+
+Keep the Intel SDM Volume 3A at hand for the TSS format (the task management chapter) and for the stack switch on a
+privilege change (the interrupt chapter), and the ELF specification (\emph{Tool Interface Standard, ELF 1.2}) for the
+header formats.
+
+\begin{minixbox}
+In MINIX, a POSIX call like \code{read} is not a kernel call at all. The library turns it into a message, and the
+kernel's only job is to deliver that message to a user-space server (the file system or the process manager) through
+\code{sys_call} in \texttt{kernel/proc.c (07400)}. When a server needs something privileged, such as copying data
+between address spaces or writing an I/O port, it sends a \emph{kernel call} to the \textbf{system task},
+\texttt{kernel/system.c (09700)}, described in \OSDI\,\S2.7. So MINIX has two layers of calls where Turk-OS has one:
+your \code{int 0x80} goes straight to a kernel function.
+\end{minixbox}
+
+\section{Build it}
+
+\task{Install a TSS}
+Define the 104-byte TSS structure, put it in GDT entry 5 (selector \code{0x28}) with access byte \code{0x89} (present,
+ring 0, 32-bit available TSS) and byte granularity, and load it with \code{ltr}. Only \code{ss0} and \code{esp0}
+matter. Setting \code{iomap_base} to the structure's size means ``no I/O permission bitmap'', so any port access from
+ring 3 faults.
+
+\begin{lst}{c}{kernel/arch/i386/tss.c}
+struct tss {
+    uint32_t prev_tss;
+    uint32_t esp0;              /* kernel stack pointer loaded on entry from ring 3 */
+    uint32_t ss0;               /* kernel stack segment: 0x10                       */
+    uint32_t esp1, ss1, esp2, ss2;
+    uint32_t cr3, eip, eflags, eax, ecx, edx, ebx, esp, ebp, esi, edi;
+    uint32_t es, cs, ss, ds, fs, gs, ldt;
+    uint16_t trap, iomap_base;
+} __attribute__((packed));
+_Static_assert(sizeof(struct tss) == 104, "TSS layout");
+
+static struct tss tss;
+
+void tss_init(void)
+{
+    tss.ss0 = 0x10;
+    tss.iomap_base = sizeof(tss);
+    gdt_set(5, (uint32_t)&tss, sizeof(tss) - 1, 0x89, 0x0);
+    __asm__ volatile ("ltr %0" : : "r"((uint16_t)0x28));
+}
+
+void tss_set_kernel_stack(uint32_t esp0) { tss.esp0 = esp0; }
+\end{lst}
+\verify{\code{info registers} in the QEMU monitor shows \code{TR=0028} with your TSS's base address.}
+
+\task{Give every process an address space}
+Add a page directory pointer to \code{struct task} (kernel threads use the kernel's directory). Write
+\code{vmm_create_address_space()}: take a page with \code{kalloc_page}, leave entries 0--767 empty, copy entries
+768--1023 from the kernel directory. In \code{schedule()}, just before \code{switch_context}, load the next task's
+directory into CR3 if it differs from the current one, and call \code{tss_set_kernel_stack} with the top of the next
+task's kernel stack.
+\verify{Two kernel threads with different directories both run; \code{info mem} shows the kernel mappings in each.}
+
+\task{The first jump into ring 3}
+Take a baby step before loading real programs. Create an address space, map one user page at \code{0x00400000}
+containing just the two bytes \code{EB FE} (\code{jmp $}, an infinite loop), map one user stack page, and enter ring 3
+by building the frame \code{iret} expects: SS, ESP, EFLAGS (with IF set), CS, EIP. The user selectors have RPL 3:
+\code{0x1B} for code and \code{0x23} for data.
+
+\begin{lst}{asm}{kernel/arch/i386/usermode.s}
+; void enter_user_mode(uint32_t entry, uint32_t user_esp)   -- never returns
+global enter_user_mode
+enter_user_mode:
+    mov  ecx, [esp + 4]     ; user entry point
+    mov  edx, [esp + 8]     ; user stack pointer
+    mov  ax, 0x23           ; user data selector (GDT index 4, RPL 3)
+    mov  ds, ax
+    mov  es, ax
+    mov  fs, ax
+    mov  gs, ax
+    push dword 0x23         ; SS
+    push edx                ; ESP
+    pushfd
+    pop  eax
+    or   eax, 0x200         ; IF = 1: interrupts stay on in user mode
+    push eax                ; EFLAGS
+    push dword 0x1B         ; CS (GDT index 3, RPL 3)
+    push ecx                ; EIP
+    iret                    ; drop to ring 3
+\end{lst}
+\verify{The monitor stays responsive (the timer preempts the looping user task), and when you stop QEMU while that
+task runs, \code{info registers} shows \code{CS=001b} and \code{EIP=00400000}.}
+
+\task{The system call gate}
+Add stub 128 to \code{isr.s} and install it with \code{idt_set_gate(0x80, isr128, 0x08, 0xEF)}: a 32-bit
+\emph{trap} gate with DPL 3. DPL 3 lets ring 3 use it; the trap type leaves interrupts enabled during system calls,
+so a long call can be preempted like any other kernel code (your Phase 9 locks make that safe). Register a handler
+that dispatches on EAX. Use the Linux i386 numbers for the calls you implement; then any Linux reference table
+matches yours.
+
+\begin{lst}{c}{kernel/syscall/syscall.c}
+enum { SYS_exit = 1, SYS_read = 3, SYS_write = 4, SYS_getpid = 20,
+       SYS_sched_yield = 158, SYS_nanosleep = 162, NR_SYSCALLS = 256 };
+
+typedef int32_t (*syscall_fn)(uint32_t a, uint32_t b, uint32_t c);
+
+static const syscall_fn syscall_table[NR_SYSCALLS] = {
+    [SYS_exit]        = sys_exit,
+    [SYS_read]        = sys_read,
+    [SYS_write]       = sys_write,
+    [SYS_getpid]      = sys_getpid,
+    [SYS_sched_yield] = sys_yield,
+    [SYS_nanosleep]   = sys_sleep_ms,      /* simplified: argument is milliseconds */
+};
+
+static void syscall_handler(struct regs *r)
+{
+    if (r->eax >= NR_SYSCALLS || !syscall_table[r->eax]) {
+        r->eax = (uint32_t)-ENOSYS;
+        return;
+    }
+    r->eax = syscall_table[r->eax](r->ebx, r->ecx, r->edx);   /* return value to user */
+}
+\end{lst}
+
+\task{A user runtime}
+Create \code{user/} with its own linker script (programs start at \code{0x00400000}), a start file that calls
+\code{main} and passes its return value to \code{exit}, and syscall wrappers in inline assembly. Build each program as a
+separate ELF with the same cross compiler, linked with \code{-nostdlib} and \code{-T user/user.ld}.
+
+\begin{lst}{asm}{user/crt0.s}
+global _start
+extern main
+extern exit
+section .text
+_start:
+    call main               ; argc and argv arrive in Phase 11
+    push eax
+    call exit               ; exit(main's return value), never returns
+\end{lst}
+
+\begin{lst}{c}{user/lib/syscall.c}
+static inline int32_t syscall3(uint32_t n, uint32_t a, uint32_t b, uint32_t c)
+{
+    int32_t ret;
+    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(n), "b"(a), "c"(b), "d"(c) : "memory");
+    return ret;
+}
+
+int  write(int fd, const void *buf, unsigned len) { return syscall3(4, fd, (uint32_t)buf, len); }
+int  getpid(void)                                  { return syscall3(20, 0, 0, 0); }
+void exit(int code)                                { syscall3(1, code, 0, 0); for (;;) { } }
+\end{lst}
+
+\task{Load programs as boot modules}
+Add \code{module /boot/hello.elf} lines to \code{grub.cfg}. For quick runs, QEMU's Multiboot loader takes the
+modules as a comma-separated \code{-initrd} list:
+
+\begin{lst}{sh}{terminal}
+qemu-system-i386 -kernel build/kernel.elf -serial stdio \
+    -initrd "build/user/hello.elf,build/user/evil.elf"
+\end{lst}
+
+In the kernel, walk \code{mods_count} and \code{mods_addr} (through \code{P2V}), reserve the modules' frames in the PMM (you
+did that in Phase 5), and keep a table of name, start and end for the loader.
+
+\task{The ELF loader}
+Write \code{elf_load(pgdir, image, size, &entry)}. Validate before trusting anything: the magic bytes
+\code{7F 45 4C 46}, 32-bit class, little-endian, type \code{ET_EXEC} (2), machine \code{EM_386} (3), and program
+headers that lie inside the file. For each \code{PT_LOAD}, check that the segment lies entirely below
+\code{0xC0000000} without overflow, allocate and map user pages (writable only if the segment's flags say so), copy
+\code{p_filesz} bytes through the direct map, and zero the rest up to \code{p_memsz}. Then map a user stack below
+\code{0xC0000000}, create a task that runs \code{enter_user_mode(entry, stack_top)}, and make it ready.
+
+\begin{lst}{c}{include/elf.h}
+struct elf32_ehdr {
+    uint8_t  e_ident[16];           /* 0x7F 'E' 'L' 'F', class, data, version ... */
+    uint16_t e_type, e_machine;
+    uint32_t e_version, e_entry, e_phoff, e_shoff, e_flags;
+    uint16_t e_ehsize, e_phentsize, e_phnum, e_shentsize, e_shnum, e_shstrndx;
+} __attribute__((packed));
+
+struct elf32_phdr {
+    uint32_t p_type;                /* 1 = PT_LOAD                  */
+    uint32_t p_offset, p_vaddr, p_paddr;
+    uint32_t p_filesz, p_memsz;     /* memsz > filesz: zero the tail */
+    uint32_t p_flags, p_align;      /* flags: 1 = X, 2 = W, 4 = R    */
+} __attribute__((packed));
+\end{lst}
+\verify{A \code{hello} program prints ``Merhaba from ring 3, pid 3'' through \code{write}, then exits, and its pages go
+back to the PMM (free count restored).}
+
+\task{Guard the door}
+Write \code{copy_from_user}, \code{copy_to_user} and \code{strncpy_from_user}, and route every system call argument
+that is a pointer through them. \code{sys_write} copies the user buffer in chunks into a kernel buffer before printing.
+Then make exceptions depend on who caused them: if \code{(r->cs & 3) == 3}, the fault came from user mode, so print
+something like ``hello (pid 3): segmentation fault at 0x00000000'' and kill that task; only faults in ring 0 still
+panic.
+
+\begin{lst}{c}{kernel/syscall/uaccess.c}
+int copy_from_user(void *dst, const void *usrc, size_t n)
+{
+    uintptr_t start = (uintptr_t)usrc, end = start + n;
+    if (end < start || end > KERNEL_VMA)                /* wraps around, or reaches the kernel */
+        return -EFAULT;
+    for (uintptr_t pg = start & ~0xFFFu; pg < end; pg += PAGE_SIZE)
+        if (!vmm_user_page_ok(current->pgdir, pg))      /* present and U/S set in PDE and PTE */
+            return -EFAULT;
+    memcpy(dst, usrc, n);                               /* current address space is active */
+    return 0;
+}
+\end{lst}
+
+\task{Write evil programs}
+A protection mechanism is only as good as its tests. Write user programs that each try one thing they must not do,
+load them all at once, and check that each is killed or gets an error while \code{hello} and the kernel carry on.
+
+\begin{center}
+\small\renewcommand{\arraystretch}{1.25}
+\begin{tabularx}{\linewidth}{@{}l X l@{}}
+\toprule
+\tkth{Program} & \tkth{What it tries} & \tkth{Expected result} \\
+\midrule
+\code{divzero} & divide by zero & killed (\#DE from ring 3) \\
+\code{nullptr} & read address 0 & killed (page fault, user mode) \\
+\code{kpeek} & read \code{*(int *)0xC0100000} & killed (protection violation) \\
+\code{cli} & execute \code{cli} or \code{hlt} & killed (\#GP) \\
+\code{badptr} & \code{write(1, (void *)0xC0000000, 16)} & \code{write} returns \code{-EFAULT} \\
+\code{hugelen} & \code{write(1, buf, 0xFFFFFFFF)} & \code{-EFAULT} (range wraps around) \\
+\code{badsys} & \code{int 0x80} with EAX = 9999 & returns \code{-ENOSYS} \\
+\bottomrule
+\end{tabularx}
+\end{center}
+\verify{All seven behave as listed in a single boot, and \code{ps} afterwards shows only the kernel's own tasks.}
+
+\section{Testing and debugging}
+
+\begin{pitfalls}
+\#GP on the \code{iret} into ring 3 & Selectors without RPL 3, or GDT entries 3--4 with the wrong DPL & Use \code{0x1B} and \code{0x23}; check access bytes \code{0xFA} and \code{0xF2}. \\
+Page fault at the user entry point with error code 5 or 7 (user mode, protection violation) & The PDE or the PTE lacks the U/S bit & Both levels need it; print both entries for the faulting address. \\
+Triple fault on the first interrupt or syscall from ring 3 & TSS not loaded, \code{esp0} zero, or the TSS descriptor is wrong & Check \code{TR} in \code{info registers}; set \code{esp0} before entering ring 3. \\
+User program never gets preempted & EFLAGS pushed for \code{iret} without IF & OR \code{0x200} into EFLAGS in \code{enter_user_mode}. \\
+Second process crashes after a context switch & CR3 switched, but \code{esp0} still points at the first task's stack & Update \code{esp0} and CR3 together, on every switch. \\
+Kernel crashes inside a system call on a bad pointer & A pointer was used directly instead of through \code{copy_from_user} & Search for every user pointer dereference; there should be none outside \code{uaccess.c}. \\
+\end{pitfalls}
+
+\section{Milestone}
+
+\begin{milestonebox}[Protection works]
+\begin{checklist}
+  \item The TSS is loaded, and \code{esp0} and CR3 are updated on every context switch.
+  \item Each process has its own page directory sharing the kernel half.
+  \item ELF programs from boot modules run in ring 3 and use \code{write}, \code{getpid}, \code{sleep} and \code{exit}.
+  \item All user pointers pass through \code{copy_from_user}/\code{copy_to_user}.
+  \item All seven evil programs are contained; the kernel never panics because of user code.
+  \item \code{docs/syscalls.md} lists each call: number, arguments, return value, errors.
+\end{checklist}
+\end{milestonebox}
+
+\begin{questionbox}
+\begin{enumerate}
+  \item List, in order, everything the CPU does when a ring-3 program executes \code{int 0x80}.
+  \item Why does the TSS need \code{esp0}, and why must it change on every context switch?
+  \item Why is the system call gate a trap gate with DPL 3, while exception gates are interrupt gates with DPL 0?
+  \item How does a system call's return value get back to the user program?
+  \item Why must both the PDE and the PTE have the U/S bit set? What happens if only the PTE has it?
+  \item What does \code{copy_from_user} check, and what could a program do if it didn't?
+  \item The kernel is mapped in every address space. Why can't user code read it?
+\end{enumerate}
+\end{questionbox}
+
+\section{Going further}
+
+Replace \code{int 0x80} with the faster \code{sysenter}/\code{sysexit} pair and measure the difference with
+\code{rdtsc}. Put \code{argc}, \code{argv} and the environment on the initial user stack in the System V i386 layout,
+so \code{main(int argc, char **argv)} works (Phase 11 needs this for \code{exec} anyway). Add a read-only page shared by
+all processes that holds the current tick count, so programs can read the time without a system call; Linux's vDSO
+grew from the same idea.
+
+\nextphase{11}{Process API: fork, exec, wait and exit}
+\booklegend
+\end{document}

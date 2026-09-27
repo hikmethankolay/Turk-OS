@@ -1,0 +1,528 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{turkos}
+
+\begin{document}
+\phaseheader{3}{Segmentation, the IDT and CPU Exceptions}{Install your own descriptor tables and turn every CPU fault into a readable crash report instead of a silent reboot}{16}{22}
+
+\ataglance{2 weeks}{4}{Phase 2: C kernel with \code{kprintf}, serial logging and \code{panic}}{Your own Global Descriptor Table
+(flat model with kernel and user segments), an Interrupt Descriptor Table with 32 exception stubs in NASM, a common C
+handler that receives the full register state, and a crash screen that names the exception and dumps the registers.}
+
+\section{Why this phase}
+
+Right now, if your kernel divides by zero or jumps to a bad address, the CPU looks for an exception handler, finds
+none, faults again, and resets the machine. You see QEMU reboot and nothing else. After this phase the same bug
+prints ``Divide error (\#DE) at EIP=0x00101234'' with every register, and you can go straight to the faulty line.
+No other change in the whole project saves as much debugging time.
+
+The phase has two parts that belong together. The \textbf{GDT} defines the segments the CPU uses and, more
+importantly for us, the privilege levels: ring 0 for the kernel and ring 3 for users. The Multiboot contract says
+GRUB's GDT may be invalid, so you have to install your own before touching a segment register. The \textbf{IDT} tells
+the CPU where to jump for each of the 256 interrupt vectors. Vectors 0--31 are CPU exceptions, which you handle now.
+Vectors 32--47 will be hardware interrupts in Phase 4, and vector \code{0x80} becomes the system call gate in
+Phase 10. This is the \emph{trap table} that \OSTEP chapter 6 describes: the kernel installs it at boot, and from
+then on the hardware knows where to go when something needs the kernel's attention.
+
+\section{Concepts you need}
+
+\subsection{Segmentation, and why we switch it off}
+
+In protected mode every memory access goes through a segment. A \textbf{segment selector} in CS, DS, SS and the
+other segment registers picks a \textbf{descriptor} from the GDT (Figure~\ref{fig:selector}), and the descriptor
+gives the segment's base address, its limit, and its access rights. The CPU adds the base to every address and checks
+it against the limit. \OSTEP chapter 16 explains the general idea, and \OSDI\,\S4.6.2 describes the Intel version.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[x=0.55cm, y=1cm]
+  \draw[draw=tkNavy!70, fill=tkBlue!10] (0,0) rectangle (13,0.7);
+  \draw[draw=tkNavy!70, fill=tkAmber!12] (13,0) rectangle (14,0.7);
+  \draw[draw=tkNavy!70, fill=tkRed!10] (14,0) rectangle (16,0.7);
+  \node[font=\sffamily\scriptsize] at (6.5,0.35) {index into the descriptor table};
+  \node[font=\sffamily\scriptsize] at (13.5,0.35) {TI};
+  \node[font=\sffamily\scriptsize] at (15,0.35) {RPL};
+  \foreach \x/\b in {0.5/15, 12.5/3, 13.5/2, 14.5/1, 15.5/0}
+    \node[font=\sffamily\scriptsize, text=tkGray] at (\x,0.95) {\b};
+  \node[tknote, text width=8.5cm, align=left, anchor=north west] at (0,-0.15)
+    {TI = 0 selects the GDT. RPL = requested privilege level. Selector \code{0x08} = index 1, ring 0 (kernel code); \code{0x10} = index 2 (kernel data); \code{0x1B} = index 3 with RPL 3 (user code).};
+\end{tikzpicture}
+\caption{A 16-bit segment selector.}
+\label{fig:selector}
+\end{figure}
+
+Modern operating systems use paging for memory protection, so they neutralise segmentation with the \textbf{flat
+model}: every descriptor has base 0 and a limit of 4\,GiB, which makes logical addresses equal to linear addresses.
+The GDT still matters for three reasons. The CPU refuses to run in protected mode without one. The \textbf{privilege
+level} of running code is the DPL of its code segment, so ring 0 and ring 3 need separate descriptors. And the
+\textbf{TSS} descriptor that Phase 10 needs for user mode lives in the GDT.
+
+Each descriptor packs its fields into 8 bytes in a famously awkward layout (Figure~\ref{fig:desc}), a leftover from
+the 286. The two bytes you choose are the \textbf{access byte} (present bit, DPL, code or data, readable or writable)
+and the \textbf{flags} nibble (4\,KiB granularity and 32-bit operation). Table~\ref{tab:gdt} lists the values
+Turk-OS uses.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[x=0.44cm, y=0.8cm]
+  % high dword
+  \draw[draw=tkNavy!70, fill=tkGray!10] (0,1) rectangle (8,1.8);
+  \draw[draw=tkNavy!70, fill=tkGreen!10] (8,1) rectangle (12,1.8);
+  \draw[draw=tkNavy!70, fill=tkGray!10] (12,1) rectangle (16,1.8);
+  \draw[draw=tkNavy!70, fill=tkRed!10] (16,1) rectangle (24,1.8);
+  \draw[draw=tkNavy!70, fill=tkGray!10] (24,1) rectangle (32,1.8);
+  \node[font=\sffamily\scriptsize] at (4,1.4) {base 31:24};
+  \node[font=\sffamily\scriptsize] at (10,1.4) {G D/B L A};
+  \node[font=\sffamily\scriptsize] at (14,1.4) {limit 19:16};
+  \node[font=\sffamily\scriptsize] at (20,1.4) {P DPL S type};
+  \node[font=\sffamily\scriptsize] at (28,1.4) {base 23:16};
+  % low dword
+  \draw[draw=tkNavy!70, fill=tkGray!10] (0,0) rectangle (16,0.8);
+  \draw[draw=tkNavy!70, fill=tkGray!10] (16,0) rectangle (32,0.8);
+  \node[font=\sffamily\scriptsize] at (8,0.4) {base 15:0};
+  \node[font=\sffamily\scriptsize] at (24,0.4) {limit 15:0};
+  \node[font=\sffamily\scriptsize\bfseries, anchor=east] at (-0.3,1.4) {bytes 4--7};
+  \node[font=\sffamily\scriptsize\bfseries, anchor=east] at (-0.3,0.4) {bytes 0--3};
+  \node[tknote] at (10,2.1) {flags};
+  \node[tknote] at (20,2.1) {access byte};
+  \foreach \x/\b in {0.4/31, 7.6/24, 15.6/16, 16.4/15, 23.6/8, 31.6/0}
+    \node[font=\sffamily\tiny, text=tkGray] at (\x,-0.25) {\b};
+\end{tikzpicture}
+\caption{The 8-byte segment descriptor. Base and limit are scattered across both halves.}
+\label{fig:desc}
+\end{figure}
+
+\begin{table}[htbp]
+\centering\small\renewcommand{\arraystretch}{1.25}
+\begin{tabular}{@{}c l l l c c@{}}
+\toprule
+\tkth{Index} & \tkth{Selector} & \tkth{Purpose} & \tkth{Access byte} & \tkth{Flags} & \tkth{Limit} \\
+\midrule
+0 & \code{0x00} & null descriptor (required, never used) & \code{0x00} & \code{0x0} & 0 \\
+1 & \code{0x08} & kernel code: present, ring 0, executable, readable & \code{0x9A} & \code{0xC} & \code{0xFFFFF} \\
+2 & \code{0x10} & kernel data: present, ring 0, writable & \code{0x92} & \code{0xC} & \code{0xFFFFF} \\
+3 & \code{0x18} & user code: as kernel code but DPL 3 (Phase 10) & \code{0xFA} & \code{0xC} & \code{0xFFFFF} \\
+4 & \code{0x20} & user data: as kernel data but DPL 3 (Phase 10) & \code{0xF2} & \code{0xC} & \code{0xFFFFF} \\
+5 & \code{0x28} & task state segment (filled in Phase 10) & \code{0x89} & \code{0x0} & \code{sizeof(tss)-1} \\
+\bottomrule
+\end{tabular}
+\caption{The Turk-OS GDT. Flags \code{0xC} = 4\,KiB granularity + 32-bit, so limit \code{0xFFFFF} covers 4\,GiB.}
+\label{tab:gdt}
+\end{table}
+
+\subsection{Interrupts, exceptions and traps}
+
+Three kinds of event make the CPU stop and run a handler. \textbf{Hardware interrupts} come from devices (Phase 4).
+\textbf{Exceptions} come from the CPU itself when an instruction can't complete. \textbf{Software interrupts} come
+from the \code{int n} instruction, which is how user programs will call the kernel. Exceptions are further divided
+by what happens on return (Table~\ref{tab:exc}). After a \textbf{fault}, the saved EIP points at the faulting
+instruction, so returning retries it; that is how page faults will work in Phase 6. After a \textbf{trap}, EIP points
+past the instruction, so execution continues; \code{int3} works this way. An \textbf{abort} means the machine state is
+unreliable, and all you can do is report it and stop.
+
+\begin{table}[htbp]
+\centering\small\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{@{}r l l l c@{}}
+\toprule
+\tkth{Vector} & \tkth{Mnemonic} & \tkth{Name} & \tkth{Class} & \tkth{Error code} \\
+\midrule
+0 & \#DE & Divide error & fault & no \\
+1 & \#DB & Debug & fault or trap & no \\
+2 & -- & Non-maskable interrupt & interrupt & no \\
+3 & \#BP & Breakpoint (\code{int3}) & trap & no \\
+4 & \#OF & Overflow (\code{into}) & trap & no \\
+5 & \#BR & Bound range exceeded & fault & no \\
+6 & \#UD & Invalid opcode & fault & no \\
+7 & \#NM & Device (FPU) not available & fault & no \\
+8 & \#DF & Double fault & abort & yes (always 0) \\
+10 & \#TS & Invalid TSS & fault & yes \\
+11 & \#NP & Segment not present & fault & yes \\
+12 & \#SS & Stack-segment fault & fault & yes \\
+13 & \#GP & General protection & fault & yes \\
+14 & \#PF & Page fault (address in CR2) & fault & yes \\
+16 & \#MF & x87 floating-point error & fault & no \\
+17 & \#AC & Alignment check & fault & yes \\
+18 & \#MC & Machine check & abort & no \\
+19 & \#XM & SIMD floating-point & fault & no \\
+21 & \#CP & Control protection & fault & yes \\
+\bottomrule
+\end{tabular}
+\caption{The CPU exceptions you will meet. Vectors 9, 15, 20 and 22--31 are reserved or rare; give them a generic handler.}
+\label{tab:exc}
+\end{table}
+
+\subsection{What happens on an interrupt}
+
+When vector $n$ fires, the CPU reads IDT entry $n$. Each entry (a \textbf{gate}) holds the handler's address, the
+code segment selector to run it with (\code{0x08}), and a type byte. Turk-OS uses \code{0x8E}: present, DPL 0, 32-bit
+\emph{interrupt gate}, which clears the interrupt flag on entry. A \emph{trap gate} (\code{0x8F}) leaves interrupts
+enabled. The CPU then pushes EFLAGS, CS and EIP on the stack and, for some exceptions, an error code, and jumps to the
+handler. The handler returns with \code{iret}, which pops EIP, CS and EFLAGS back. (When the interrupt arrives in ring
+3, the CPU also switches stacks and pushes the user SS and ESP; that is Phase 10's topic.)
+
+C can't be the handler directly: a C function does not know it must preserve every register and return with
+\code{iret}. So each vector gets a tiny assembly stub that makes the stack look the same for every interrupt,
+saves all registers, and calls one C function with a pointer to the saved state (Figure~\ref{fig:frame}). Getting
+this layout exactly right, and matching it with a C struct, is the heart of the phase.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[slot/.style={draw=tkNavy!70, minimum width=3.6cm, minimum height=0.46cm, font=\ttfamily\scriptsize},
+  br/.style={decorate, decoration={brace, amplitude=4pt}, line width=0.6pt}]
+  \node[slot, fill=tkGray!12] (ss) at (0,0) {ss, useresp};
+  \node[slot, fill=tkRed!10, below=0pt of ss] (ef) {eflags};
+  \node[slot, fill=tkRed!10, below=0pt of ef] (cs) {cs};
+  \node[slot, fill=tkRed!10, below=0pt of cs] (ip) {eip};
+  \node[slot, fill=tkAmber!14, below=0pt of ip] (ec) {err\_code (or dummy 0)};
+  \node[slot, fill=tkAmber!14, below=0pt of ec] (in) {int\_no};
+  \node[slot, fill=tkBlue!10, below=0pt of in] (ax) {eax ecx edx ebx};
+  \node[slot, fill=tkBlue!10, below=0pt of ax] (sp) {esp ebp esi edi};
+  \node[slot, fill=tkGreen!10, below=0pt of sp] (ds) {ds};
+  \node[slot, fill=white, below=0pt of ds] (pa) {pointer to this frame};
+  \draw[br, tkGray] ([xshift=4pt]ss.north east) -- ([xshift=4pt]ss.south east) node[midway, right=5pt, tknote, align=left] {only when coming from ring 3};
+  \draw[br, tkRed] ([xshift=4pt]ef.north east) -- ([xshift=4pt]ip.south east) node[midway, right=5pt, tknote, align=left] {pushed by the CPU};
+  \draw[br, tkAmber] ([xshift=4pt]ec.north east) -- ([xshift=4pt]in.south east) node[midway, right=5pt, tknote, align=left] {pushed by the per-vector stub\\(the CPU pushes err\_code for 8, 10--14, 17, 21)};
+  \draw[br, tkBlue] ([xshift=4pt]ax.north east) -- ([xshift=4pt]sp.south east) node[midway, right=5pt, tknote, align=left] {\code{pusha} in the common stub};
+  \draw[br, tkGreen] ([xshift=4pt]ds.north east) -- ([xshift=4pt]ds.south east) node[midway, right=5pt, tknote, align=left] {saved data segment};
+  \draw[br, tkNavy] ([xshift=4pt]pa.north east) -- ([xshift=4pt]pa.south east) node[midway, right=5pt, tknote, align=left] {\code{push esp}: the argument \code{struct regs *r}};
+  \draw[tkarrow] ([xshift=-12pt]ss.north west) -- ([xshift=-12pt]pa.south west) node[midway, left, tknote, text width=1.6cm] {pushed in this order};
+\end{tikzpicture}
+\caption{The stack when \code{isr_handler} is called. \code{struct regs} lists these fields from the bottom (\code{ds}) up.}
+\label{fig:frame}
+\end{figure}
+
+\section{Reading plan}
+
+\begin{readingplan}
+\must & \LOB & Ch.~5 \emph{Segmentation}: accessing memory, the GDT, loading the GDT & 33--37 & Tasks 3.1--3.2. \\
+\must & \LOB & Ch.~6 \emph{Interrupts and Input}, up to and including \emph{Loading the IDT} & 39--43 & Tasks 3.3--3.5; PIC and keyboard wait for Phase 4. \\
+\must & \OSTEP & Ch.~6 \emph{Mechanism: Limited Direct Execution} & 49--62 & Why a trap table exists and what the hardware does on a trap. \\
+\must & \OSTEP & Ch.~16 \emph{Segmentation} & 149--160 & The general idea behind the descriptors you are writing. \\
+\should & \OSDI & \S4.6.2 \emph{Segmentation with Paging: The Intel Pentium} & 415--420 & Selectors, descriptors, GDT and LDT on real x86 hardware. \\
+\should & \MOS & \S3.7.3 \emph{Segmentation with Paging: The Intel x86} & 247--252 & A second explanation, with the history of why x86 kept segments. \\
+\should & \MOS & \S5.1.5 \emph{Interrupts Revisited} & 347--351 & Precise and imprecise interrupts; what ``saved state'' means. \\
+\should & \OSDI & \S2.6.8 \emph{Interrupt Handling in MINIX 3} & 167--178 & A complete, working version of what you build here. \\
+\could & \OSC & \S1.2 \emph{Computer-System Organization} (interrupts); \S17.3 \emph{Protection Rings} & 7--15, 669--671 & Interrupt mechanics and rings in general terms. \\
+\end{readingplan}
+
+From the Intel SDM Volume 3A, read the parts of chapter 3 (protected-mode memory management) about segment
+selectors and descriptors, and chapter 6 (interrupt and exception handling), especially the exception
+classification, the error code format, and the per-exception reference at its end. Keep that last part open while
+you write the handler names.
+
+\begin{minixbox}
+MINIX builds its GDT and IDT in \texttt{kernel/protect.c (08300)}; look for \code{prot_init}, which fills the tables
+from a list of gate descriptions much like your \code{idt_init}. The entry stubs are macros in
+\texttt{kernel/mpx386.s (06300)}, and exceptions end up in \texttt{kernel/exception.c (08000)}. There, notice the
+decision you will make in Phase 10: an exception in a user process becomes a signal to that process (for example,
+divide error sends \code{SIGFPE}), while an exception inside the kernel is a panic.
+\end{minixbox}
+
+\section{Build it}
+
+\task{Describe the GDT in C}
+Write \code{kernel/arch/i386/gdt.c}. Pack the structs (they are hardware formats), fill the five entries of
+Table~\ref{tab:gdt}, and leave room for the TSS.
+
+\begin{lst}{c}{kernel/arch/i386/gdt.c}
+struct gdt_entry {
+    uint16_t limit_low;
+    uint16_t base_low;
+    uint8_t  base_mid;
+    uint8_t  access;
+    uint8_t  gran;          /* high nibble: flags (G, D/B); low nibble: limit 19:16 */
+    uint8_t  base_high;
+} __attribute__((packed));
+
+struct gdt_ptr {
+    uint16_t limit;         /* size of the table in bytes, minus one */
+    uint32_t base;          /* linear address of the table           */
+} __attribute__((packed));
+
+static struct gdt_entry gdt[6];
+static struct gdt_ptr   gp;
+extern void gdt_flush(struct gdt_ptr *p);   /* in gdt_flush.s */
+
+static void gdt_set(int i, uint32_t base, uint32_t limit, uint8_t access, uint8_t flags)
+{
+    gdt[i].base_low  = base & 0xFFFF;
+    gdt[i].base_mid  = (base >> 16) & 0xFF;
+    gdt[i].base_high = (base >> 24) & 0xFF;
+    gdt[i].limit_low = limit & 0xFFFF;
+    gdt[i].gran      = ((limit >> 16) & 0x0F) | (flags << 4);
+    gdt[i].access    = access;
+}
+
+void gdt_init(void)
+{
+    gdt_set(0, 0, 0,       0x00, 0x0);  /* null                        */
+    gdt_set(1, 0, 0xFFFFF, 0x9A, 0xC);  /* 0x08 kernel code            */
+    gdt_set(2, 0, 0xFFFFF, 0x92, 0xC);  /* 0x10 kernel data            */
+    gdt_set(3, 0, 0xFFFFF, 0xFA, 0xC);  /* 0x18 user code  (Phase 10)  */
+    gdt_set(4, 0, 0xFFFFF, 0xF2, 0xC);  /* 0x20 user data  (Phase 10)  */
+    /* entry 5 (0x28) becomes the TSS in Phase 10 */
+    gp.limit = sizeof(gdt) - 1;
+    gp.base  = (uint32_t)&gdt;
+    gdt_flush(&gp);
+}
+\end{lst}
+
+\task{Load the GDT and reload the segment registers}
+\code{lgdt} only tells the CPU where the table is. The segment registers still hold the old descriptors in a hidden
+cache until you reload them. Data segments can be loaded with \code{mov}; CS can only be changed by a far jump (or a
+far call or \code{iret}).
+
+\begin{lst}{asm}{kernel/arch/i386/gdt_flush.s}
+global gdt_flush
+gdt_flush:
+    mov  eax, [esp + 4]     ; argument: pointer to struct gdt_ptr
+    lgdt [eax]              ; load the GDT register
+    mov  ax, 0x10           ; 0x10 = kernel data selector
+    mov  ds, ax
+    mov  es, ax
+    mov  fs, ax
+    mov  gs, ax
+    mov  ss, ax
+    jmp  0x08:.reload_cs    ; far jump: CS = 0x08 (kernel code)
+.reload_cs:
+    ret
+\end{lst}
+\verify{The kernel keeps running after \code{gdt_init()}. In the QEMU monitor, \code{info registers} shows a
+\code{GDT=} line whose base is the address of your \code{gdt} array (check with \code{i686-elf-nm}) and whose limit is
+\code{0000002f}; CS is \code{0008} and DS is \code{0010}.}
+
+\task{Build and load the IDT}
+Write \code{kernel/arch/i386/idt.c} with a 256-entry table of gates, a setter, and \code{idt_init}, which installs the
+32 exception stubs from the next task and loads the table with \code{lidt}. Entries you don't fill stay zero, which
+means ``not present''; if such a vector fires you get a \#GP, which your handler will report.
+
+\begin{lst}{c}{kernel/arch/i386/idt.c}
+struct idt_entry {
+    uint16_t offset_low;    /* handler address bits 15:0            */
+    uint16_t selector;      /* code segment to run it in: 0x08      */
+    uint8_t  zero;
+    uint8_t  type_attr;     /* 0x8E = present, ring 0, 32-bit interrupt gate */
+    uint16_t offset_high;   /* handler address bits 31:16           */
+} __attribute__((packed));
+
+struct idt_ptr { uint16_t limit; uint32_t base; } __attribute__((packed));
+
+static struct idt_entry idt[256];
+extern uint32_t isr_stub_table[32];     /* addresses of isr0..isr31, from isr.s */
+
+void idt_set_gate(uint8_t n, uint32_t handler, uint16_t sel, uint8_t flags)
+{
+    idt[n].offset_low  = handler & 0xFFFF;
+    idt[n].offset_high = handler >> 16;
+    idt[n].selector    = sel;
+    idt[n].zero        = 0;
+    idt[n].type_attr   = flags;
+}
+
+void idt_init(void)
+{
+    for (int i = 0; i < 32; i++)
+        idt_set_gate(i, isr_stub_table[i], 0x08, 0x8E);
+    struct idt_ptr ip = { sizeof(idt) - 1, (uint32_t)&idt };
+    __asm__ volatile ("lidt %0" : : "m"(ip));
+}
+\end{lst}
+
+\task{Write the interrupt stubs}
+This is the most important assembly in the project, so type it yourself and comment every line. Two NASM macros
+generate the 32 stubs: one for vectors where the CPU pushes an error code and one that pushes a dummy zero, so every
+frame has the same shape. All stubs jump to one common routine that builds the rest of Figure~\ref{fig:frame}.
+
+\begin{lst}{asm}{kernel/arch/i386/isr.s}
+extern isr_handler
+
+%macro ISR_NOERR 1
+isr%1:
+    push dword 0            ; dummy error code: keeps every frame the same shape
+    push dword %1           ; the vector number
+    jmp  isr_common
+%endmacro
+
+%macro ISR_ERR 1
+isr%1:
+    push dword %1           ; the CPU has already pushed an error code
+    jmp  isr_common
+%endmacro
+
+ISR_NOERR 0
+ISR_NOERR 1
+ISR_NOERR 2
+ISR_NOERR 3
+ISR_NOERR 4
+ISR_NOERR 5
+ISR_NOERR 6
+ISR_NOERR 7
+ISR_ERR   8
+ISR_NOERR 9
+ISR_ERR   10
+ISR_ERR   11
+ISR_ERR   12
+ISR_ERR   13
+ISR_ERR   14
+ISR_NOERR 15
+ISR_NOERR 16
+ISR_ERR   17
+ISR_NOERR 18
+ISR_NOERR 19
+ISR_NOERR 20
+ISR_ERR   21
+ISR_NOERR 22                ; 22..31: reserved, no error code
+ISR_NOERR 23
+ISR_NOERR 24
+ISR_NOERR 25
+ISR_NOERR 26
+ISR_NOERR 27
+ISR_NOERR 28
+ISR_NOERR 29
+ISR_NOERR 30
+ISR_NOERR 31
+
+isr_common:
+    pusha                   ; saves eax, ecx, edx, ebx, esp, ebp, esi, edi
+    mov  ax, ds
+    push eax                ; save the interrupted code's data segment
+    mov  ax, 0x10           ; switch to the kernel data segment
+    mov  ds, ax
+    mov  es, ax
+    mov  fs, ax
+    mov  gs, ax
+    push esp                ; argument for isr_handler: pointer to the frame
+    call isr_handler
+    add  esp, 4             ; drop the argument
+    pop  eax                ; restore the original data segment
+    mov  ds, ax
+    mov  es, ax
+    mov  fs, ax
+    mov  gs, ax
+    popa
+    add  esp, 8             ; drop int_no and err_code
+    iret                    ; pop eip, cs, eflags and resume
+
+global isr_stub_table       ; table of stub addresses for idt_init()
+isr_stub_table:
+%assign i 0
+%rep 32
+    dd isr%+i
+%assign i i+1
+%endrep
+\end{lst}
+
+\task{The C exception handler}
+Mirror the frame in a struct, lowest address first. Then write \code{isr_handler}: if a handler is registered for the
+vector (next task), call it and return; otherwise print a crash report and panic. For a page fault, also print CR2,
+which holds the faulting address.
+
+\begin{lst}{c}{include/arch/regs.h and kernel/arch/i386/isr.c}
+struct regs {
+    uint32_t ds;                                        /* pushed last by isr_common */
+    uint32_t edi, esi, ebp, esp_at_pusha, ebx, edx, ecx, eax;   /* pusha */
+    uint32_t int_no, err_code;                          /* pushed by the stub        */
+    uint32_t eip, cs, eflags;                           /* pushed by the CPU         */
+    uint32_t useresp, ss;                               /* only from ring 3 (Phase 10) */
+};
+
+static const char *exception_names[32] = {
+    "Divide error", "Debug", "NMI", "Breakpoint", "Overflow", "Bound range exceeded",
+    "Invalid opcode", "Device not available", "Double fault", "Coprocessor overrun",
+    "Invalid TSS", "Segment not present", "Stack-segment fault", "General protection",
+    "Page fault", "Reserved", "x87 FPU error", "Alignment check", "Machine check",
+    "SIMD FP exception", "Virtualization", "Control protection", /* 22..31 */ };
+
+void isr_handler(struct regs *r)
+{
+    if (handlers[r->int_no]) {              /* registered handler: let it deal with it */
+        handlers[r->int_no](r);
+        return;
+    }
+    const char *name = exception_names[r->int_no] ? exception_names[r->int_no] : "Reserved";
+    kprintf("\n*** CPU exception %u: %s (error code 0x%x)\n", r->int_no, name, r->err_code);
+    kprintf("EIP=%08x  CS=%04x  EFLAGS=%08x\n", r->eip, r->cs, r->eflags);
+    kprintf("EAX=%08x  EBX=%08x  ECX=%08x  EDX=%08x\n", r->eax, r->ebx, r->ecx, r->edx);
+    kprintf("ESI=%08x  EDI=%08x  EBP=%08x\n", r->esi, r->edi, r->ebp);
+    if (r->int_no == 14) {
+        uint32_t cr2;
+        __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
+        kprintf("CR2 (faulting address) = %08x\n", cr2);
+    }
+    panic("unhandled CPU exception");
+}
+\end{lst}
+\verify{\code{sizeof(struct regs)} is 64 bytes (16 fields). Assert it at compile time with
+\code{_Static_assert}.}
+
+\task{A handler registration API}
+Add \code{register_interrupt_handler(uint8_t n, void (*fn)(struct regs *))} backed by a 256-entry table of function
+pointers. Phase 4 installs the timer and keyboard handlers through it, Phase 6 the page-fault handler, and Phase 10
+the system call handler. Register a breakpoint handler now that prints ``breakpoint at EIP=\dots'' and simply
+returns.
+
+\task{Trigger every exception you can}
+Add a \code{crash} command to your boot sequence (a real command monitor arrives in Phase 4). Write one tiny
+function per exception and check that each gives the expected report. The \code{volatile} stops the compiler from
+noticing the division by zero at compile time.
+
+\begin{lst}{c}{tests/exceptions.c}
+void test_divide_error(void)  { volatile int zero = 0; volatile int x = 1 / zero; (void)x; }
+void test_invalid_opcode(void) { __asm__ volatile ("ud2"); }
+void test_breakpoint(void)     { __asm__ volatile ("int3"); kprintf("...and we continued!\n"); }
+void test_gp(void)             { __asm__ volatile ("mov $0x2B, %ax; mov %ax, %ds"); } /* entry 5 is still empty */
+\end{lst}
+\verify{Divide error, invalid opcode and general protection each print a report with a sensible EIP (check it
+with \code{i686-elf-addr2line -e build/kernel.elf <eip>}). The breakpoint test prints both messages and the kernel
+keeps running.}
+
+\section{Testing and debugging}
+
+Two QEMU tools are essential here. \code{-d int -no-reboot} logs every interrupt and exception with its vector
+(\code{v=0d} is \#GP, \code{v=0e} is \#PF) and the error code, and stops instead of rebooting on a triple fault. The
+monitor's \code{info registers} shows the GDT and IDT base and limit. If you install Bochs, its debugger can also
+decode the tables with \code{info gdt} and \code{info idt}.
+
+\begin{pitfalls}
+Reboot right after \code{lgdt} & Wrong limit (should be \code{sizeof(gdt)-1}), struct not packed, or the far jump is missing & Check \code{sizeof(struct gdt_entry) == 8}; look at \code{GDT=} in \code{info registers}. \\
+\#GP immediately after loading DS or SS & Selector points at the wrong entry, or the access byte is wrong & \code{0x10} must be index 2 with access \code{0x92}; print the table bytes. \\
+The divide-error report prints forever & Returning from a fault re-executes the faulting instruction & Faults must be fixed or must end in \code{panic}; only traps return safely. \\
+Crash or garbage after \code{iret} & Unbalanced stack: missing \code{add esp, 8}, or a stub pushed the wrong number of values & Every path must pop exactly what it pushed; step through \code{isr_common} in GDB. \\
+\code{int_no} or registers look shuffled & \code{struct regs} field order doesn't match the push order & The struct lists fields from the \emph{last} push to the first. \\
+Double fault (vector 8) on every exception & The handler itself faults, for example because of a stack overflow & Use \code{-d int} to see the first exception in the chain; that one is the real bug. \\
+\end{pitfalls}
+
+\section{Milestone}
+
+\begin{milestonebox}[No more silent reboots]
+\begin{checklist}
+  \item \code{info registers} shows your GDT (limit \code{0x2f}) and IDT (limit \code{0x7ff}), with CS=\code{0x08} and DS=\code{0x10}.
+  \item Divide by zero, \code{ud2} and a bad segment load each produce a named crash report with registers, and no reboot.
+  \item \code{int3} prints a message and execution continues after it.
+  \item \code{register_interrupt_handler} works, and \code{sizeof(struct regs)} is checked at compile time.
+  \item You can explain every line of \code{isr_common}.
+\end{checklist}
+\end{milestonebox}
+
+\begin{questionbox}
+\begin{enumerate}
+  \item If the flat model makes segmentation do nothing, why is a GDT still required, and why does it need ring 3 entries?
+  \item Decode selector \code{0x23}: which GDT entry, which table, which RPL?
+  \item What does an interrupt gate do to the IF flag that a trap gate does not? Why does Turk-OS want that?
+  \item Which exceptions push an error code, and why do the other stubs push a dummy value?
+  \item Draw the stack at the moment \code{isr_handler} is called.
+  \item Explain the difference between a fault, a trap and an abort, with one example of each.
+  \item Why does returning from the divide-error handler run the handler again?
+\end{enumerate}
+\end{questionbox}
+
+\section{Going further}
+
+Print a backtrace in the crash report by walking the chain of saved EBP values: \code{[ebp]} holds the caller's EBP and
+\code{[ebp+4]} the return address. Because you compile with \code{-fno-omit-frame-pointer}, the chain is intact. Print
+raw addresses for now and symbolise them on the host with \code{addr2line}; in Phase 15 you can embed a symbol table.
+If you want to go deep, give the double fault its own known-good stack through a task gate, so even a kernel stack
+overflow produces a report. That trick needs the TSS machinery from Phase 10.
+
+\nextphase{4}{Hardware Interrupts: PIC, Timer and Keyboard}
+\booklegend
+\end{document}
