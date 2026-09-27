@@ -159,7 +159,7 @@ the MINIX lens.
 
 | Code | Book | Used for |
 |---|---|---|
-| **LOB** | Helin and Renberg, *The little book about OS development* (2015) | The practical build order (in `Books/book.pdf`) |
+| **LOB** | Helin and Renberg, *The little book about OS development* (2015) | The practical build order |
 | **OSTEP** | Arpaci-Dusseau, *Operating Systems: Three Easy Pieces* (v0.90) | Main theory text |
 | **OSC** | Silberschatz, Galvin and Gagne, *Operating System Concepts* (10th ed., 2018) | Reference and second explanation |
 | **MOS** | Tanenbaum and Bos, *Modern Operating Systems* (4th ed., 2015) | Hardware, I/O, security, OS design |
