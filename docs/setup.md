@@ -279,8 +279,8 @@ Open a new terminal so the change takes effect. The folders in `~/src` can be de
 
 ### If the cross build fails
 
-You can start Phase 1 with the host compiler while you fix it, as the little book does. Use these flags and link
-with `ld -m elf_i386`:
+You can start Phase 1 with the host compiler while you fix it, as *The little book about OS development* does. Use
+these flags and link with `ld -m elf_i386`:
 
 ```text
 -m32 -ffreestanding -fno-pie -fno-stack-protector -fno-builtin -nostdlib -fcf-protection=none

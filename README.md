@@ -120,7 +120,7 @@ These choices hold for the whole project. Each one follows from the books the pl
 | Toolchain | `i686-elf` cross GCC and binutils, GNU Make, Git | A cross compiler never assumes a Linux target, which prevents a whole family of confusing bugs. |
 | Emulator and debugger | QEMU and GDB (remote stub); Bochs optional | QEMU is fast, scriptable and has a monitor for registers and page tables. |
 | Kernel structure | Monolithic, modular source tree | Simplest to get right for a first kernel. MINIX's microkernel is studied as a contrast. |
-| On-disk file system | MINIX V3 layout with 1 KiB blocks, named TurkFS | Fully described in the MINIX book, with source. Linux's `mkfs.minix -3` and `fsck.minix` create and check the images, and Linux can mount them. |
+| On-disk file system | MINIX V3 layout with 1 KiB blocks, named TurkFS | Fully described in *Operating Systems: Design and Implementation*, with source. Linux's `mkfs.minix -3` and `fsck.minix` create and check the images, and Linux can mount them. |
 | System call ABI | `int 0x80`, Linux i386 call numbers | Any Linux reference table matches Turk-OS's. |
 | Testing | In-kernel `ktest` suites, headless QEMU, `isa-debug-exit` | `make test` boots, runs every test and exits with a pass or fail code, so regressions show up at once. |
 
@@ -341,8 +341,7 @@ Turk-OS/
 ├── rootfs/                 files for the root archive (/etc/motd, /etc/passwd); bin/ is generated  (Phase 13)
 ├── tests/                  host tests for lib/, in-kernel ktest suites                  (Phases 0, 5, 7)
 ├── tools/                  mkturkfs.c and helper scripts
-├── docs/                   study plan (LaTeX + PDFs), setup guide, lab journal           (see docs/README.md)
-└── Books/                  the five reference books, kept locally and not tracked by Git
+└── docs/                   study plan (LaTeX + PDFs), setup guide, lab journal           (see docs/README.md)
 ```
 
 Generated files never enter Git. Everything the build produces goes to `build/`: `kernel.elf`, `boot.bin`,
@@ -486,7 +485,7 @@ debugging table, the *milestone* checklist, *self-check questions* and *going fu
 The study loop, repeated in every phase:
 
 1. **Read the theory first**, usually OSTEP, then the REQUIRED items from the other books.
-2. **Read the practical chapter** in the little book, when there is one.
+2. **Read the practical chapter** in *The little book about OS development*, when there is one.
 3. **Look at a real system**: the MINIX lens box points to the matching section and source file.
 4. **Build in small steps**: one task at a time, boot after each change, commit when it works.
 5. **Verify**: a task isn't finished until its Verify step passes.
@@ -499,19 +498,24 @@ Never start a phase while the previous milestone is still shaky; every later pha
 
 ## Books and references
 
-The books live in `Books/` on the author's machine. They are **not** in the repository (most are copyrighted), so
-get your own copies. Two of them are free online.
+The books are **not** part of this repository, so get your own copies before Phase 0. Two are free online from their
+authors. The other three are copyrighted textbooks: buy them from the publisher or a bookshop (a used copy is fine),
+or borrow them from a library.
 
-| Code | Book | Role in the plan |
-|---|---|---|
-| **LOB** | Erik Helin, Adam Renberg. *The little book about OS development*, 2015. [Free online](https://littleosbook.github.io/). | The practical spine: its 14 chapters give the build order for Phases 1–14. Uses GRUB Legacy and Bochs; the phase docs give the QEMU and GRUB 2 equivalents. |
-| **OSTEP** | Remzi H. and Andrea C. Arpaci-Dusseau. *Operating Systems: Three Easy Pieces*, v0.90. [Free online](https://pages.cs.wisc.edu/~remzi/OSTEP/). | Main theory text, the first read in every phase. |
-| **OSC** | A. Silberschatz, P. B. Galvin, G. Gagne. *Operating System Concepts*, 10th ed., Wiley, 2018. | Encyclopedic reference; a second explanation when an OSTEP chapter didn't click. |
-| **MOS** | Andrew S. Tanenbaum, Herbert Bos. *Modern Operating Systems*, 4th ed., Pearson, 2015. | Strongest on hardware, I/O, clocks, disks, security and OS design (Ch. 12). |
-| **OSDI** | Andrew S. Tanenbaum, Albert S. Woodhull. *Operating Systems: Design and Implementation*, 3rd ed., 2006. | MINIX 3 printed line by line: how a real x86 kernel does each step. |
+| Code | Book | Where to get it | Role in the plan |
+|---|---|---|---|
+| **LOB** | Erik Helin, Adam Renberg. *The little book about OS development*, 2015. | Free at [littleosbook.github.io](https://littleosbook.github.io/), as a web page or a PDF. The page numbers in the plan refer to the PDF. | The practical spine: its 14 chapters give the build order for Phases 1–14. Uses GRUB Legacy and Bochs; the phase docs give the QEMU and GRUB 2 equivalents. |
+| **OSTEP** | Remzi H. and Andrea C. Arpaci-Dusseau. *Operating Systems: Three Easy Pieces*, v0.90, Arpaci-Dusseau Books, 2015. | Free at [pages.cs.wisc.edu/~remzi/OSTEP](https://pages.cs.wisc.edu/~remzi/OSTEP/), one PDF per chapter (current version 1.10). Printed copies are sold there too. | Main theory text, the first read in every phase. |
+| **OSC** | A. Silberschatz, P. B. Galvin, G. Gagne. *Operating System Concepts*, 10th ed., Wiley, 2018. ISBN 978-1-119-32091-3. | Wiley, a bookshop or a library. | Encyclopedic reference; a second explanation when an OSTEP chapter didn't click. |
+| **MOS** | Andrew S. Tanenbaum, Herbert Bos. *Modern Operating Systems*, 4th ed., Pearson, 2015. ISBN 978-0-13-359162-0. | Pearson, a bookshop or a library. | Strongest on hardware, I/O, clocks, disks, security and OS design (Ch. 12). |
+| **OSDI** | Andrew S. Tanenbaum, Albert S. Woodhull. *Operating Systems: Design and Implementation*, 3rd ed., Pearson Prentice Hall, 2006. ISBN 978-0-13-142938-3. | A bookshop (often second-hand) or a library. | MINIX 3 printed line by line: how a real x86 kernel does each step. |
 
-Page numbers in the plan are the *printed* page numbers from each book's table of contents, not PDF page indices.
-MINIX references such as `kernel/proc.c (07400)` give the file and its starting line in OSDI Appendix B.
+Page numbers in the plan are the *printed* page numbers of these editions, not PDF page indices. With any other
+edition, find each reading by the chapter and section numbers that every reading-plan row gives. For OSTEP this is
+the normal case: each free chapter PDF starts at page 1, and version 1.10 is paginated differently from v0.90.
+Chapters 1–43, and every section the plan cites, have the same numbers in both versions; only chapter 23 was renamed
+(*Complete Virtual Memory Systems*, formerly *The VAX/VMS Virtual Memory System*). MINIX references such as
+`kernel/proc.c (07400)` give the file and its starting line in OSDI Appendix B.
 
 Hardware facts come from outside the books:
 

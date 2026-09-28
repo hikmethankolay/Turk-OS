@@ -133,7 +133,7 @@ compares it with the alternatives: contiguous allocation, linked lists and FAT.
 
 To open \code{/bin/hello}, the kernel starts at the root inode (inode 1), reads the root directory's data and
 searches it for \code{bin}, reads inode \code{bin}, reads its data and searches for \code{hello}, then reads inode
-\code{hello}. \OSTEP\,\S40.4 draws this as a timeline of disk reads, and it is the best way to understand why caching
+\code{hello}. \OSTEP\,\S40.6 draws this as a timeline of disk reads, and it is the best way to understand why caching
 matters: without the buffer cache, every \code{open} costs several disk reads just to walk the path.
 
 \subsection{Crashes}
@@ -347,7 +347,7 @@ Deadlock while creating a file & A directory inode lock and a buffer lock taken 
 
 \begin{questionbox}
 \begin{enumerate}
-  \item List the disk reads needed to open and read \code{/home/turk/notes.txt} with an empty cache, following \OSTEP\,\S40.4.
+  \item List the disk reads needed to open and read \code{/home/turk/notes.txt} with an empty cache, following \OSTEP\,\S40.6.
   \item What is the largest file TurkFS can hold with seven direct zones, one single and one double indirect block, 1\,KiB zones and 4-byte zone numbers?
   \item What is the difference between a file descriptor, an open file and an inode? Which of them does \code{fork} copy?
   \item What does the VFS layer buy you? Name three things in Turk-OS that would be harder without it.

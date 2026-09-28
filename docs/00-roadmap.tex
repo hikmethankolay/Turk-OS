@@ -16,7 +16,7 @@
   \node[font=\sffamily\bfseries\fontsize{26}{28}\selectfont, text=white, anchor=north west] at (0.23\linewidth,3.8cm) {Turk-OS};
   \node[font=\sffamily\bfseries\Large, text=white, anchor=north west] at (0.23\linewidth,2.65cm) {Roadmap: from zero to a working OS};
   \node[font=\sffamily\small, text=white!78!tkNavy, anchor=south west, text width=0.74\linewidth, align=left] at (0.23\linewidth,0.35cm)
-    {A 16-phase study and build plan for a UNIX-like 32-bit x86 kernel, based on the five books in \texttt{Books/}};
+    {A 16-phase study and build plan for a UNIX-like 32-bit x86 kernel, based on five operating-system textbooks};
 \end{tikzpicture}
 
 \vspace{0.4em}
@@ -67,9 +67,9 @@ shaky, because every later phase builds on top of it.
 
 \section{Your five books and how each one is used}
 
-The books in \texttt{Books/} complement each other. Only \LOB tells you what to type. The others explain why it works
-and show how real systems do it. The file \texttt{Konrul\_LIFT-UP\_Niyet\_Mektubu.pdf} in the same folder is an FPGA
-project application, not an OS text, so this plan does not use it.
+The five books complement each other. Only \LOB tells you what to type. The others explain why it works and show how
+real systems do it. None of them comes with this plan, so get your own copies before you start Phase 0;
+Section~\ref{sec:getbooks} says where.
 
 \begin{table}[htbp]
 \centering\small\renewcommand{\arraystretch}{1.4}
@@ -85,12 +85,49 @@ project application, not an OS text, so this plan does not use it.
   Use it when an \OSTEP chapter didn't click, or when you want the complete picture of a topic. \\
 \MOS & Modern Operating Systems, 4th ed. & Strongest on hardware, I/O, clocks, disks, security and OS design (Ch.~12). &
   Read the hardware and I/O sections closely; they explain the devices you will program. \\
-\OSDI & OS: Design and Implementation, 3rd ed. & The only book with a complete real x86 kernel: MINIX 3, printed line by line. &
+\OSDI & Operating Systems: Design and Implementation, 3rd ed. & The only book with a complete real x86 kernel: MINIX 3, printed line by line. &
   After you understand a topic, read how MINIX implements it. Don't copy it: MINIX is a microkernel, Turk-OS is monolithic. \\
 \bottomrule
 \end{tabularx}
 \caption{Roles of the five books.}
 \end{table}
+
+\subsection{Getting your copies}\label{sec:getbooks}
+
+\LOB and \OSTEP are free online from their authors. \OSC, \MOS and \OSDI are commercial textbooks: buy them from the
+publisher or a bookshop (a used copy is fine), or borrow them from a library. Table~\ref{tab:editions} lists the
+exact editions that the reading plans cite.
+
+\begin{table}[htbp]
+\centering\small\renewcommand{\arraystretch}{1.4}
+\begin{tabularx}{\linewidth}{@{}l >{\raggedright\arraybackslash}p{0.45\linewidth} >{\raggedright\arraybackslash}X@{}}
+\toprule
+\tkth{Code} & \tkth{Edition cited in this plan} & \tkth{Where to get it} \\
+\midrule
+\LOB & Erik Helin, Adam Renberg. \emph{The little book about OS development}, 2015. &
+  Free at \url{https://littleosbook.github.io}, as a web page or as a PDF (the \emph{PDF version} link). Page numbers refer to the PDF. \\
+\OSTEP & Remzi H.\ Arpaci-Dusseau, Andrea C.\ Arpaci-Dusseau. \emph{Operating Systems: Three Easy Pieces}, version 0.90, Arpaci-Dusseau Books, 2015. &
+  Free at \url{https://pages.cs.wisc.edu/~remzi/OSTEP/}, one PDF per chapter, in the current version (1.10). Printed copies are sold on the same page. \\
+\OSC & Abraham Silberschatz, Peter Baer Galvin, Greg Gagne. \emph{Operating System Concepts}, 10th ed., Wiley, 2018. ISBN 978-1-119-32091-3. &
+  Wiley, a bookshop or a library. \\
+\MOS & Andrew S.\ Tanenbaum, Herbert Bos. \emph{Modern Operating Systems}, 4th ed., Pearson, 2015. ISBN 978-0-13-359162-0. &
+  Pearson, a bookshop or a library. \\
+\OSDI & Andrew S.\ Tanenbaum, Albert S.\ Woodhull. \emph{Operating Systems: Design and Implementation}, 3rd ed., Pearson Prentice Hall, 2006. ISBN 978-0-13-142938-3. &
+  A bookshop (often second-hand) or a library. \\
+\bottomrule
+\end{tabularx}
+\caption{The editions this plan cites, and where to get them.}
+\label{tab:editions}
+\end{table}
+
+\begin{warnbox}[Page numbers belong to these editions]
+The page ranges in the reading plans are the \emph{printed} page numbers of the editions in Table~\ref{tab:editions}.
+They will not match another edition, and a reflowable e-book has no fixed pages at all, so find each reading by the
+chapter and section numbers that every row gives. For \OSTEP this is the normal case: each free chapter PDF starts again at page~1, and the
+current version is paginated differently from version 0.90. Chapters 1--43, and every section this plan cites, have
+the same numbers in both versions, and the page range still tells you how long a reading is. One title changed:
+chapter 23, \emph{The VAX/VMS Virtual Memory System}, is now \emph{Complete Virtual Memory Systems}, with VAX/VMS in \S23.1.
+\end{warnbox}
 
 \subsection{References outside the five books}
 
@@ -105,7 +142,7 @@ refers to it.
 
 \section{Key technical decisions}
 
-These choices hold for the whole plan. Each one follows from the books you have, which keeps your reading and your
+These choices hold for the whole plan. Each one follows from the five books, which keeps your reading and your
 code in step.
 
 \begin{table}[htbp]
@@ -306,8 +343,7 @@ which folders it adds.
 
 \begin{lst}{plain}{Turk-OS/ (final layout)}
 Turk-OS/
-|-- Books/                 the five reference books
-|-- docs/                  this study plan (LaTeX), journal.md, architecture notes
+|-- docs/                 this study plan (LaTeX), journal.md, architecture notes
 |-- boot/                  loader.s (Multiboot entry), grub.cfg
 |-- kernel/
 |   |-- arch/i386/         gdt.c idt.c isr.s irq.c pic.c pit.c tss.c paging.c switch.s

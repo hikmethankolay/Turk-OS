@@ -157,18 +157,25 @@ Each reading plan row looks like this:
 The usual order within a phase is OSTEP first, then the other REQUIRED items, then the practical chapter of LOB, then
 the MINIX lens.
 
-| Code | Book | Used for |
-|---|---|---|
-| **LOB** | Helin and Renberg, *The little book about OS development* (2015) | The practical build order |
-| **OSTEP** | Arpaci-Dusseau, *Operating Systems: Three Easy Pieces* (v0.90) | Main theory text |
-| **OSC** | Silberschatz, Galvin and Gagne, *Operating System Concepts* (10th ed., 2018) | Reference and second explanation |
-| **MOS** | Tanenbaum and Bos, *Modern Operating Systems* (4th ed., 2015) | Hardware, I/O, security, OS design |
-| **OSDI** | Tanenbaum and Woodhull, *Operating Systems: Design and Implementation* (3rd ed., 2006) | MINIX 3 with its full source listing |
+| Code | Book | Used for | Where to get it |
+|---|---|---|---|
+| **LOB** | Helin and Renberg, *The little book about OS development* (2015) | The practical build order | Free at [littleosbook.github.io](https://littleosbook.github.io/) |
+| **OSTEP** | Arpaci-Dusseau and Arpaci-Dusseau, *Operating Systems: Three Easy Pieces* (v0.90, 2015) | Main theory text | Free at [pages.cs.wisc.edu/~remzi/OSTEP](https://pages.cs.wisc.edu/~remzi/OSTEP/), one PDF per chapter |
+| **OSC** | Silberschatz, Galvin and Gagne, *Operating System Concepts* (10th ed., Wiley, 2018) | Reference and second explanation | Buy it, or borrow it from a library |
+| **MOS** | Tanenbaum and Bos, *Modern Operating Systems* (4th ed., Pearson, 2015) | Hardware, I/O, security, OS design | Buy it, or borrow it from a library |
+| **OSDI** | Tanenbaum and Woodhull, *Operating Systems: Design and Implementation* (3rd ed., Pearson Prentice Hall, 2006) | MINIX 3 with its full source listing | Buy it (often second-hand), or borrow it from a library |
 
-Two conventions matter when you look things up:
+The books are not part of this repository. The ISBNs of the editions the plan cites are in the
+[main README](../README.md#books-and-references) and in the roadmap.
 
-- **Page numbers are printed page numbers** from each book's table of contents, not PDF page indices. A PDF viewer's
-  page box usually shows a different number.
+Three conventions matter when you look things up:
+
+- **Page numbers are printed page numbers** of the editions above, not PDF page indices. A PDF viewer's page box
+  usually shows a different number.
+- **With any other edition, go by chapter and section.** Every reading-plan row gives both. For OSTEP this is the
+  normal case: each free chapter PDF starts at page 1, and the current version (1.10) is paginated differently from
+  v0.90. Chapters 1–43, and every section the plan cites, have the same numbers in both versions; only chapter 23 has
+  a new title (*Complete Virtual Memory Systems*, formerly *The VAX/VMS Virtual Memory System*).
 - **MINIX source references** such as `kernel/proc.c (07400)` give the file and its starting line number in OSDI
   Appendix B.
 
