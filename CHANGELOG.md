@@ -29,6 +29,28 @@ Sections used inside each entry: **Added** for new features, **Changed** for cha
   (WSL2).
 - `docs/journal.md`, the lab journal template.
 
+### Study plan: Stage V, the RISC-V and ARM ports
+
+#### Added
+- Skeleton folders for the Stage V layout: `kernel/arch/riscv32/`, `kernel/arch/aarch64/`, `user/arch/i386/`,
+  `user/arch/riscv32/`, `user/arch/aarch64/` and `tests/data/`.
+
+#### Docs
+- Three new phase documents after Turk-OS 1.0: Phase 16 *Portability: an Architecture Layer*, Phase 17 *The RISC-V
+  Port* (RV32 with Sv32 on QEMU `virt` and OpenSBI, optionally the Timur-RV32IMC core) and Phase 18 *The ARM Port*
+  (AArch64 at EL1 on QEMU `virt`, optionally a Raspberry Pi 4), ending at Turk-OS 2.0. Stage V has its own
+  progress scale; the 1.0 scale of Phases 0–15 is unchanged.
+- Roadmap: nineteen phases in five stages, new technical decisions and a decision box on porting after 1.0, the
+  Stage V row in the phase map, a 58-week timeline, a figure of Turk-OS 2.0 on three architectures, Stage V risks
+  and tracker entries.
+- Phase 15: Track E now points to Stage V, and the phase leads into Phase 16. Phases 2, 3, 6, 8 and 10 each gained
+  a short portability note.
+- `docs/setup.md`: section 9, the toolchains for the ports (cross compilers, QEMU boards, OpenSBI, `dtc`, GDB) on
+  every platform; Troubleshooting is now section 10.
+- `docs/common/turkos.sty`: GNU as listing styles for RISC-V and AArch64, chips and a legend for the Stage V
+  references, the Stage V colour, and a configurable progress-bar label.
+- `README.md` and `docs/README.md` describe Stage V and Turk-OS 2.0.
+
 <!--
 Template for a phase milestone:
 

@@ -454,6 +454,14 @@ void isr_handler(struct regs *r)
 \verify{\code{sizeof(struct regs)} is 64 bytes (16 fields). Assert it at compile time with
 \code{_Static_assert}.}
 
+\begin{tipbox}[Portability note]
+Every field of \code{struct regs} is an x86 register. In Phase 16 it becomes \code{struct trapframe}, one per
+architecture, and code outside \code{kernel/arch/i386} reads it only through small helpers: the system call number,
+an argument, the return value, the program counter. Start the habit now. Leave field names like \code{eax},
+\code{eip} and \code{cs} to the x86 code, and when a later phase (page faults, system calls, signals) needs a
+register elsewhere, give it a one-line inline helper instead of a field name.
+\end{tipbox}
+
 \task{A handler registration API}
 Add \code{register_interrupt_handler(uint8_t n, void (*fn)(struct regs *))} backed by a 256-entry table of function
 pointers. Phase 4 installs the timer and keyboard handlers through it, Phase 6 the page-fault handler, and Phase 10

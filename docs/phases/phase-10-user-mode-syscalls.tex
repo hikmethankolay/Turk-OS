@@ -236,6 +236,15 @@ static void syscall_handler(struct regs *r)
 }
 \end{lst}
 
+\begin{tipbox}[Portability note]
+\code{syscall_handler} is generic code, yet it reads x86 registers by name. Dispatch through three one-line inline
+helpers in the x86 header instead, such as \code{tf_sysno(r)}, \mbox{\code{tf_arg(r, n)}} and \mbox{\code{tf_set_ret(r, v)}}:
+Phase 16 makes exactly these part of the interface every architecture provides. The ports keep these Linux i386 call
+numbers and change only the trap: RISC-V uses \code{ecall} with the number in \code{a7} and the arguments in
+\code{a0}--\code{a5}, AArch64 uses \texttt{svc~\#0} with the number in \code{x8} and the arguments in
+\code{x0}--\code{x5}, and the result comes back in \code{a0} or \code{x0}.
+\end{tipbox}
+
 \task{A user runtime}
 Create \code{user/} with its own linker script (programs start at \code{0x00400000}), a start file that calls
 \code{main} and passes its return value to \code{exit}, and syscall wrappers in inline assembly. Build each program as a

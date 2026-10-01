@@ -286,6 +286,14 @@ void serial_putc(char c)
 \verify{With \code{make run} (which passes \code{-serial stdio}), text you send to the serial port appears in your
 terminal. Also try \code{-serial file:build/serial.log}.}
 
+\begin{tipbox}[Portability note]
+This UART comes back in Phase 17. On QEMU's RISC-V \code{virt} board it is the same 16550, with the same registers at
+the same offsets, but memory-mapped at \code{0x10000000} instead of reached through ports. So keep every register
+access in two small functions, say \code{uart_read(reg)} and \code{uart_write(reg, val)} on top of \code{inb} and
+\code{outb}, and write the rest of \code{serial.c} with them. Phase 16 then swaps only those two for MMIO accessors,
+and both machines share the rest of the driver.
+\end{tipbox}
+
 \task{kprintf and the console layer}
 Write \code{lib/printf.c} with \code{kvprintf(void (*putc)(char), const char *fmt, va_list ap)} as the engine, and
 \code{kprintf} on top of it using the console. Support \texttt{\%c}, \texttt{\%s}, \texttt{\%d}, \texttt{\%i}, \texttt{\%u},

@@ -2,7 +2,9 @@
 
 This guide takes your machine to a working Turk-OS workshop: host tools, an `i686-elf` cross compiler, QEMU, GDB
 and an editor that understands the code. It covers tasks 0.1–0.3 and 0.7 of [Phase 0](pdf/phase-00-foundations.pdf)
-for every supported platform, in copy-and-paste form.
+for every supported platform, in copy-and-paste form. [Section 9](#9-toolchains-for-the-ports-stage-v) adds the tools
+for the RISC-V and ARM ports of Stage V (Task 16.1 of [Phase 16](pdf/phase-16-portability-layer.pdf)), which you only
+need after Turk-OS 1.0.
 
 Turk-OS builds the same way on every platform below: the same cross compiler, the same QEMU, the same Makefile.
 Only package names and a few tool names differ. When a command from a phase document isn't found on your system,
@@ -21,7 +23,8 @@ anything else, the phase document wins.
 6. [Smoke-test QEMU and GDB](#6-smoke-test-qemu-and-gdb)
 7. [Editor setup](#7-editor-setup)
 8. [LaTeX for the study plan (optional)](#8-latex-for-the-study-plan-optional)
-9. [Troubleshooting](#9-troubleshooting)
+9. [Toolchains for the ports (Stage V)](#9-toolchains-for-the-ports-stage-v)
+10. [Troubleshooting](#10-troubleshooting)
 
 ---
 
@@ -458,13 +461,344 @@ Then build with `make -C docs` from the repository root.
 
 ---
 
-## 9. Troubleshooting
+## 9. Toolchains for the ports (Stage V)
+
+You need this section only when you reach [Phase 16](pdf/phase-16-portability-layer.pdf) (Task 16.1), after
+Turk-OS 1.0; if you are working on Phase 0, skip it. Stage V ports Turk-OS to RISC-V (Phase 17) and to ARM (Phase 18),
+and each port needs its own cross compiler, its own QEMU board and a debugger that understands it. The order is the
+same as in sections 2 to 6: packages first, then the cross compilers, then the checks.
+
+### 9.1 What you need and why
+
+| Tool | Used for | From |
+|---|---|:---:|
+| `riscv32-elf-gcc`, `riscv32-elf-ld`, `riscv32-elf-objdump`, `riscv32-elf-readelf`, `riscv32-elf-nm` | Compiling, linking and inspecting the 32-bit RISC-V (RV32) kernel and user programs | Phase 16 |
+| `aarch64-elf-gcc`, `aarch64-elf-ld`, `aarch64-elf-objdump`, `aarch64-elf-readelf`, `aarch64-elf-nm` | The same for 64-bit ARM (AArch64) | Phase 16 |
+| `qemu-system-riscv32` with the OpenSBI firmware | Running the RISC-V port on QEMU's `virt` board. OpenSBI is the machine-mode firmware that starts your kernel; QEMU ships it and loads it by itself (`-bios default`) | Phase 16 |
+| `qemu-system-aarch64` | Running the ARM port on QEMU's `virt` board with a Cortex-A72 processor | Phase 16 |
+| `dtc`, the devicetree compiler | Turning a board's binary devicetree (its list of memory and devices) into text you can read, for the devicetree parser and its tests | Phase 16 |
+| A GDB that knows RISC-V and AArch64 | `make debug` on both ports | Phase 17 |
+
+Everything from Phase 0 stays: x86 keeps `i686-elf-gcc`, NASM and GRUB. The ports need neither NASM nor GRUB. Their
+assembly files are `.S` files, which GCC runs through the C preprocessor and then hands to the GNU assembler from that
+target's binutils. GRUB and the bootable ISO belong to the x86 port only.
+
+### 9.2 Install the emulators, dtc and GDB
+
+Add these to the tools from section 2.
+
+**Arch Linux.**
+
+```sh
+sudo pacman -S --needed qemu-system-riscv qemu-system-aarch64 dtc
+```
+
+| Package | Why |
+|---|---|
+| `qemu-system-riscv` | `qemu-system-riscv32` (and `qemu-system-riscv64`). It pulls in `qemu-system-riscv-firmware`, which holds the OpenSBI images |
+| `qemu-system-aarch64` | `qemu-system-aarch64` |
+| `dtc` | `dtc`, plus small helpers such as `fdtdump` and `fdtget` |
+
+Arch builds its `gdb` for every architecture (`--enable-targets=all`), so the debugger from Phase 0 already handles
+both ports. Arch has no current `riscv32-elf` or `aarch64-elf` GCC package (the AUR's `riscv32-elf-gcc` is GCC 9.3,
+too old for the ISA name in section 9.3), so build both compilers yourself.
+
+**Fedora.**
+
+```sh
+sudo dnf install qemu-system-riscv qemu-system-aarch64 dtc
+```
+
+| Package | Why |
+|---|---|
+| `qemu-system-riscv` | `qemu-system-riscv32` and `qemu-system-riscv64`, with the OpenSBI images included |
+| `qemu-system-aarch64` | `qemu-system-aarch64` |
+| `dtc` | `dtc` and the other devicetree tools |
+
+Fedora's `gdb` from Phase 0 already includes RISC-V and AArch64: `gdb --configuration` lists them under
+`--enable-targets`. No extra debugger is needed.
+
+**Ubuntu and Debian.** Newer releases moved the RISC-V emulator into a package of its own. Check which release you
+have with `grep VERSION_ID /etc/os-release`, then:
+
+```sh
+sudo apt install qemu-system-arm device-tree-compiler gdb-multiarch
+sudo apt install qemu-system-riscv      # Debian 13, Ubuntu 25.04 and later
+sudo apt install qemu-system-misc       # instead, on Debian 12, Ubuntu 22.04 and 24.04
+```
+
+| Package | Why |
+|---|---|
+| `qemu-system-arm` | `qemu-system-aarch64`. Debian packages the 32-bit and 64-bit ARM emulators together |
+| `qemu-system-riscv` | `qemu-system-riscv32` with its OpenSBI images (newer releases) |
+| `qemu-system-misc` | `qemu-system-riscv32` on older releases, but without the 32-bit OpenSBI image (see below) |
+| `device-tree-compiler` | `dtc` |
+| `gdb-multiarch` | A GDB for every architecture. Debian's plain `gdb` only debugs your computer's own architecture, x86 on a PC |
+
+**The 32-bit OpenSBI on Debian 12, Ubuntu 22.04 and Ubuntu 24.04.** These releases include OpenSBI only for 64-bit
+RISC-V, so `qemu-system-riscv32 -bios default` stops with
+`Unable to find the RISC-V BIOS "opensbi-riscv32-generic-fw_dynamic.bin"` (QEMU 7.2 and older say
+`Unable to load the RISC-V firmware` instead). Copy the 32-bit image from an OpenSBI release to the place and name
+QEMU looks for, and `-bios default` works exactly as the phase documents use it:
+
+```sh
+cd /tmp
+curl -LO https://github.com/riscv-software-src/opensbi/releases/download/v1.7/opensbi-1.7-rv-bin.tar.xz
+tar xf opensbi-1.7-rv-bin.tar.xz
+sudo cp opensbi-1.7-rv-bin/share/opensbi/ilp32/generic/firmware/fw_dynamic.bin \
+        /usr/share/qemu/opensbi-riscv32-generic-fw_dynamic.bin
+```
+
+Version 1.7 is the one inside Fedora's QEMU 10.2, which the Stage V documents were checked with.
+
+**Other Linux distributions.** Install QEMU with `qemu-system-riscv32` and `qemu-system-aarch64`. Check that the
+32-bit OpenSBI image (`opensbi-riscv32-generic-fw_dynamic.bin`) came with it, and if it didn't, install it as shown
+for Debian 12 above. You also need `dtc`, sometimes packaged as `device-tree-compiler`, and a GDB built for several
+architectures, called `gdb-multiarch` on some distributions and included in the normal `gdb` on others. To test a
+GDB, run `gdb -batch -ex 'set architecture riscv:rv32' -ex 'set architecture aarch64'`. A multi-architecture build
+answers `The target architecture is set to ...` twice. An x86-only build says `Undefined item: "riscv:rv32".`
+
+**macOS.**
+
+```sh
+brew install aarch64-elf-binutils aarch64-elf-gcc riscv64-elf-gdb aarch64-elf-gdb dtc
+```
+
+| Formula | Why |
+|---|---|
+| `qemu` (from section 2) | Already contains `qemu-system-riscv32` with its OpenSBI images, and `qemu-system-aarch64` |
+| `aarch64-elf-binutils`, `aarch64-elf-gcc` | The ARM cross compiler, prebuilt, so skip the ARM half of section 9.3 |
+| `riscv64-elf-gdb` | The RISC-V debugger. It handles 32-bit RISC-V too |
+| `aarch64-elf-gdb` | The ARM debugger |
+| `dtc` | `dtc` |
+
+Homebrew has no `riscv32-elf-gcc`, so build that one from source as in section 9.3, which explains the
+macOS differences.
+
+**Windows (WSL2).** In the Ubuntu terminal, follow the Ubuntu and Debian lines above for your Ubuntu release. Both
+boards run with `-nographic` in the terminal, so WSLg doesn't matter here.
+
+### 9.3 Build the riscv32-elf and aarch64-elf cross compilers
+
+**For:** every Linux distribution and WSL2, and on macOS for `riscv32-elf` only.
+
+This is section 3 twice more, with a different `TARGET` each time and two extra GCC options for RISC-V. Use the same
+versions and the same prefix as in step 3.1, so that all three compilers end up side by side in `~/opt/cross/bin`.
+Give each target its own build folders. Each target takes about as long as the `i686-elf` one did; RISC-V takes a
+little longer, because GCC builds `libgcc` several times, once for each common combination of RISC-V extensions.
+
+Set the variables from step 3.1 again (all except `TARGET`). If `~/src` no longer has the two source folders, get
+them again with step 3.2.
+
+```sh
+export BINUTILS_VERSION=2.47
+export GCC_VERSION=16.2.0
+export PREFIX="$HOME/opt/cross"
+export PATH="$PREFIX/bin:$PATH"
+```
+
+**RISC-V (`riscv32-elf`):**
+
+```sh
+export TARGET=riscv32-elf
+mkdir -p ~/src/build-binutils-$TARGET && cd ~/src/build-binutils-$TARGET
+../binutils-$BINUTILS_VERSION/configure --target=$TARGET --prefix="$PREFIX" \
+    --with-sysroot --disable-nls --disable-werror
+make -j"$(nproc)" && make install
+
+mkdir -p ~/src/build-gcc-$TARGET && cd ~/src/build-gcc-$TARGET
+../gcc-$GCC_VERSION/configure --target=$TARGET --prefix="$PREFIX" \
+    --disable-nls --enable-languages=c --without-headers \
+    --with-arch=rv32imac_zicsr_zifencei --with-abi=ilp32
+make -j"$(nproc)" all-gcc all-target-libgcc
+make install-gcc install-target-libgcc
+```
+
+The two new options set the compiler's defaults. `rv32imac_zicsr_zifencei` names the instruction set: the 32-bit base
+integer instructions (`rv32i`), multiply and divide (`m`), atomic instructions (`a`), the 16-bit compressed
+instructions (`c`), the instructions that read and write control and status registers (`zicsr`), and `fence.i`, the
+instruction-fetch fence (`zifencei`). The last two must be spelled out because GCC 12 and binutils 2.38 follow the
+December 2019 version of the ISA specification, where they are no longer part of the base set: with plain `rv32imac`,
+the first `csrr` in Phase 17 doesn't assemble. `ilp32` is the ABI that goes with it: `int`, `long` and pointers are 32
+bits wide, and no floating-point registers are used.
+
+`riscv32-elf-gcc -print-multi-lib` lists the extra `libgcc` builds. One of them, `rv32im/ilp32`, is what GCC links
+for a core without the A extension, such as Timur-RV32IMC in Task 17.13 (`-march=rv32imc_zicsr_zifencei`), so a
+kernel for that core never gets library code that uses instructions the core lacks.
+
+**ARM (`aarch64-elf`):**
+
+```sh
+export TARGET=aarch64-elf
+mkdir -p ~/src/build-binutils-$TARGET && cd ~/src/build-binutils-$TARGET
+../binutils-$BINUTILS_VERSION/configure --target=$TARGET --prefix="$PREFIX" \
+    --with-sysroot --disable-nls --disable-werror
+make -j"$(nproc)" && make install
+
+mkdir -p ~/src/build-gcc-$TARGET && cd ~/src/build-gcc-$TARGET
+../gcc-$GCC_VERSION/configure --target=$TARGET --prefix="$PREFIX" \
+    --disable-nls --enable-languages=c --without-headers
+make -j"$(nproc)" all-gcc all-target-libgcc
+make install-gcc install-target-libgcc
+```
+
+AArch64 needs no extra options. The default is 64-bit code with the LP64 ABI (`long` and pointers are 64 bits wide,
+`int` stays 32), which is what Phase 18 uses. Restrictions such as `-mgeneral-regs-only` are compiler flags that the
+Makefile passes, not build options.
+
+On Linux and WSL2, `~/opt/cross/bin` is already on your `PATH` from step 3.5, so both compilers work in every new
+terminal.
+
+**On macOS** (`riscv32-elf` only), four things differ:
+
+1. Before configuring GCC, run `./contrib/download_prerequisites` once inside `~/src/gcc-$GCC_VERSION`. It downloads
+   GMP, MPFR and MPC, which GCC then builds along with itself, so they don't have to come from Homebrew.
+2. Use `gmake` instead of `make`.
+3. Use `"$(sysctl -n hw.ncpu)"` instead of `"$(nproc)"`.
+4. Afterwards, put the compiler on your `PATH` for good (macOS skipped step 3.5):
+   `echo 'export PATH="$HOME/opt/cross/bin:$PATH"' >> ~/.zshrc`, then open a new terminal.
+
+**Why not a prebuilt `riscv64-elf-gcc`?** Homebrew and Arch package one. Given `-march` and `-mabi` it generates RV32
+code and even links the 32-bit `libgcc`, but it defaults to 64-bit code and the 64-bit ABI. Every compile *and* link
+command would then need both options, and the Turk-OS Makefile links with the compiler's defaults (Phase 16), so the
+link fails. A `riscv32-elf` compiler built with the options above gets this right by itself.
+
+### 9.4 Tool names for the ports
+
+| Purpose | Arch | Fedora | Ubuntu / Debian / WSL2 | macOS |
+|---|---|---|---|---|
+| Cross prefix for RISC-V (`CROSS`) | `riscv32-elf-` | `riscv32-elf-` | `riscv32-elf-` | `riscv32-elf-` |
+| Cross prefix for ARM (`CROSS`) | `aarch64-elf-` | `aarch64-elf-` | `aarch64-elf-` | `aarch64-elf-` |
+| Debugger for the ports | `gdb` | `gdb` | `gdb-multiarch` | `riscv64-elf-gdb`, `aarch64-elf-gdb` |
+| Cross compiler location | `~/opt/cross/bin` | `~/opt/cross/bin` | `~/opt/cross/bin` | `~/opt/cross/bin` (RISC-V), Homebrew (ARM) |
+
+The x86 prefix stays `i686-elf-`. `qemu-system-riscv32`, `qemu-system-aarch64` and `dtc` have the same names
+everywhere.
+
+Phase 16 (Task 16.11) gives each architecture its own `kernel/arch/$(ARCH)/arch.mk`, which sets `CROSS`. Choose the
+debugger there too, with `find_tool` from section 4, and define `find_tool` above the line that includes `arch.mk`:
+
+```make
+# kernel/arch/i386/arch.mk (the line from section 4, unchanged)
+GDB := $(call find_tool,i386-elf-gdb gdb)
+# kernel/arch/riscv32/arch.mk
+GDB := $(call find_tool,gdb-multiarch riscv64-elf-gdb gdb)
+# kernel/arch/aarch64/arch.mk
+GDB := $(call find_tool,gdb-multiarch aarch64-elf-gdb gdb)
+```
+
+Plain `gdb` comes last because on Debian and Ubuntu it exists but only knows the PC's own architecture.
+
+### 9.5 Verify the port toolchains
+
+Open a new terminal and run each command. On macOS, use the debugger names from section 9.4.
+
+| Command | Expected result |
+|---|---|
+| `riscv32-elf-gcc --version` | `riscv32-elf-gcc (GCC) 16.2.0` (or the version you built) |
+| `riscv32-elf-gcc -v` | The `Configured with:` line ends in `--with-arch=rv32imac_zicsr_zifencei --with-abi=ilp32` |
+| `aarch64-elf-gcc --version` | `aarch64-elf-gcc (GCC) 16.2.0` |
+| `qemu-system-riscv32 --version` | `QEMU emulator version ...` |
+| `qemu-system-aarch64 --version` | `QEMU emulator version ...` |
+| `dtc --version` | `Version: DTC 1.x.y` |
+| `gdb-multiarch -batch -ex 'set architecture riscv:rv32' -ex 'set architecture aarch64'` (`gdb` on Arch and Fedora) | `The target architecture is set to "riscv:rv32".`, then the same for `"aarch64"` |
+
+Then compile one small file for each port and look at the result:
+
+```sh
+mkdir -p /tmp/turkos-check && cd /tmp/turkos-check
+cat > csr.c <<'EOF'
+unsigned long read_sstatus(void)
+{
+    unsigned long x;
+    __asm__ volatile ("csrr %0, sstatus" : "=r"(x));
+    return x;
+}
+EOF
+riscv32-elf-gcc -std=gnu11 -ffreestanding -O2 -march=rv32imac_zicsr_zifencei -mabi=ilp32 -c csr.c -o csr.o
+riscv32-elf-objdump -d csr.o           # csrr a0,sstatus  then  ret
+riscv32-elf-readelf -h csr.o           # Class: ELF32, Machine: RISC-V
+printf 'int add(int a, int b) { return a + b; }\n' > add.c
+aarch64-elf-gcc -std=gnu11 -ffreestanding -mgeneral-regs-only -O2 -c add.c -o add-a64.o
+aarch64-elf-objdump -d add-a64.o       # add w0, w0, w1  then  ret
+aarch64-elf-readelf -h add-a64.o       # Class: ELF64, Machine: AArch64
+```
+
+`riscv32-elf-readelf -h` also shows `Flags: 0x1, RVC, soft-float ABI`: compressed instructions are allowed and no
+floating-point registers are used. On AArch64, `w0` and `w1` are the 32-bit halves of the 64-bit registers `x0` and
+`x1`, because an `int` is still 32 bits wide. Now compile `csr.c` once more with `-march=rv32imac`. The assembler
+stops with ``Error: unrecognized opcode `csrr a0,sstatus', extension `zicsr' required``, which is why the ISA name is
+so long.
+
+### 9.6 Smoke-test the two boards
+
+Start the RISC-V board with its firmware and nothing else:
+
+```sh
+qemu-system-riscv32 -machine virt -nographic -bios default
+```
+
+OpenSBI prints its logo and a table about the board. `Platform Name` shows `riscv-virtio,qemu`. The SBI extensions are
+the services it offers your kernel. `Domain0 Next Mode` shows `S-mode`, the supervisor mode your kernel will run in.
+With no kernel to start, OpenSBI then waits. `-nographic` makes the terminal the board's serial port, so Ctrl+C goes
+to the board instead of stopping QEMU. Press **Ctrl+A, then X** to quit, or Ctrl+A, then C to switch between the
+serial port and the `(qemu)` monitor.
+
+Now the ARM board:
+
+```sh
+qemu-system-aarch64 -machine virt -cpu cortex-a72 -nographic
+```
+
+It prints nothing at all, and that is correct: this board has no firmware unless you give it one, so the processor
+starts in empty flash memory. Press Ctrl+A, then C, and type `info registers` at the `(qemu)` prompt. You should see
+the 64-bit registers `X00` to `X30` and a `PSTATE=` line ending in the current exception level, such as `EL1h`. Type
+`quit` to leave. Without `-cpu cortex-a72`, the `virt` board starts a 32-bit Cortex-A15 instead, and the registers are
+called `R00` to `R15`.
+
+Each board can also write out its devicetree, the description of its memory and devices that your kernel reads from
+Phase 16 on:
+
+```sh
+qemu-system-riscv32 -machine virt,dumpdtb=virt-riscv32.dtb
+qemu-system-aarch64 -machine virt,dumpdtb=virt-aarch64.dtb -cpu cortex-a72
+dtc -I dtb -O dts virt-riscv32.dtb | less
+```
+
+With `dumpdtb`, QEMU writes the blob and exits without starting the machine. `dtc` turns it into text that starts
+with `/dts-v1/;`. The root node says `model = "riscv-virtio,qemu";`, and further down you find `memory@80000000` and
+the UART at `serial@10000000`. In the ARM blob the root says `model = "linux,dummy-virt";` and the UART is
+`pl011@9000000`.
+
+GDB attaches the same way as in section 6. In one terminal:
+
+```sh
+qemu-system-riscv32 -machine virt -nographic -bios default -s -S
+```
+
+In a second terminal, use your debugger from section 9.4 (`gdb` on Arch and Fedora, `riscv64-elf-gdb` on macOS):
+
+```sh
+gdb-multiarch -ex "target remote localhost:1234"
+(gdb) info registers pc
+(gdb) x/4i $pc
+(gdb) stepi
+(gdb) continue
+```
+
+GDB detects a 32-bit RISC-V target (`riscv:rv32`) by itself and stops at `0x1000`, where QEMU puts a few instructions
+of reset code that run before OpenSBI. `x/4i` shows them, among them a `csrr` that reads the `mhartid` register, the
+number of the processor core. After `continue`, the OpenSBI banner appears in the first terminal.
+
+---
+
+## 10. Troubleshooting
 
 | Platform | Symptom | Likely cause | Fix |
 |---|---|---|---|
 | All | GCC build stops with missing `gmp.h` or `mpfr.h` | Build dependencies missing | Install the GMP, MPFR and MPC development packages for your platform (section 2), then rerun `configure` |
 | All | `configure: error: building in source directory` | Built inside the source tree | Use the separate `build-binutils` / `build-gcc` folders |
-| All | GCC `configure` can't find `i686-elf-as` | binutils not installed, or not on `PATH` | Finish step 3.3, and repeat the exports from step 3.1 in this terminal |
+| All | GCC `configure` can't find `i686-elf-as` (or `riscv32-elf-as`, `aarch64-elf-as`) | binutils for that target not installed, or not on `PATH` | Finish step 3.3 (or the binutils half of step 9.3), and repeat the exports from step 3.1 in this terminal |
 | All | `i686-elf-gcc` found in one terminal but not another | `PATH` set only in that shell | Put the export in `~/.bashrc` (or `~/.zshrc`) and open a new terminal |
 | All | A command from a phase document isn't found, for example `grub2-mkrescue: command not found` | The tool has a different name on your platform | Look it up in section 4, or use the Makefile variables from section 4 |
 | All | `grub-mkrescue` fails with a `xorriso` or `mformat` error | Missing ISO tools | Install `xorriso` (`libisoburn` on Arch) and `mtools` |
@@ -479,6 +813,15 @@ Then build with `make -C docs` from the repository root.
 | WSL2 | QEMU prints `gtk initialization failed` or no window appears | WSLg missing or outdated | Run `wsl --update` in PowerShell and restart WSL (`wsl --shutdown`); meanwhile use `-display curses` or `-display none -serial stdio` |
 | WSL2 | Builds are very slow | Repository under `/mnt/c` | Clone into the Linux home folder (`~/Turk-OS`) |
 | WSL2 | `$'\r': command not found` or `/bin/sh^M: bad interpreter` | Files checked out with Windows (CRLF) line endings | Clone inside WSL, not with Git for Windows; in an existing clone run `git add --renormalize .` |
+| All (Stage V) | ``Error: unrecognized opcode `csrr a0,sstatus', extension `zicsr' required`` (or ``extension `zifencei' required`` for `fence.i`) | `-march` without `_zicsr_zifencei` | Use `-march=rv32imac_zicsr_zifencei`, and build GCC with the options from step 9.3 |
+| All (Stage V) | The RISC-V link fails with ``ABI is incompatible with that of the selected emulation`` and ``target emulation `elf32-littleriscv' does not match `elf64-littleriscv'`` | RV32 objects linked with `riscv64-elf-` tools, which default to 64 bits | Build `riscv32-elf` (section 9.3) and use `CROSS=riscv32-elf-` |
+| All (Stage V) | `Unable to find the RISC-V BIOS "opensbi-riscv32-generic-fw_dynamic.bin"` (QEMU 7.2 and older: `Unable to load the RISC-V firmware`) | Your QEMU package has no 32-bit OpenSBI image (Debian 12, Ubuntu 22.04 and 24.04) | Install the image as shown in [section 9.2](#92-install-the-emulators-dtc-and-gdb) |
+| All (Stage V) | QEMU started with `-nographic` ignores Ctrl+C | The terminal is the board's serial port, so Ctrl+C goes to the board | Press Ctrl+A, then X to quit; Ctrl+A, then C for the monitor |
+| All (Stage V) | `qemu-system-aarch64 -nographic` prints nothing | Expected without a kernel: the ARM board has no firmware | Check that it runs with Ctrl+A, then C and `info registers`; Phase 18 gives it a kernel |
+| All (Stage V) | `info registers` on the ARM board shows `R00` to `R15` instead of `X00` to `X30` | No `-cpu` option: the `virt` board starts a 32-bit Cortex-A15 by default | Add `-cpu cortex-a72` |
+| Ubuntu / Debian / WSL2 (Stage V) | `qemu-system-aarch64: command not found` | Debian packages it in `qemu-system-arm` | `sudo apt install qemu-system-arm` |
+| Ubuntu / Debian / WSL2 (Stage V) | `qemu-system-riscv32: command not found` | It isn't part of `qemu-system-x86` | `sudo apt install qemu-system-riscv` (Debian 13, Ubuntu 25.04 and later) or `qemu-system-misc` (older releases) |
+| Ubuntu / Debian / WSL2 (Stage V) | GDB warns that the target description `specified unknown architecture "riscv:rv32"` (or `"aarch64"`) | Plain `gdb` only knows the PC's own architecture | Use `gdb-multiarch` (section 9.4) |
 
 When a problem takes more than an hour, write down the hypothesis in the [lab journal](journal.md) before each
 attempt. The OSDev Wiki's [GCC Cross-Compiler](https://wiki.osdev.org/GCC_Cross-Compiler) page lists more known

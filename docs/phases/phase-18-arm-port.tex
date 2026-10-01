@@ -1,0 +1,1283 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{turkos}
+
+\begin{document}
+\renewcommand{\progresslabel}{Stage V progress toward Turk-OS 2.0 (this phase in red)}
+\phaseheader{18}{The ARM Port}{Port Turk-OS to 64-bit ARM: exception levels, the GIC, a three-level MMU with two translation bases, a 64-bit clean kernel, and finally Turk-OS 2.0 on three architectures}{60}{100}
+
+\ataglance{5--6 weeks (the Raspberry Pi 4 in Task 18.12 is optional)}{5}{Phase 17 complete: the RISC-V port works, so the
+architecture interface has been tested once; \code{make ARCH=aarch64 check-generic} from Task 16.9 still
+passes}{Turk-OS on \code{qemu-system-aarch64 -machine virt} booting to \code{tsh} with EL1 exception vectors, GICv2,
+the generic timer, the PL011 UART, the 39-bit VMSAv8-64 MMU with \code{TTBR0} and \code{TTBR1}, \code{svc} system
+calls, an ELF64 loader, virtio-blk, \code{make ARCH=aarch64 test}, and the v2.0 release for three architectures.}
+
+\section{Why this phase}
+
+The RISC-V port proved that the architecture interface of Phase 16 can carry a second machine. But RV32 was kind to
+you: pointers were still 32 bits, the page tables still had two levels, and the kernel still lived at
+\code{0xC0000000}. AArch64 changes everything at once. The instruction set is new, every register and every pointer
+is 64 bits wide, the MMU has three levels and two base registers, memory has types that you must choose, and the
+processor reorders memory accesses unless you tell it not to. If the interface survives this port, it is really
+generic.
+
+This is also the last phase of the plan. You will finish by building one TurkFS image that boots on three
+architectures, measuring the same benchmarks on all of them, writing down what porting taught you, and tagging
+Turk-OS 2.0. Expect the MMU (Task 18.6) to take the longest: an AArch64 MMU that is set up slightly wrong usually
+stops the machine without a word, just as x86 paging did in Phase 6.
+
+\section{Concepts you need}
+
+\subsection{AArch64 in one page}
+
+AArch64 has 31 general-purpose 64-bit registers, \code{x0} to \code{x30}. Each has a 32-bit view: \code{w5} is the low
+half of \code{x5}, and writing \code{w5} clears the upper half. Register number 31 means either the stack pointer
+\code{sp} or the zero register \code{xzr}, depending on the instruction. The program counter is not a general
+register: you change it only with branches. Every instruction is exactly 4 bytes. There is no \code{push} or
+\code{pop}; you move \code{sp} yourself and store pairs of registers with \code{stp} and \code{ldp}. \code{bl} puts
+the return address in \code{x30} (the link register) instead of on the stack, and \code{ret} jumps to it. The
+condition flags N, Z, C and V live in \code{PSTATE}, the processor state. Control registers are \textbf{system
+registers} with names like \code{VBAR_EL1}; you read them with \code{mrs} and write them with \code{msr}. The suffix
+names the lowest exception level allowed to use the register.
+
+The calling convention is the AAPCS64. Arguments go in \code{x0}--\code{x7} and the result comes back in \code{x0};
+\code{x19}--\code{x28} are callee-saved; \code{x29} is the frame pointer and \code{x30} the link register;
+\code{sp} must stay 16-byte aligned. The data model is \textbf{LP64}: \code{int} stays 32 bits, but \code{long},
+\code{size_t} and every pointer become 64 bits. Table~\ref{tab:isas} puts the three architectures of Turk-OS side by
+side.
+
+\begin{table}[htbp]
+\centering\small\renewcommand{\arraystretch}{1.2}
+\begin{tabularx}{\linewidth}{@{}>{\raggedright\arraybackslash}p{0.2\linewidth} >{\raggedright\arraybackslash}X >{\raggedright\arraybackslash}X >{\raggedright\arraybackslash}X@{}}
+\toprule
+\tkth{} & \tkth{i386 (Phases 0--15)} & \tkth{RV32 (Phase 17)} & \tkth{AArch64 (this phase)} \\
+\midrule
+data model & ILP32 & ILP32 & LP64 \\
+registers & 8 (\code{eax} \dots\ \code{esp}) & \code{x1}--\code{x31}, \code{x0} = 0 & \code{x0}--\code{x30}, \code{sp}, \code{xzr} \\
+arguments & on the stack (cdecl) & \code{a0}--\code{a7} & \code{x0}--\code{x7} \\
+callee-saved & \code{ebx esi edi ebp} & \code{s0}--\code{s11} & \code{x19}--\code{x28}, \code{x29} \\
+return address & pushed on the stack & \code{ra} & \code{x30} \\
+system call & \code{int 0x80}, number in \code{eax} & \code{ecall}, number in \code{a7} & \texttt{svc \#0}, number in \code{x8} \\
+return from trap & \code{iret} & \code{sret} & \code{eret} \\
+kernel stack on a trap & \code{esp0} in the TSS & swapped in through \code{sscratch} & \code{SP_EL1}, a separate register \\
+page table base & \code{CR3} & \code{satp} & \code{TTBR0_EL1} and \code{TTBR1_EL1} \\
+\bottomrule
+\end{tabularx}
+\caption{One kernel, three machines. Only the right-hand column is new in this phase.}
+\label{tab:isas}
+\end{table}
+
+\subsection{Exception levels}
+
+AArch64 replaces x86's rings and RISC-V's modes with four \textbf{exception levels} (Figure~\ref{fig:els}). EL0 runs
+programs, EL1 an operating system kernel, EL2 a hypervisor and EL3 the secure monitor firmware. An exception can only
+move execution to the same or a higher level, and \code{eret} is the only way down. Turk-OS runs at EL1 and its
+programs at EL0. QEMU's \code{virt} board has no EL2 or EL3 unless you ask for them, so by default the kernel starts
+at EL1; with \code{-machine virt,virtualization=on}, and on a Raspberry Pi 4, it starts at EL2 and must step down.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[lv/.style={tkbox, minimum width=6.6cm, text width=6.4cm, minimum height=0.72cm, align=left},
+  n/.style={tknote, anchor=west, align=left, text width=5.6cm}]
+  \node[lv, fill=tkGray!12] (e3) at (0,0) {\textbf{EL3}\enspace secure monitor (firmware, TrustZone)};
+  \node[lv, fill=tkGray!12, below=3pt of e3] (e2) {\textbf{EL2}\enspace hypervisor: unused by Turk-OS};
+  \node[tkhi, minimum width=6.6cm, text width=6.4cm, minimum height=0.72cm, align=left, below=3pt of e2] (e1) {\textbf{EL1}\enspace Turk-OS: \code{VBAR_EL1}, \code{TTBR1_EL1}, \code{SP_EL1}};
+  \node[tkok, minimum width=6.6cm, text width=6.4cm, minimum height=0.72cm, align=left, below=0.75cm of e1] (e0) {\textbf{EL0}\enspace programs: \code{TTBR0_EL1}, \code{SP_EL0}};
+  \node[n, right=0.4cm of e3] {absent on QEMU \code{virt} unless \code{secure=on}; on the Pi 4 the firmware's stub};
+  \node[n, right=0.4cm of e2] {with \code{virtualization=on}, and on the Pi 4, the kernel starts here and drops to EL1};
+  \node[n, right=0.4cm of e1] {QEMU \code{virt} by default starts the kernel here};
+  \node[n, right=0.4cm of e0] {\texttt{svc \#0}, an IRQ or a fault go up to EL1};
+  \draw[tkarrow] ([xshift=-1.2cm]e0.north) -- node[left, tknote] {exception} ([xshift=-1.2cm]e1.south);
+  \draw[tkarrow, tkRed] ([xshift=1.2cm]e1.south) -- node[right, tknote] {\code{eret}} ([xshift=1.2cm]e0.north);
+\end{tikzpicture}
+\caption{The four exception levels and where Turk-OS uses them.}
+\label{fig:els}
+\end{figure}
+
+Each level from EL1 up has its own stack pointer. At EL1 the kernel normally uses \code{SP_EL1} (the mode is then
+called EL1h, ``h'' for handler); \code{SP_EL0} belongs to the user program. When an exception arrives from EL0, the CPU
+simply starts using \code{SP_EL1}, so the hardware itself switches to the kernel stack. There is no TSS to update and
+no \code{sscratch} to swap: whatever \code{sp} held when the kernel last executed \code{eret} is the kernel stack for
+the next exception.
+
+\subsection{Taking an exception}
+
+On every exception to EL1 the CPU saves the return address in \code{ELR_EL1} and the old \code{PSTATE} in
+\code{SPSR_EL1}, masks all four interrupt classes in \code{PSTATE.DAIF} (Debug, SError, IRQ, FIQ), switches to
+\code{SP_EL1}, and jumps into the \textbf{vector table} that \code{VBAR_EL1} points to. For synchronous exceptions it
+also writes the reason into \code{ESR_EL1}, and for aborts the faulting address into \code{FAR_EL1}. \code{eret} reloads
+\code{PSTATE} from \code{SPSR_EL1} and the PC from \code{ELR_EL1}. Unlike x86, the CPU pushes nothing on any stack:
+saving registers is entirely your code's job.
+
+The vector table is 2\,KiB long and must be 2\,KiB aligned. It has four groups of four entries, and each entry is
+0x80 bytes, room for 32 instructions (Figure~\ref{fig:vectors}). The group says where the exception came from; the
+entry says what kind it is. Turk-OS uses four of the sixteen and treats the rest as fatal.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[c/.style={cell, minimum width=2.15cm}, k/.style={c, fill=tkRed!10}, u/.style={c, fill=tkGreen!12},
+  vx/.style={c, fill=tkGray!10, text=tkGray}, h/.style={font=\sffamily\scriptsize\bfseries, text=tkNavy},
+  g/.style={font=\sffamily\scriptsize, anchor=east, align=right}]
+  \foreach \t [count=\i from 0] in {synchronous, IRQ, FIQ, SError} \node[h] at (2.15*\i, 0.55) {\t};
+  \node[g] at (-1.2, 0)     {current EL, \code{SP_EL0}};
+  \node[g] at (-1.2, -0.62) {current EL, \code{SP_EL1} (kernel)};
+  \node[g] at (-1.2, -1.24) {lower EL, AArch64 (user)};
+  \node[g] at (-1.2, -1.86) {lower EL, AArch32};
+  \node[vx] at (0,0) {0x000}; \node[vx] at (2.15,0) {0x080}; \node[vx] at (4.3,0) {0x100}; \node[vx] at (6.45,0) {0x180};
+  \node[k] at (0,-0.62) {0x200 faults, \code{brk}}; \node[k] at (2.15,-0.62) {0x280 device};
+  \node[vx] at (4.3,-0.62) {0x300}; \node[vx] at (6.45,-0.62) {0x380};
+  \node[u] at (0,-1.24) {0x400 \texttt{svc}, faults}; \node[u] at (2.15,-1.24) {0x480 device};
+  \node[vx] at (4.3,-1.24) {0x500}; \node[vx] at (6.45,-1.24) {0x580};
+  \node[vx] at (0,-1.86) {0x600}; \node[vx] at (2.15,-1.86) {0x680}; \node[vx] at (4.3,-1.86) {0x700}; \node[vx] at (6.45,-1.86) {0x780};
+\end{tikzpicture}
+\caption{The AArch64 vector table: offsets from \code{VBAR_EL1}. Coloured entries are the ones Turk-OS handles;
+grey ones mean a bug (FIQ and SError are not used, and Turk-OS runs no 32-bit code).}
+\label{fig:vectors}
+\end{figure}
+
+\begin{table}[htbp]
+\centering\small\renewcommand{\arraystretch}{1.2}
+\begin{tabularx}{\linewidth}{@{}l >{\raggedright\arraybackslash}X >{\raggedright\arraybackslash}X@{}}
+\toprule
+\tkth{EC} & \tkth{Meaning} & \tkth{What Turk-OS does} \\
+\midrule
+\code{0x00} & unknown reason: an undefined instruction, or \code{hlt} without semihosting & \code{SIGILL}, or panic in the kernel \\
+\code{0x07} & SVE, SIMD or floating-point instruction trapped by \code{CPACR_EL1.FPEN} & \code{SIGILL}: Turk-OS 2.0 uses no FP (Task 18.2) \\
+\code{0x15} & \code{svc} executed in AArch64 state & system call; \code{ELR_EL1} already points past it \\
+\code{0x20}, \code{0x21} & instruction abort from EL0, from EL1 & page fault on an instruction fetch \\
+\code{0x24}, \code{0x25} & data abort from EL0, from EL1 & page fault; ISS bit 6 (WnR) says write \\
+\code{0x26} & stack pointer alignment fault & \code{SIGBUS}, or panic: \code{sp} was not 16-byte aligned \\
+\code{0x3C} & \code{brk} executed in AArch64 state & debug print; \code{ELR_EL1} points at the \code{brk} itself \\
+\bottomrule
+\end{tabularx}
+\caption{The exception classes in \code{ESR_EL1} bits 31:26 that Turk-OS decodes. For aborts, the low six bits
+(the fault status code) give the type and the table level: \code{0x04}--\code{0x07} translation fault, \code{0x08}
+plus level access-flag fault, \code{0x0C} plus level permission fault.}
+\label{tab:esr}
+\end{table}
+
+\subsection{The GIC and the generic timer}
+
+The \textbf{Generic Interrupt Controller} (GIC) plays the part of the 8259 PIC and RISC-V's PLIC. Version 2 has two
+blocks of memory-mapped registers. The \textbf{distributor} (\code{GICD_*}) decides, per interrupt, whether it is
+enabled, how urgent it is and which CPU receives it. Each CPU has a \textbf{CPU interface} (\code{GICC_*}) through
+which it acknowledges an interrupt (reading \code{GICC_IAR} returns its number) and ends it (writing that value to
+\code{GICC_EOIR}). Interrupt numbers, called INTIDs, come in three ranges: 0--15 are SGIs, software interrupts between
+CPUs; 16--31 are PPIs, private to one CPU, such as its timer; 32 and up are SPIs, shared devices such as the UART
+and the disk. A devicetree \code{interrupts} property for the GIC has three cells: the type (0 for an SPI, 1 for a
+PPI), the number within that type, and flags. So SPI 1 is INTID 33. INTID 1023 means ``spurious, nothing to do''.
+
+The \textbf{generic timer} is built into every core, so there is no PIT or SBI call. \code{CNTFRQ_EL0} holds the
+counter frequency, \code{CNTVCT_EL0} the current count, and each timer has a control register (\code{CNTV_CTL_EL0}:
+enable and mask bits) and a down-counter (\code{CNTV_TVAL_EL0}) that raises its PPI when it reaches zero. Turk-OS uses
+the \textbf{virtual} timer, INTID 27, which Linux also uses at EL1; the physical EL1 timer is INTID 30. Read the
+frequency, never assume it: QEMU gives a Cortex-A72 62.5\,MHz, while newer CPU models get 1\,GHz.
+
+\subsection{Translation with two base registers}
+
+With the 4\,KiB granule and 39-bit virtual addresses (\code{T0SZ} = \code{T1SZ} = 25 in \code{TCR_EL1}), a walk starts
+at level~1 and has three levels of 512 eight-byte entries, each table exactly one page (Figure~\ref{fig:walk}). Bits
+38:30 of the address select the level-1 entry, 29:21 the level-2 entry, 20:12 the level-3 entry, and 11:0 the byte.
+Bits 63:39 must be all zeros or all ones. All zeros means the walk starts at \code{TTBR0_EL1}; all ones means
+\code{TTBR1_EL1}; anything else faults. So the 64-bit space has a 512\,GiB bottom half for one process, a 512\,GiB
+top half for the kernel, and an enormous hole between them (Figure~\ref{fig:as64}).
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[x=0.36cm, y=1cm, every node/.style={font=\sffamily\scriptsize}]
+  \draw[draw=tkNavy!70, fill=tkGray!12] (0,4) rectangle (8,4.7);
+  \draw[draw=tkNavy!70, fill=tkBlue!12] (8,4) rectangle (16,4.7);
+  \draw[draw=tkNavy!70, fill=tkGreen!12] (16,4) rectangle (24,4.7);
+  \draw[draw=tkNavy!70, fill=tkViolet!14] (24,4) rectangle (32,4.7);
+  \draw[draw=tkNavy!70, fill=tkAmber!14] (32,4) rectangle (40,4.7);
+  \node at (4,4.35) {63:39 select TTBR};
+  \node at (12,4.35) {38:30 level 1};
+  \node at (20,4.35) {29:21 level 2};
+  \node at (28,4.35) {20:12 level 3};
+  \node at (36,4.35) {11:0 offset};
+  \node[tkhi, minimum width=1.9cm, align=center] (ttbr) at (2.5,1.2) {\code{TTBR0_EL1}\\or \code{TTBR1_EL1}};
+  \node[draw=tkNavy!70, fill=tkBlue!6, minimum width=1.7cm, minimum height=1.9cm, align=center] (l1) at (12,1.2) {level 1\\512 entries\\(1\,GiB each)};
+  \node[draw=tkNavy!70, fill=tkGreen!6, minimum width=1.7cm, minimum height=1.9cm, align=center] (l2) at (20,1.2) {level 2\\512 entries\\(2\,MiB each)};
+  \node[draw=tkNavy!70, fill=tkViolet!8, minimum width=1.7cm, minimum height=1.9cm, align=center] (l3) at (28,1.2) {level 3\\512 entries\\(4\,KiB each)};
+  \node[draw=tkNavy!70, fill=tkAmber!8, minimum width=1.7cm, minimum height=1.9cm, align=center] (pg) at (36,1.2) {4\,KiB\\page};
+  \draw[tkarrow] (4,4) -- (ttbr.north);
+  \draw[tkarrow] (ttbr) -- (l1);
+  \draw[tkarrow] (12,4) -- (l1.north); \draw[tkarrow] (20,4) -- (l2.north);
+  \draw[tkarrow] (28,4) -- (l3.north); \draw[tkarrow] (36,4) -- (pg.north);
+  \draw[tkarrow] (l1) -- node[above, font=\sffamily\tiny] {table} (l2);
+  \draw[tkarrow] (l2) -- node[above, font=\sffamily\tiny] {table} (l3);
+  \draw[tkarrow] (l3) -- node[above, font=\sffamily\tiny] {page} (pg);
+  \node[tknote, text width=12.5cm, anchor=north] at (20,-0.05) {A level-1 or level-2 entry may also be a \textbf{block}
+    that maps 1\,GiB or 2\,MiB directly and ends the walk early, like x86's 4\,MiB pages.};
+\end{tikzpicture}
+\caption{VMSAv8-64 translation of a 39-bit virtual address with 4\,KiB pages. As on x86, every table pointer is a
+physical address.}
+\label{fig:walk}
+\end{figure}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[m/.style={draw=tkNavy!70, minimum width=6.8cm, text width=6.6cm, font=\sffamily\scriptsize, align=center},
+  a/.style={font=\ttfamily\scriptsize, anchor=east}, n/.style={tknote, anchor=west, align=left}]
+  \node[m, minimum height=1.3cm, fill=tkRed!10] (k) at (0,0) {\textbf{kernel}: direct map of RAM at \code{KERNEL_BASE} + physical,\\kernel image at \code{0xFFFFFF8040200000}, devices mapped as Device};
+  \node[m, minimum height=0.9cm, fill=tkGray!15, below=0pt of k] (hole) {not translatable: any access faults};
+  \node[m, minimum height=1.3cm, fill=tkGreen!10, below=0pt of hole] (u) {\textbf{one process}: program at \code{0x00400000},\\heap, stack below \code{USER_STACK_TOP} = $2^{39}$};
+  \node[a] at ([xshift=-4pt]k.north west) {0xFFFFFFFFFFFFFFFF};
+  \node[a] at ([xshift=-4pt]k.south west) {0xFFFFFF8000000000};
+  \node[a] at ([xshift=-4pt]u.north west) {0x0000008000000000};
+  \node[a] at ([xshift=-4pt]u.south west) {0x0000000000000000};
+  \node[n, right=6pt of k] {\code{TTBR1_EL1}: one set of\\tables for the whole system};
+  \node[n, right=6pt of u] {\code{TTBR0_EL1}: changed on\\every process switch};
+\end{tikzpicture}
+\caption{The Turk-OS address space on AArch64. Compare Phase 10's Figure: the user half no longer has to share a page
+directory with the kernel.}
+\label{fig:as64}
+\end{figure}
+
+This split removes a chore from x86 and RISC-V, where every new page directory needed copies of the kernel's
+entries. On AArch64 a process's level-1 table contains only user mappings, and \code{arch_mmu_switch} changes only
+\code{TTBR0_EL1}. Table~\ref{tab:pte} compares the leaf entries of the three MMUs you have now programmed.
+
+\begin{table}[htbp]
+\centering\small\renewcommand{\arraystretch}{1.2}
+\begin{tabularx}{\linewidth}{@{}>{\raggedright\arraybackslash}p{0.14\linewidth} >{\raggedright\arraybackslash}X >{\raggedright\arraybackslash}X >{\raggedright\arraybackslash}X@{}}
+\toprule
+\tkth{Property} & \tkth{x86 PTE (Phase 6)} & \tkth{Sv32 PTE (Phase 17)} & \tkth{AArch64 page descriptor} \\
+\midrule
+valid & P, bit 0 & V, bit 0 & bit 0, with bit 1 = 1 for a page \\
+writable & R/W, bit 1 & W, bit 2 (R, bit 1, readable) & AP[2], bit 7, set means \emph{read-only} \\
+user & U/S, bit 2 & U, bit 4 & AP[1], bit 6 \\
+executable & always, without PAE & X, bit 3 & UXN bit 54, PXN bit 53, set means \emph{not} executable \\
+accessed & A, bit 5, set by hardware & A, bit 6 & AF, bit 10; if clear, the first access faults \\
+dirty & D, bit 6, set by hardware & D, bit 7 & none in Armv8.0: map read-only and catch the fault \\
+global & G, bit 8 & G, bit 5 & nG, bit 11, set means \emph{not} global \\
+cache type & PCD, PWT (bits 4, 3) & none: fixed by the platform & AttrIndx, bits 4:2, an index into \code{MAIR_EL1}; SH, bits 9:8 \\
+frame & bits 31:12 & PPN, bits 31:10 & bits 47:12 \\
+\bottomrule
+\end{tabularx}
+\caption{Three page-table entry formats. Note how many AArch64 bits are inverted: they are set to take a right
+away, not to grant one.}
+\label{tab:pte}
+\end{table}
+
+\subsection{Memory types and barriers}
+
+On x86 and in QEMU's RISC-V board you never had to say what kind of memory an address was. On AArch64 every mapping
+names a \textbf{memory type} through its AttrIndx field, which selects one of eight attribute bytes in
+\code{MAIR_EL1}. Turk-OS needs two. \textbf{Normal} memory (attribute \code{0xFF}: write-back cacheable) may be cached,
+read speculatively, and have its accesses merged and reordered: right for RAM, disastrous for a device, where a
+read can pop a byte out of a FIFO and the order of writes is the protocol. \textbf{Device-nGnRnE} memory (attribute
+\code{0x00}) forbids all of that: no gathering of accesses, no reordering, no early write acknowledgement. Every MMIO
+region must be mapped as Device. With the MMU off, the CPU treats every data access as Device-nGnRnE, which is why
+early boot code runs without caches and must not make unaligned accesses.
+
+The CPU is also free to reorder ordinary loads and stores as seen by other observers, such as another core, a DMA
+engine or the MMU's own table walker. Three barrier instructions restore order. \code{dmb} (data memory barrier)
+keeps memory accesses before it ahead of those after it. \code{dsb} (data synchronisation barrier) waits until earlier
+accesses, and TLB and cache maintenance, have actually completed. \code{isb} (instruction synchronisation barrier)
+throws away the instructions already fetched, so the next ones see a just-written system register. An option names
+the scope: \code{ish} is the inner shareable domain (all the cores), \code{st} restricts it to stores. So changing a
+live page-table entry is: write it, \code{dsb ishst} so the walker can see it, \code{tlbi} to drop the old
+translation, \code{dsb ish} to wait for that, and \code{isb}.
+
+\begin{conceptbox}{The access flag}
+A descriptor whose AF bit is 0 is valid but raises an access-flag fault the first time it is used. Armv8.0 never sets
+AF in hardware (later versions can, if \code{TCR_EL1.HA} asks for it). An operating system can clear AF on purpose to
+learn which pages are in use, which is the information \OSTEP's clock algorithm needs. Turk-OS simply sets AF in every
+descriptor it writes; forgetting to do so is the classic first bug of an AArch64 MMU.
+\end{conceptbox}
+
+\section{Reading plan}
+
+\begin{readingplan}
+\must & \OSC & \S9.7 \emph{Example: ARMv8 Architecture} & 383--384 & Granules, levels and regions in two pages, after the IA-32 example you read in Phase 6. \\
+\must & \ARMDOC & \emph{Learn the architecture: AArch64 Exception Model} (exception levels, exception types, the vector table, handling and returning) & -- & Tasks 18.2, 18.4 and 18.9. \\
+\must & \ARMDOC & \emph{Learn the architecture: AArch64 memory management} (translation regimes, granules, TTBR0/TTBR1, \code{TCR_EL1}, TLB maintenance) & -- & Task 18.6, before you write a line of it. \\
+\should & \ARMDOC & \emph{Learn the architecture: AArch64 memory attributes and properties} & -- & Normal versus Device memory, shareability, MAIR. \\
+\should & \ARMDOC & \emph{Learn the architecture: Memory Systems, Ordering, and Barriers} & -- & What \code{dmb}, \code{dsb} and \code{isb} really guarantee. \\
+\should & \ARMDOC & \emph{Learn the architecture: Generic Timer} & -- & Counter, frequency, the timer registers (Task 18.5). \\
+\should & \ARMDOC & \emph{ARM Generic Interrupt Controller Architecture Specification}, version 2.0 (IHI~0048B), Ch.~4 \emph{Programmers' Model} & -- & The distributor and CPU interface registers of Task 18.5. \\
+\should & \SPEC & QEMU documentation, \emph{`virt' generic virtual platform} (Arm), especially \emph{Hardware configuration information for bare-metal programming} & -- & What the board guarantees and where it puts the devicetree (Task 18.1). \\
+\should & \ARMDOC & \emph{Semihosting for AArch32 and AArch64}: the trap instructions and \code{SYS_EXIT (0x18)} & -- & The test exit of Task 18.10. \\
+\should & \OSC & \S17.3 \emph{Protection Rings}, the ARM part (TrustZone, exception levels) & 669--671 & Why EL2 and EL3 exist above your kernel. \\
+\should & \OSTEP & \S28.10 \emph{Load-Linked and Store-Conditional} & 311--312 & Exactly what \code{ldaxr}/\code{stlxr} do (Task 18.8). \\
+\should & \OSTEP & \S19.5 \emph{TLB Issue: Context Switches} & 200--202 & Flushing on every switch versus ASIDs, for \code{TTBR0_EL1}. \\
+\could & \ARMDOC & DDI~0487, the chapters \emph{The AArch64 System Level Programmers' Model} and \emph{The AArch64 Virtual Memory System Architecture} & -- & The authoritative answer when a guide is vague. \\
+\could & \ARMDOC & \emph{Procedure Call Standard for the Arm 64-bit Architecture} (AAPCS64) & -- & Register roles and stack alignment, for the assembly and the user ABI. \\
+\could & \MOS & \S12.3.9 \emph{Useful Techniques}: \emph{Hiding the Hardware} & 1005--1007 & Ideas for the porting chapter of Task 18.11. \\
+\could & \MOS & \S11.3.1 \emph{Operating System Structure}, the part \emph{The Hardware Abstraction Layer} & 880--882 & How Windows separates the machine from the kernel. \\
+\end{readingplan}
+
+Keep Linux's \emph{Documentation/arch/arm64/booting.rst} at hand as well: it defines the Image header and the CPU
+state that QEMU and the Raspberry Pi firmware both produce for Task 18.2.
+
+\begin{minixbox}[Real-system lens: how Linux arm64 does it]
+Linux enters at \code{primary_entry} in \texttt{arch/arm64/kernel/head.S}, whose \code{init_kernel_el} drops from EL2
+to EL1 when the kernel does not stay there itself. \code{__cpu_setup} in \texttt{arch/arm64/mm/proc.S} computes
+\code{MAIR_EL1} and \code{TCR_EL1} much as your Task 18.6 does, before \code{head.S} turns the MMU on.
+The vector table is \code{vectors} in \texttt{arch/arm64/kernel/entry.S}: sixteen uses of the \code{kernel_ventry}
+macro, each saving registers into a \code{struct pt_regs} and calling C handlers such as \code{el0t_64_sync_handler}
+in \texttt{entry-common.c}, which sends \code{svc} to \code{el0_svc}. For contrast, MINIX 3's ARM port
+(\texttt{minix/kernel/arch/earm} in the MINIX 3 source tree, not in \OSDI) targets 32-bit ARMv7 boards such as the
+BeagleBone. Its \texttt{exc.S} has the old ARM vector table: eight single \code{ldr pc} instructions, one per
+exception type, instead of sixteen 128-byte slots.
+\end{minixbox}
+
+\section{Build it}
+
+\task{Meet the board}
+QEMU's \code{virt} board for Arm is documented as having only two fixed addresses: flash at 0 and RAM at
+\code{0x40000000}. Everything else may move between QEMU versions, so the kernel finds it in the devicetree, as on
+RISC-V. Pass \code{-cpu cortex-a72}: without it QEMU emulates a 32-bit Cortex-A15. Ask for GICv2 explicitly too; it is
+the default today only because you use eight or fewer CPUs. Dump the devicetree (keep a copy in \code{tests/data/}
+for the FDT tests of Task 16.10) and look at the memory map.
+
+\begin{lst}{sh}{terminal}
+qemu-system-aarch64 -machine virt,gic-version=2,dumpdtb=build/aarch64/virt.dtb -cpu cortex-a72 -m 128M
+dtc -I dtb -O dts build/aarch64/virt.dtb | less
+printf 'info mtree -f\nquit\n' | qemu-system-aarch64 -machine virt,gic-version=2 -cpu cortex-a72 \
+    -display none -monitor stdio -S
+\end{lst}
+
+\begin{center}
+\small\renewcommand{\arraystretch}{1.2}
+\begin{tabularx}{\linewidth}{@{}l l >{\raggedright\arraybackslash}X@{}}
+\toprule
+\tkth{Device} & \tkth{Address (QEMU 10)} & \tkth{Interrupt} \\
+\midrule
+GICv2 distributor, CPU interface & \code{0x08000000}, \code{0x08010000} & -- \\
+PL011 UART & \code{0x09000000} & SPI 1 = INTID 33 \\
+virtio-mmio, 32 slots & \code{0x0a000000} + \code{0x200}\,$\times n$ & SPI $16+n$ = INTID $48+n$ \\
+RAM & \code{0x40000000} & -- \\
+generic timer & in the core & virtual: INTID 27; EL1 physical: INTID 30 \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+QEMU starts a kernel in one of two ways. An ELF file is booted ``bare-metal'': the CPU starts at the ELF entry at
+the highest exception level, \code{x0} holds nothing useful, and the devicetree waits at the start of RAM. Any other
+file is booted with the \textbf{Linux boot protocol}: \code{x0} holds the devicetree's physical address, an
+\code{-initrd} is loaded and listed in \code{/chosen}, and the CPU starts at EL1, or at EL2 if the board has it.
+The Raspberry Pi firmware does the same, so Turk-OS uses the Linux protocol on both.
+\verify{The decoded tree shows \code{memory@40000000} with 128\,MiB, \code{pl011@9000000} with
+\code{interrupts = <0x00 0x01 0x04>}, an \code{intc@8000000} compatible with \code{arm,cortex-a15-gic} (QEMU's name for a
+GICv2), a \code{timer} node with four PPIs, and 32 \code{virtio_mmio} nodes. Note in \code{docs/porting.md} which of
+them your code reads.}
+
+\task{The first instructions}
+\code{boot.S} starts with the 64-byte \textbf{arm64 Image header}, which makes the raw binary bootable by QEMU and by
+the Pi firmware. With \code{text_offset} 0, both load it 2\,MiB above a 2\,MiB-aligned base, that is at
+\code{0x40200000} on QEMU. Then core 0 continues and any other core parks. On QEMU the other cores are not even
+running: they start powered off and wait for a PSCI \code{CPU_ON} call (a firmware call through \code{hvc} or
+\code{smc}) that Turk-OS never makes. On the Pi they wait in the firmware's spin loop. Checking \code{MPIDR_EL1} costs
+three instructions and protects you on any board.
+
+If \code{CurrentEL} says EL2, prepare EL1 and step down with \code{eret}: \code{HCR_EL2.RW} makes EL1 a 64-bit level,
+\code{CNTHCTL_EL2} lets EL1 use the timers, \code{SCTLR_EL1} gets a known value with the MMU off, and \code{SPSR_EL2}
+describes the state to ``return'' to: EL1h with all interrupts masked.
+
+\begin{lst}{a64asm}{kernel/arch/aarch64/boot.S}
+// kernel/arch/aarch64/boot.S -- entered at EL2 or EL1, MMU off, x0 = FDT address
+    .section .text.boot, "ax"
+    .global _start
+_start:                             // the 64-byte arm64 Image header comes first
+    b     primary                   // code0: jump over the rest of the header
+    .word 0                         // code1
+    .quad 0                         // text_offset: 2 MiB above a 2 MiB-aligned base
+    .quad _kernel_size              // image_size, defined in kernel.ld
+    .quad 0x2                       // flags: little-endian, 4 KiB pages
+    .quad 0, 0, 0                   // reserved
+    .word 0x644d5241                // magic "ARM\x64"
+    .word 0                         // reserved
+
+primary:
+    mov   x19, x0                   // keep the FDT pointer safe
+    mrs   x1, mpidr_el1
+    and   x1, x1, #0xff             // Aff0: this core's number in the cluster
+    cbnz  x1, park                  // only core 0 boots Turk-OS
+    mrs   x1, CurrentEL
+    lsr   x1, x1, #2                // CurrentEL[3:2] holds the exception level
+    cmp   x1, #2
+    b.ne  at_el1
+    mov   x1, #(1 << 31)            // HCR_EL2.RW = 1: EL1 runs in AArch64
+    msr   hcr_el2, x1
+    mov   x1, #3                    // CNTHCTL_EL2: EL1PCTEN | EL1PCEN, timers usable at EL1
+    msr   cnthctl_el2, x1
+    msr   cntvoff_el2, xzr          // virtual count = physical count
+    ldr   x1, =0x30d00800           // SCTLR_EL1: MMU and caches off, RES1 bits set
+    msr   sctlr_el1, x1
+    mov   x1, #0x3c5                // SPSR_EL2: D, A, I, F masked; mode EL1h
+    msr   spsr_el2, x1
+    adr   x1, at_el1
+    msr   elr_el2, x1
+    eret                            // "return" into EL1 at at_el1
+\end{lst}
+
+At EL1, select \code{SP_EL1}, set \code{CPACR_EL1} to 0, give the CPU a stack, clear \code{.bss}, store the
+devicetree pointer where \code{arch_early_init} will find it, and call \code{kmain}. Every address here comes from
+\code{adrp}, which is PC-relative, so the code works at the physical address it was loaded at.
+
+\begin{lst}{a64asm}{kernel/arch/aarch64/boot.S (continued)}
+at_el1:
+    msr   spsel, #1                 // the kernel uses SP_EL1, not SP_EL0
+    msr   cpacr_el1, xzr            // FPEN = 00: any FP/SIMD instruction traps (EC 0x07)
+    adrp  x1, boot_stack_top
+    add   x1, x1, :lo12:boot_stack_top
+    mov   sp, x1                    // adrp is PC-relative, so this is a physical address
+    adrp  x1, __bss_start
+    add   x1, x1, :lo12:__bss_start
+    adrp  x2, __bss_end
+    add   x2, x2, :lo12:__bss_end
+1:  cmp   x1, x2
+    b.hs  2f
+    str   xzr, [x1], #8             // .bss is 8-byte aligned in kernel.ld
+    b     1b
+2:  adrp  x1, boot_fdt
+    str   x19, [x1, :lo12:boot_fdt] // arch_early_init() reads it
+    bl    kmain
+park:
+    wfe                             // other cores sleep here for ever
+    b     park
+\end{lst}
+
+\begin{decisionbox}{No floating point in Turk-OS 2.0}
+Compilers use the 32 SIMD registers for ordinary code too: \code{memcpy}, structure copies, vectorised loops. If the
+kernel did, every system call would silently destroy user registers. So the kernel is built with
+\code{-mgeneral-regs-only}, and \code{CPACR_EL1.FPEN} (bits 21:20) stays \code{00}, so any FP or SIMD instruction
+traps with EC \code{0x07}. The userland is built with \code{-mgeneral-regs-only} as well, since Turk-libc has no
+floating point. A program that uses FP anyway gets \code{SIGILL} instead of corrupting another process's registers.
+Real FP support (\code{FPEN} = \code{0b11}, and saving \code{q0}--\code{q31}, \code{FPCR} and \code{FPSR} per task)
+is a stretch goal.
+\end{decisionbox}
+
+The linker script puts \code{.text.boot} first and defines \code{__bss_start}, \code{__bss_end}, \code{_end} and
+\code{_kernel_size = _end - _start}; \code{arch.mk} turns the ELF into the raw image. Until Task 18.6 the MMU stays
+off, so link the kernel at its physical address (\code{KERNEL_BASE} 0 in \code{memlayout.h}) and add
+\code{-mstrict-align}, because Device memory faults on unaligned accesses.
+
+\begin{lst}{make}{kernel/arch/aarch64/arch.mk}
+CROSS       := aarch64-elf-
+ARCH_CFLAGS := -march=armv8-a -mgeneral-regs-only -mstrict-align   # drop -mstrict-align in Task 18.6
+ARCH_SRCS   := $(wildcard kernel/arch/aarch64/*.c kernel/arch/aarch64/*.S) kernel/drivers/pl011.c \
+               kernel/drivers/virtio_mmio.c kernel/drivers/virtio_blk.c
+LDSCRIPT    := kernel/arch/aarch64/kernel.ld
+QEMU        := qemu-system-aarch64
+QEMU_FLAGS  := -machine virt,gic-version=2 -cpu cortex-a72 -m 128M -nographic \
+               -kernel $(BUILD)/kernel8.img -global virtio-mmio.force-legacy=false \
+               -drive if=none,format=raw,file=$(BUILD)/turkfs.img,id=hd0 -device virtio-blk-device,drive=hd0
+QEMU_TEST_FLAGS  := -semihosting-config enable=on,target=native -append test
+TEST_PASS_STATUS := 0               # QEMU's exit status when all tests pass (i386: 1)
+
+$(BUILD)/kernel8.img: $(BUILD)/kernel.elf
+	$(CROSS)objcopy -O binary $< $@
+\end{lst}
+\verify{\code{make ARCH=aarch64 debug}, then in \code{gdb-multiarch build/aarch64/kernel.elf}: \code{x0} at
+\code{_start} holds an address whose first word reads \code{0xedfe0dd0} (the FDT magic \code{0xd00dfeed}, big-endian),
+\code{CurrentEL} is \code{0x4}, and \code{kmain} is reached. Run once more with \code{-machine virt,virtualization=on}:
+\code{info registers} in the QEMU monitor first shows \code{EL2h}, later \code{EL1h}.}
+
+\task{A new UART: the PL011}
+The \code{virt} board's console is an Arm PL011, not a 16550, so it gets its own driver next to the shared 16550
+core of Task 16.8. It registers with \code{console_register()} like any other console, and its receive interrupt
+feeds \code{tty_input_char()}. The baud rate divisor is $\text{clock}/(16 \times \text{baud})$, split into an integer
+part and a fractional part in 64ths; read the clock from the devicetree (QEMU's \code{apb-pclk} node says 24\,MHz),
+because the Pi's is different. QEMU's model ignores the divisors, real hardware does not.
+
+\begin{lst}{c}{kernel/drivers/pl011.c}
+#define UART_DR     0x000               /* data: write to send, read to receive */
+#define UART_FR     0x018               /* flags                                */
+#define UART_IBRD   0x024               /* integer baud divisor                 */
+#define UART_FBRD   0x028               /* fractional baud divisor (1/64ths)    */
+#define UART_LCR_H  0x02C               /* line control                         */
+#define UART_CR     0x030               /* control                              */
+#define UART_IMSC   0x038               /* interrupt mask set/clear             */
+#define UART_ICR    0x044               /* interrupt clear                      */
+#define FR_RXFE     (1u << 4)           /* receive FIFO empty                   */
+#define FR_TXFF     (1u << 5)           /* transmit FIFO full                   */
+#define INT_RX      (1u << 4)           /* receive interrupt                    */
+#define INT_RT      (1u << 6)           /* receive timeout interrupt            */
+
+static volatile uint32_t *uart;         /* Device-mapped base from the FDT */
+#define REG(off) uart[(off) / 4]
+
+void pl011_init(volatile uint32_t *base, uint32_t clock_hz)
+{
+    uart = base;
+    REG(UART_CR) = 0;                                   /* disable while configuring */
+    uint32_t div = (4 * clock_hz + 115200 / 2) / 115200; /* 64 * clock / (16 * baud)   */
+    REG(UART_IBRD) = div >> 6;
+    REG(UART_FBRD) = div & 0x3F;
+    REG(UART_LCR_H) = (3u << 5) | (1u << 4);            /* 8N1, FIFOs on; latches the divisors */
+    REG(UART_IMSC) = INT_RX | INT_RT;
+    REG(UART_CR) = (1u << 0) | (1u << 8) | (1u << 9);   /* UARTEN, TXE, RXE */
+}
+
+void pl011_putc(char c)
+{
+    while (REG(UART_FR) & FR_TXFF)
+        ;
+    REG(UART_DR) = (uint8_t)c;
+}
+
+void pl011_irq(struct trapframe *tf)
+{
+    (void)tf;
+    while (!(REG(UART_FR) & FR_RXFE))
+        tty_input_char(REG(UART_DR) & 0xFF);            /* Task 16.8: into the tty */
+    REG(UART_ICR) = INT_RX | INT_RT;
+}
+\end{lst}
+With the FIFO on, the receive interrupt fires when the FIFO reaches its trigger level, and the receive-timeout
+interrupt catches the last few characters of a burst; enable both. Until Task 18.5 you can poll \code{FR_RXFE}.
+\verify{\code{kmain} prints ``Merhaba from AArch64, EL1'' through the PL011, and \code{kprintf} works with
+\texttt{\%lx} for 64-bit values.}
+
+\task{Exception vectors}
+Write \code{vectors.S} with one macro per 128-byte slot. Each slot makes room for a trap frame, saves \code{x0} and
+\code{x1}, puts its own number (0--15) in \code{x0} and branches to shared code that saves everything else and calls
+C. \code{trap_return} undoes it and ends in \code{eret}. In \code{arch_init}, load \code{VBAR_EL1} with the
+table's address and execute \code{isb}.
+
+\begin{lst}{a64asm}{kernel/arch/aarch64/vectors.S}
+#define TF_SIZE 288                     // sizeof(struct trapframe), a multiple of 16
+
+.macro ventry kind                      // one 128-byte slot: save x0, x1, then share the rest
+    .balign 0x80
+    sub   sp, sp, #TF_SIZE
+    stp   x0, x1, [sp, #16 * 0]
+    mov   x0, #\kind                    // 0-3: EL1 with SP_EL0, 4-7: EL1 with SP_EL1,
+    b     trap_common                   // 8-11: EL0 AArch64, 12-15: EL0 AArch32
+.endm
+
+    .text
+    .balign 0x800                       // VBAR_EL1 needs 2 KiB alignment
+    .global vectors
+vectors:                                // in each group: sync, IRQ, FIQ, SError
+    .irp kind, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
+    ventry \kind
+    .endr
+
+trap_common:
+    stp x2, x3, [sp, #16 * 1];    stp x4, x5, [sp, #16 * 2];    stp x6, x7, [sp, #16 * 3]
+    stp x8, x9, [sp, #16 * 4];    stp x10, x11, [sp, #16 * 5];  stp x12, x13, [sp, #16 * 6]
+    stp x14, x15, [sp, #16 * 7];  stp x16, x17, [sp, #16 * 8];  stp x18, x19, [sp, #16 * 9]
+    stp x20, x21, [sp, #16 * 10]; stp x22, x23, [sp, #16 * 11]; stp x24, x25, [sp, #16 * 12]
+    stp x26, x27, [sp, #16 * 13]; stp x28, x29, [sp, #16 * 14]
+    mrs   x1, sp_el0
+    stp   x30, x1, [sp, #16 * 15]       // x30 and the user's stack pointer
+    mrs   x1, elr_el1
+    mrs   x2, spsr_el1
+    stp   x1, x2, [sp, #16 * 16]
+    mrs   x1, esr_el1
+    mrs   x2, far_el1
+    stp   x1, x2, [sp, #16 * 17]
+    mov   x1, x0                        // trap_handler(tf, kind)
+    mov   x0, sp
+    bl    trap_handler
+
+    .global trap_return
+trap_return:
+    msr   daifset, #2                   // no IRQ between restoring ELR/SPSR and eret
+    ldp   x1, x2, [sp, #16 * 16]
+    msr   elr_el1, x1
+    msr   spsr_el1, x2
+    ldp   x30, x1, [sp, #16 * 15]
+    msr   sp_el0, x1
+    ldp x0, x1, [sp, #16 * 0];    ldp x2, x3, [sp, #16 * 1];    ldp x4, x5, [sp, #16 * 2]
+    ldp x6, x7, [sp, #16 * 3];    ldp x8, x9, [sp, #16 * 4];    ldp x10, x11, [sp, #16 * 5]
+    ldp x12, x13, [sp, #16 * 6];  ldp x14, x15, [sp, #16 * 7];  ldp x16, x17, [sp, #16 * 8]
+    ldp x18, x19, [sp, #16 * 9];  ldp x20, x21, [sp, #16 * 10]; ldp x22, x23, [sp, #16 * 11]
+    ldp x24, x25, [sp, #16 * 12]; ldp x26, x27, [sp, #16 * 13]; ldp x28, x29, [sp, #16 * 14]
+    add   sp, sp, #TF_SIZE              // sp is the top of this task's kernel stack again
+    eret
+\end{lst}
+
+The trap frame matches that layout field for field, and the accessors of Task 16.5 hide it from generic code.
+The system call number is in \code{x8} and the first argument in \code{x0}, which is also where the result goes, so
+the generic dispatcher must read all its arguments before it calls \code{tf_set_ret}.
+
+\begin{lst}{c}{kernel/arch/aarch64/include/arch/trapframe.h}
+struct trapframe {
+    uint64_t x[31];             /* x0..x30                     offset   0 */
+    uint64_t sp_el0;            /* the user's stack pointer           248 */
+    uint64_t elr;               /* ELR_EL1: where eret will go        256 */
+    uint64_t spsr;              /* SPSR_EL1: the interrupted PSTATE   264 */
+    uint64_t esr;               /* ESR_EL1: why the exception came    272 */
+    uint64_t far;               /* FAR_EL1: the faulting address      280 */
+};
+_Static_assert(sizeof(struct trapframe) == 288, "vectors.S uses TF_SIZE = 288");
+
+static inline unsigned long tf_sysno(const struct trapframe *tf)         { return tf->x[8]; }
+static inline unsigned long tf_arg(const struct trapframe *tf, int n)    { return tf->x[n]; }
+static inline void tf_set_ret(struct trapframe *tf, unsigned long v)     { tf->x[0] = v; }
+static inline uintptr_t tf_pc(const struct trapframe *tf)                { return tf->elr; }
+static inline void tf_set_pc(struct trapframe *tf, uintptr_t pc)         { tf->elr = pc; }
+static inline uintptr_t tf_sp(const struct trapframe *tf)                { return tf->sp_el0; }
+static inline bool tf_from_user(const struct trapframe *tf) { return (tf->spsr & 0xF) == 0; } /* EL0t */
+\end{lst}
+
+The C handler decodes the slot number and, for synchronous exceptions, the exception class of
+Table~\ref{tab:esr}. Give every class a name for the crash report, as you did for scause on RISC-V. Note the two
+different return addresses: after \code{svc}, \code{ELR_EL1} already points to the next instruction (unlike RISC-V,
+where you added 4 to \code{sepc}); after \code{brk} and after a fault it points at the instruction itself.
+
+\begin{lst}{c}{kernel/arch/aarch64/trap.c}
+enum { EC_UNKNOWN = 0x00, EC_FP_SIMD = 0x07, EC_SVC64 = 0x15, EC_IABT_LOW = 0x20,
+       EC_IABT_CUR = 0x21, EC_DABT_LOW = 0x24, EC_DABT_CUR = 0x25, EC_SP_ALIGN = 0x26,
+       EC_BRK64 = 0x3C };
+
+void trap_handler(struct trapframe *tf, unsigned long kind)
+{
+    if (kind < 4 || kind >= 12)                     /* SP_EL0 at EL1, or AArch32 code */
+        fatal_trap(tf, "unexpected vector");
+    switch (kind & 3) {                             /* 0 sync, 1 IRQ, 2 FIQ, 3 SError */
+    case 1:
+        gic_handle_irq(tf);
+        break;
+    case 0: {
+        unsigned ec = (tf->esr >> 26) & 0x3F;       /* exception class, ESR bits 31:26 */
+        switch (ec) {
+        case EC_SVC64:                              /* ELR already points past the svc */
+            syscall_dispatch(tf);
+            break;
+        case EC_DABT_LOW: case EC_DABT_CUR: case EC_IABT_LOW: case EC_IABT_CUR:
+            handle_page_fault(tf);                  /* generic; asks arch_fault_info() */
+            break;
+        case EC_BRK64:                              /* ELR points AT the brk: skip it */
+            kprintf("brk #%lu at %lx\n", (unsigned long)(tf->esr & 0xFFFF), tf->elr);
+            tf->elr += 4;
+            break;
+        default:
+            fatal_trap(tf, ec_name(ec));            /* "SVE/SIMD/FP access", ... */
+        }
+        break;
+    }
+    default:
+        fatal_trap(tf, "FIQ or SError");
+    }
+}
+\end{lst}
+\verify{A test that executes \code{brk #7} (in inline assembly) prints its immediate and continues. A load from an
+unmapped address in a test shows ``data abort from EL1'' with the address from \code{FAR_EL1} and the register dump.}
+
+\task{Interrupts and time}
+Find the GIC in the devicetree (\code{arm,cortex-a15-gic}, two \code{reg} ranges), configure the distributor, enable
+it and the CPU interface, and set the priority mask. Then route device interrupts by INTID through Phase 3's handler
+table, grown to the number of INTIDs the GIC reports. Phase 8's lesson still holds: write \code{GICC_EOIR} before you
+call a handler that may switch tasks. Until an interrupt is ended, the CPU interface blocks every interrupt of the same
+or lower priority, and preemption would stop.
+
+\begin{lst}{c}{kernel/arch/aarch64/gic.c}
+#define GICD_CTLR       0x000           /* distributor: on/off                     */
+#define GICD_TYPER      0x004           /* bits 4:0 = number of INTIDs / 32 - 1    */
+#define GICD_ISENABLER  0x100           /* one bit per INTID: write 1 to enable    */
+#define GICD_ICENABLER  0x180           /* write 1 to disable                      */
+#define GICD_IPRIORITYR 0x400           /* one byte per INTID, lower = more urgent */
+#define GICD_ITARGETSR  0x800           /* one byte per INTID: which CPUs (SPIs)   */
+#define GICC_CTLR       0x000           /* CPU interface: on/off                   */
+#define GICC_PMR        0x004           /* priority mask: only priorities below it */
+#define GICC_IAR        0x00C           /* read = acknowledge, gives the INTID     */
+#define GICC_EOIR       0x010           /* write = end of interrupt                */
+
+static volatile uint8_t *gicd, *gicc;   /* Device-mapped, bases from the FDT */
+#define D32(off) (*(volatile uint32_t *)(gicd + (off)))
+#define C32(off) (*(volatile uint32_t *)(gicc + (off)))
+
+void gic_init(void)
+{
+    unsigned nr = 32 * ((D32(GICD_TYPER) & 0x1F) + 1);
+    D32(GICD_CTLR) = 0;                             /* off while configuring */
+    for (unsigned id = 0; id < nr; id++) {
+        gicd[GICD_IPRIORITYR + id] = 0xA0;          /* these registers are byte-accessible */
+        if (id >= 32)
+            gicd[GICD_ITARGETSR + id] = 0x01;       /* every SPI goes to CPU interface 0 */
+    }
+    D32(GICD_CTLR) = 1;
+    C32(GICC_PMR) = 0xF0;                           /* 0 would mask everything */
+    C32(GICC_CTLR) = 1;
+}
+
+void arch_irq_unmask(unsigned irq) { D32(GICD_ISENABLER + 4 * (irq / 32)) = 1u << (irq % 32); }
+void arch_irq_mask(unsigned irq)   { D32(GICD_ICENABLER + 4 * (irq / 32)) = 1u << (irq % 32); }
+
+void gic_handle_irq(struct trapframe *tf)
+{
+    uint32_t iar = C32(GICC_IAR);                   /* acknowledge */
+    unsigned id = iar & 0x3FF;
+    if (id == 1023)                                 /* spurious: nothing to end */
+        return;
+    C32(GICC_EOIR) = iar;                           /* before a handler that may switch tasks */
+    irq_dispatch(id, tf);                           /* the handler table, indexed by INTID */
+}
+\end{lst}
+
+The timer reloads its down-counter on every tick. Its PPI is level-triggered: until you write \code{CNTV_TVAL_EL0}
+again, the interrupt stays asserted.
+
+\begin{lst}{c}{kernel/arch/aarch64/timer.c}
+#define TIMER_INTID 27                  /* EL1 virtual timer, a PPI */
+static uint64_t ticks_per_irq;
+
+static void timer_irq(struct trapframe *tf)
+{
+    __asm__ volatile ("msr cntv_tval_el0, %0" : : "r"(ticks_per_irq));  /* next tick */
+    sched_tick(tf);                     /* Phase 8: accounting, sleepers, preemption */
+}
+
+void arch_timer_init(unsigned hz)
+{
+    uint64_t freq;
+    __asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(freq));     /* never hard-code it */
+    ticks_per_irq = freq / hz;
+    register_interrupt_handler(TIMER_INTID, timer_irq);
+    __asm__ volatile ("msr cntv_tval_el0, %0" : : "r"(ticks_per_irq));
+    __asm__ volatile ("msr cntv_ctl_el0, %0" : : "r"(1UL));   /* ENABLE = 1, IMASK = 0 */
+    arch_irq_unmask(TIMER_INTID);
+}
+
+uint64_t arch_cycles(void)
+{
+    uint64_t t;
+    __asm__ volatile ("isb; mrs %0, cntvct_el0" : "=r"(t));   /* isb: don't read it early */
+    return t;
+}
+\end{lst}
+Finally take the PL011's INTID from its \code{interrupts} property, register \code{pl011_irq} and unmask it.
+\verify{\code{uptime} in the kernel monitor advances by 100 ticks per second of wall-clock time, keys typed on the
+serial console reach the monitor through the receive interrupt, and a counter per INTID in the monitor shows 27
+and 33 rising.}
+
+\task{The MMU, carefully}
+Turn the MMU on in \code{boot.S}, before any C code runs, with one static level-1 table of two 1\,GiB blocks: Device
+memory for the first gigabyte (the GIC, the PL011, virtio) and Normal memory for the second (RAM, with the kernel).
+Because \code{KERNEL_BASE} has zeros in bits 38:30, the same table works for both bases: through \code{TTBR0_EL1}
+it is an identity map, needed for the few instructions between turning the MMU on and jumping high; through
+\code{TTBR1_EL1} it is the high half. Now set \code{KERNEL_BASE} back to its real value and drop
+\code{-mstrict-align}. Insert this code just before \code{bl kmain}.
+
+\begin{lst}{a64asm}{kernel/arch/aarch64/boot.S (MMU)}
+#define BLOCK      (1 << 0)               // valid level-1 block: 1 GiB
+#define ATTR(i)    ((i) << 2)             // AttrIndx: 0 = Device, 1 = Normal (MAIR_EL1)
+#define SH_INNER   (3 << 8)
+#define AF         (1 << 10)
+#define PXN        (1 << 53)
+#define UXN        (1 << 54)
+#define DEV_BLOCK  (BLOCK | ATTR(0) | AF | PXN | UXN)
+#define MEM_BLOCK  (BLOCK | ATTR(1) | SH_INNER | AF | UXN)
+#define MAIR_VALUE ((0x00 << 0) | (0xff << 8))   // Attr0 Device-nGnRnE, Attr1 Normal WB
+#define TCR_VALUE  ((25 << 0) | (1 << 8) | (1 << 10) | (3 << 12) | (0 << 14) | \
+                    (25 << 16) | (1 << 24) | (1 << 26) | (3 << 28) | (2 << 30))
+
+    .section .data
+    .balign 4096
+boot_l1:                                  // one level-1 table, used by TTBR0 and TTBR1
+    .quad 0x00000000 | DEV_BLOCK          // PA 0-1 GiB: GIC, PL011, virtio-mmio
+    .quad 0x40000000 | MEM_BLOCK          // PA 1-2 GiB: RAM, with the kernel in it
+    .fill 510, 8, 0
+
+    .text
+enable_mmu:
+    adrp  x1, boot_l1
+    msr   ttbr0_el1, x1             // identity map: VA = PA for the next few instructions
+    msr   ttbr1_el1, x1             // high half: VA = KERNEL_BASE + PA
+    ldr   x1, =MAIR_VALUE
+    msr   mair_el1, x1
+    ldr   x1, =TCR_VALUE
+    mrs   x2, id_aa64mmfr0_el1
+    and   x2, x2, #0xf              // PARange: how many physical address bits exist
+    bfi   x1, x2, #32, #3           // TCR_EL1.IPS (bits 34:32) = PARange
+    msr   tcr_el1, x1
+    isb
+    tlbi  vmalle1                   // forget anything cached before reset
+    dsb   nsh
+    mrs   x1, sctlr_el1
+    orr   x1, x1, #(1 << 0)         // M: MMU on
+    orr   x1, x1, #(1 << 2)         // C: data cache on
+    orr   x1, x1, #(1 << 12)        // I: instruction cache on
+    msr   sctlr_el1, x1
+    isb                             // from here on every fetch is translated
+    ldr   x1, =high_entry           // the link-time address, in the TTBR1 half
+    br    x1
+high_entry:
+    ldr   x1, =boot_stack_top       // move sp to its high-half alias as well
+    mov   sp, x1
+    bl    kmain
+\end{lst}
+
+The \code{TCR_EL1} value spells out the 39-bit layout: \code{T0SZ} and \code{T1SZ} (bits 5:0 and 21:16) are 25;
+\code{IRGN}, \code{ORGN} and \code{SH} make table walks cacheable and inner shareable; and the two granule fields are
+encoded differently, \code{TG0} = \code{0b00} but \code{TG1} = \code{0b10} for 4\,KiB. \code{IPS} is copied from
+\code{ID_AA64MMFR0_EL1.PARange}, so the same code runs on any core.
+
+The boot table maps far too much. In C, build the real kernel tables: the direct map with 2\,MiB blocks covering only
+the RAM listed in \code{/memory}, the kernel image with 4\,KiB pages so that \code{.text} is read-only and
+\code{.rodata} not executable (Phase 15's hardening), and each device the FDT names as a Device page at
+\code{P2V(base)}. Load them into \code{TTBR1_EL1}, flush the whole TLB, and give \code{TTBR0_EL1} an empty table for
+kernel threads. The header of the new memory layout:
+
+\begin{lst}{c}{kernel/arch/aarch64/include/arch/memlayout.h}
+#define KERNEL_BASE     0xFFFFFF8000000000UL    /* start of the TTBR1 half */
+#define USER_BASE       0x00400000UL
+#define USER_TOP        0x0000008000000000UL    /* 2^39: end of the TTBR0 half */
+#define USER_STACK_TOP  USER_TOP
+#define PAGE_SIZE       4096UL
+#define P2V(pa)         ((void *)((uintptr_t)(pa) + KERNEL_BASE))
+#define V2P(va)         ((uintptr_t)(va) - KERNEL_BASE)
+\end{lst}
+
+The descriptor bits go into \code{<arch/mmu.h>}. \code{arch_mmu_map} walks the three levels exactly like Phase 17's
+two-level walk, with one more step: index bits 38:30, then 29:21, then 20:12, and a missing table becomes a zeroed
+page linked in as \code{V2P(page) | PTE_VALID | PTE_TABLE}. After writing the leaf it executes \code{dsb ishst}, so the
+table walker sees the entry. Translating the generic \code{VM_*} flags is where the inverted bits of
+Table~\ref{tab:pte} bite:
+
+\begin{lst}{c}{kernel/arch/aarch64/include/arch/mmu.h}
+typedef uint64_t pte_t;
+#define PTE_VALID    (1UL << 0)
+#define PTE_TABLE    (1UL << 1)         /* with VALID: a table (levels 1-2) or a page (level 3) */
+#define PTE_ATTR(i)  ((pte_t)(i) << 2)  /* AttrIndx into MAIR_EL1 */
+#define MT_DEVICE    0                  /* Attr0 = 0x00: Device-nGnRnE */
+#define MT_NORMAL    1                  /* Attr1 = 0xFF: Normal, write-back cacheable */
+#define PTE_EL0      (1UL << 6)         /* AP[1]: EL0 may access */
+#define PTE_RDONLY   (1UL << 7)         /* AP[2]: read-only at every level */
+#define PTE_SH_INNER (3UL << 8)
+#define PTE_AF       (1UL << 10)        /* access flag: 0 faults on first use */
+#define PTE_NG       (1UL << 11)        /* not global: belongs to one address space */
+#define PTE_PXN      (1UL << 53)        /* EL1 may not execute */
+#define PTE_UXN      (1UL << 54)        /* EL0 may not execute */
+#define PTE_COW      (1UL << 55)        /* software bit (55-58 are ignored by the MMU) */
+#define PTE_ADDR(e)  ((e) & 0x0000FFFFFFFFF000UL)
+\end{lst}
+
+\begin{lst}{c}{kernel/arch/aarch64/mmu.c}
+static pte_t vm_to_pte(unsigned flags)
+{
+    pte_t e = PTE_VALID | PTE_TABLE | PTE_AF | PTE_SH_INNER | PTE_ATTR(MT_NORMAL);
+    if (!(flags & VM_WRITE) || (flags & VM_COW))
+        e |= PTE_RDONLY;
+    if (flags & VM_COW)
+        e |= PTE_COW;
+    if (flags & VM_USER) {
+        e |= PTE_EL0 | PTE_NG | PTE_PXN;            /* the kernel never runs user code */
+        if (!(flags & VM_EXEC))
+            e |= PTE_UXN;
+    } else {
+        e |= PTE_UXN;
+        if (!(flags & VM_EXEC))
+            e |= PTE_PXN;
+    }
+    return e;
+}
+
+void arch_tlb_flush(uintptr_t va)
+{
+    uint64_t op = (va >> 12) & ((1UL << 44) - 1);   /* VA[55:12] in bits 43:0, ASID 0 */
+    __asm__ volatile ("dsb ishst\n\t"       /* finish the table write first   */
+                      "tlbi vae1is, %0\n\t" /* drop that page from every TLB  */
+                      "dsb ish\n\t"         /* wait until the TLBs are clean  */
+                      "isb"                 /* and refetch with the new view  */
+                      : : "r"(op) : "memory");
+}
+\end{lst}
+
+A new mapping needs no TLB flush, because the TLBs never hold entries that fault; \code{arch_mmu_protect} and
+\code{arch_mmu_unmap} change live entries and must call \code{arch_tlb_flush}. \code{arch_mmu_switch} writes
+\code{TTBR0_EL1}, executes \code{isb}, and, since Turk-OS uses no ASIDs yet, flushes the TLB with
+\code{tlbi vmalle1}, \code{dsb ish} and \code{isb}. Two more differences from x86 and RISC-V: Armv8.0 has no
+equivalent of \code{sstatus.SUM}, so \code{copy_from_user} reads user pages directly (Armv8.1's PAN would forbid it),
+and its range check now ends at \code{USER_TOP}. Finally fill in the fault description for the generic handler:
+
+\begin{lst}{c}{kernel/arch/aarch64/trap.c (page faults)}
+void arch_fault_info(const struct trapframe *tf, struct fault_info *fi)
+{
+    unsigned ec  = (tf->esr >> 26) & 0x3F;
+    unsigned fsc = tf->esr & 0x3F;                  /* DFSC or IFSC: type and level */
+    fi->addr    = tf->far;                          /* the faulting virtual address */
+    fi->exec    = (ec == 0x20 || ec == 0x21);       /* instruction abort            */
+    fi->user    = (ec == 0x20 || ec == 0x24);       /* taken from EL0               */
+    fi->write   = !fi->exec && (tf->esr & (1u << 6));   /* WnR, data aborts only    */
+    fi->present = (fsc & 0x3C) != 0x04;             /* 0x04-0x07: translation fault */
+}
+\end{lst}
+\verify{The kernel prints from its high-half address (\code{0xFFFFFF80402...} in a backtrace); the Phase 6 fault tests
+pass: a write to \code{.text} is a permission fault at level 3 (fault status \code{0x0F}), an unmapped address a
+translation fault (\code{0x04}--\code{0x07}, by the level where the walk stopped); and your own \code{pagetable}
+monitor command shows Device attributes only on device pages.}
+
+\task{Sixty-four bits everywhere}
+Task 16.9 made the generic code compile cleanly for aarch64, but compiling is not running. This is the first time
+Turk-OS executes with 64-bit pointers, and some bugs only show at run time. Fix them in generic code, not in
+\code{arch/}, and run the fixed code on i386 and riscv32 too. The bugs this port typically finds:
+
+\begin{center}
+\small\renewcommand{\arraystretch}{1.25}
+\begin{tabularx}{\linewidth}{@{}>{\raggedright\arraybackslash}p{0.3\linewidth} X@{}}
+\toprule
+\tkth{Bug} & \tkth{What happens and the fix} \\
+\midrule
+pointer stored in \code{uint32_t} & kernel addresses lose their top half; use \code{uintptr_t}, and treat any pointer-to-int cast warning as an error \\
+\code{addr & ~0xFFFu} & \code{~0xFFFu} is a 32-bit \code{0xFFFFF000}, so the mask also clears bits 63:32; use \code{~(uintptr_t)(PAGE_SIZE - 1)} \\
+Phase 10's \code{syscall_fn} with \code{uint32_t} arguments & user pointers lose their top bits (the user stack sits just below $2^{39}$), and a result kept in a \code{uint32_t} reaches user mode as \code{0x00000000FFFFFFFE} instead of $-2$; take \code{unsigned long} arguments and return \code{long} \\
+\texttt{\%x} for addresses and sizes & half the value is printed; use \texttt{\%lx}, \texttt{\%zu}, and let \code{-Wformat} find them \\
+the initial user stack & \code{argv} and \code{envp} slots are 8 bytes, and \code{sp} must be 16-byte aligned at \code{_start} \\
+the ELF loader & \code{EM_386} and \code{EM_RISCV} images are 32-bit; AArch64 programs are ELF64 \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+The ELF loader learns the 64-bit structures and accepts \code{ELFCLASS64} (2 in \code{e_ident[4]}) with
+\code{EM_AARCH64} (183), and only those, on this port. \code{Elf64_Ehdr} is 64 bytes and \code{Elf64_Phdr} 56: entry,
+offsets, addresses and sizes grow to 64 bits, and in the program header \code{p_flags} moves up to sit right after
+\code{p_type}. Check both sizes with \code{_Static_assert}. \code{paddr_t} was already 64 bits since Task 16.7; AArch64 is where that matters.
+
+\verify{The Phase 10 evil programs, rebuilt for AArch64, behave as listed in Task~10.9, with one more case: a
+\code{write} whose buffer lies at \code{0x0000008000000000} (just past \code{USER_TOP}) returns \code{-EFAULT}.}
+
+\task{Tasks and locks}
+\code{arch_switch} saves only what the AAPCS64 makes callee-saved: \code{x19}--\code{x28}, the frame pointer and the
+link register, 96 bytes, and the stack pointer itself goes into \code{*save}. A new task's first context points
+\code{x30} at a trampoline that enables interrupts and calls the entry function.
+
+\begin{lst}{a64asm}{kernel/arch/aarch64/switch.S}
+// void arch_switch(struct context **save, struct context *load)
+// struct context = x19..x28, x29 (frame pointer), x30 (return address): 96 bytes.
+    .text
+    .global arch_switch
+arch_switch:
+    sub   sp, sp, #96               // keeps sp 16-byte aligned
+    stp   x19, x20, [sp, #0];   stp   x21, x22, [sp, #16]
+    stp   x23, x24, [sp, #32];  stp   x25, x26, [sp, #48]
+    stp   x27, x28, [sp, #64];  stp   x29, x30, [sp, #80]
+    mov   x2, sp                    // str cannot store sp directly
+    str   x2, [x0]                  // *save = this task's context
+    mov   sp, x1                    // switch to the other task's kernel stack
+    ldp   x19, x20, [sp, #0];   ldp   x21, x22, [sp, #16]
+    ldp   x23, x24, [sp, #32];  ldp   x25, x26, [sp, #48]
+    ldp   x27, x28, [sp, #64];  ldp   x29, x30, [sp, #80]
+    add   sp, sp, #96
+    ret                             // to wherever that task called arch_switch
+
+    .global task_trampoline         // arch_task_init(): x19 = entry, x20 = arg
+task_trampoline:
+    msr   daifclr, #2               // new tasks start with IRQs enabled
+    mov   x0, x20
+    blr   x19                       // entry(arg)
+    bl    task_exit                 // never returns
+
+    .global arch_return_to_user     // _Noreturn void arch_return_to_user(struct trapframe *tf)
+arch_return_to_user:
+    mov   sp, x0                    // the frame sits at the top of the kernel stack
+    b     trap_return
+\end{lst}
+
+\begin{lst}{c}{kernel/arch/aarch64/proc.c}
+void arch_task_init(struct task *t, void (*entry)(void *), void *arg)
+{
+    struct context *c = (struct context *)((char *)t->kstack + KSTACK_SIZE) - 1;
+    memset(c, 0, sizeof *c);
+    c->x19 = (uint64_t)entry;               /* task_trampoline calls x19(x20) */
+    c->x20 = (uint64_t)arg;
+    c->x30 = (uint64_t)task_trampoline;     /* arch_switch's ret lands here   */
+    t->context = c;
+}
+\end{lst}
+
+Interrupt control uses \code{DAIF}. \texttt{msr daifset, \#2} sets only the I bit (the immediate's bits are D, A, I, F
+from 8 down to 1), and restoring writes the whole saved \code{DAIF} back, so nesting works exactly as in Task 9.1.
+The spinlock's atomic exchange becomes a pair of exclusive instructions: \code{ldaxr} loads and arms the exclusive
+monitor, \code{stlxr} stores only if nobody wrote the location in between and reports failure otherwise, and the
+loop retries. The ``a'' and ``l'' give the acquire and release ordering that \code{__atomic_exchange_n} asked for in
+Phase 9. Exclusives are only guaranteed on Normal, cacheable memory, which is one more reason why the MMU is on before
+the first lock is taken.
+
+\begin{lst}{c}{kernel/arch/aarch64/include/arch/irq.h}
+static inline unsigned long irq_save(void)
+{
+    unsigned long flags;
+    __asm__ volatile ("mrs %0, daif\n\tmsr daifset, #2" : "=r"(flags) : : "memory");
+    return flags;                                   /* DAIF.I (bit 7) as it was */
+}
+
+static inline void irq_restore(unsigned long flags)
+{
+    __asm__ volatile ("msr daif, %0" : : "r"(flags) : "memory");
+}
+
+static inline void irq_enable(void)  { __asm__ volatile ("msr daifclr, #2" : : : "memory"); }
+static inline void irq_disable(void) { __asm__ volatile ("msr daifset, #2" : : : "memory"); }
+static inline void cpu_idle(void)    { __asm__ volatile ("wfi"); }
+\end{lst}
+
+\begin{lst}{c}{kernel/arch/aarch64/include/arch/atomic.h}
+#define ARCH_HAS_ATOMICS 1
+
+static inline uint32_t atomic_xchg(volatile uint32_t *p, uint32_t v)
+{
+    uint32_t old, failed;
+    __asm__ volatile ("1: ldaxr %w0, [%2]\n\t"      /* load and open the exclusive monitor */
+                      "   stlxr %w1, %w3, [%2]\n\t" /* store only if nobody wrote since   */
+                      "   cbnz  %w1, 1b"            /* lost the reservation: try again    */
+                      : "=&r"(old), "=&r"(failed) : "r"(p), "r"(v) : "memory");
+    return old;
+}
+\end{lst}
+\verify{The Phase 8 and Phase 9 suites pass: three preempted threads share the CPU, 1000 create and exit cycles leak
+nothing, and the producer--consumer and dining-philosophers tests finish. A disassembly of \code{spin_lock} shows
+\code{ldaxr} and \code{stlxr}.}
+
+\task{Into EL0 and back}
+\code{arch_user_entry} fills the trap frame that \code{arch_return_to_user} will \code{eret} from. \code{SPSR_EL1}
+= 0 means mode EL0t with no interrupt class masked; \code{ELR_EL1} is the program's entry; \code{SP_EL0} is its stack.
+The trap frame sits at the top of the task's kernel stack, so after \code{eret}, \code{SP_EL1} points exactly there,
+ready for the next exception: nothing like Phase 10's \code{tss_set_kernel_stack} is needed.
+
+\begin{lst}{c}{kernel/arch/aarch64/proc.c (continued)}
+void arch_user_entry(struct trapframe *tf, uintptr_t entry, uintptr_t sp)
+{
+    memset(tf, 0, sizeof *tf);              /* no kernel values leak to user mode */
+    tf->elr = entry;                        /* eret jumps here                    */
+    tf->sp_el0 = sp & ~(uintptr_t)0xF;      /* AAPCS64: 16-byte aligned           */
+    tf->spsr = 0;                           /* M = EL0t, D A I F clear: IRQs on   */
+}
+\end{lst}
+
+System calls arrive as EC \code{0x15} at offset \code{0x400} and go through the same generic dispatcher as on x86 and
+RISC-V, with the same Linux i386 numbers: \code{write} is still 4, whatever Linux's own arm64 table says.
+\code{arch_signal_frame} copies the trap frame to the user stack, sets \code{ELR_EL1} to the handler and \code{x0} to
+the signal number, and puts the restorer in \code{x30}: on AArch64 the handler's \code{ret} goes to the link register,
+so nothing needs to be pushed. \code{arch_sigreturn} copies the saved frame back after checking that its
+\code{SPSR} still says EL0t, or a program could forge a frame that returns to EL1.
+\verify{A hand-made user program loops on \code{svc} \code{getpid}; \code{info registers} while it runs shows
+\code{EL0t}, and a forged \code{sigreturn} frame with \code{SPSR} = \code{0x5} kills the process instead of entering
+the kernel.}
+
+\task{virtio again, and the whole userland}
+\code{kernel/drivers/virtio_blk.c} and \code{virtio_mmio.c} from Task 17.10 compile unchanged; only the base and the
+INTID come from the FDT, and the INTID goes to \code{arch_irq_unmask} instead of the PLIC. Probe all 32 slots,
+skipping those whose device ID is 0: a comment in QEMU's \code{hw/arm/virt.c} explains that \code{-device} options are
+assigned from the highest address down, so a single disk usually sits in the last slot. Keep
+\code{-global virtio-mmio.force-legacy=false}, or QEMU offers the legacy interface (version 1). The queue address
+registers come in low and high halves; on RV32 the high halves were always 0, now they carry real bits. Before the
+\code{QueueNotify} write the shared driver needs a barrier that orders the descriptor writes before it: \code{fence}
+on RISC-V, \code{dsb st} here.
+
+The userland needs a start file, the system call stubs, \code{user/arch/aarch64/user.ld} (programs at
+\code{0x00400000}, as everywhere) and the same \code{-mgeneral-regs-only}. Then rebuild Turk-libc, \code{tsh} and the
+utilities.
+
+\begin{lst}{a64asm}{user/arch/aarch64/crt0.S}
+// user/arch/aarch64/crt0.S -- the kernel enters here with sp -> argc, argv[], envp[]
+    .text
+    .global _start
+_start:
+    ldr   x0, [sp]                  // argc
+    add   x1, sp, #8                // argv: 8-byte pointers in LP64
+    add   x2, x1, x0, lsl #3        // skip argv[0..argc-1]
+    add   x2, x2, #8                // and its NULL: envp
+    bl    main
+    bl    exit                      // exit(main's return value), never returns
+\end{lst}
+
+\begin{lst}{c}{user/arch/aarch64/syscall.c}
+static inline long syscall3(long n, long a, long b, long c)
+{
+    register long x8 __asm__("x8") = n;     /* the Linux i386 number, as on x86 */
+    register long x0 __asm__("x0") = a;
+    register long x1 __asm__("x1") = b;
+    register long x2 __asm__("x2") = c;
+    __asm__ volatile ("svc #0" : "+r"(x0) : "r"(x8), "r"(x1), "r"(x2) : "memory");
+    return x0;                              /* result, or -errno */
+}
+
+long write(int fd, const void *buf, unsigned long len) { return syscall3(4, fd, (long)buf, len); }
+int  getpid(void)                                       { return syscall3(20, 0, 0, 0); }
+void exit(int code)                                     { syscall3(1, code, 0, 0); for (;;) { } }
+\end{lst}
+
+For \code{make test}, the board has no \code{isa-debug-exit} or \code{sifive_test} device. Instead QEMU implements
+Arm \textbf{semihosting}, a debugger interface: with \code{-semihosting-config enable=on,target=native}, the
+instruction \texttt{hlt \#0xf000} at EL1 becomes a request to QEMU, with the operation in \code{w0} and a parameter
+pointer in \code{x1}. \code{SYS_EXIT} (\code{0x18}) on AArch64 takes a two-word block; when its first word is
+\code{ADP_Stopped_ApplicationExit} (\code{0x20026}), QEMU exits with the second word as its exit status. User code
+cannot do this unless you also pass \code{userspace=on}, which you should not.
+
+\begin{lst}{c}{kernel/arch/aarch64/semihost.c}
+_Noreturn void arch_test_exit(int failed)
+{
+    static uint64_t block[2];
+    block[0] = 0x20026;                         /* ADP_Stopped_ApplicationExit */
+    block[1] = failed ? 1 : 0;                  /* QEMU's exit status          */
+    register uint64_t op  __asm__("x0") = 0x18; /* SYS_EXIT                    */
+    register uint64_t arg __asm__("x1") = (uint64_t)block;
+    __asm__ volatile ("hlt #0xf000" : : "r"(op), "r"(arg) : "memory");
+    for (;;)                                    /* only without -semihosting   */
+        __asm__ volatile ("wfi");
+}
+\end{lst}
+\verify{\code{make ARCH=aarch64 run} boots to \code{turk@os:/$} with the root on virtio-blk; \code{make ARCH=aarch64
+test} prints every result and \code{ALL TESTS PASSED}, and breaking one test makes QEMU exit with status 1. The Phase
+15 fuzzer runs for an hour without a kernel panic.}
+
+\task{Turk-OS 2.0}
+Now bring the three architectures together. TurkFS has no endianness or word-size problem: all three targets are
+little-endian and the on-disk format uses fixed-width fields, so one image must work everywhere. Prove it: create an
+image with \code{mkfs.minix -3}, write files on AArch64, check it with \code{fsck.minix -f}, boot the same file on
+riscv32 (virtio) and on i386 (ATA, \code{-drive if=ide}), and write from there too.
+
+\begin{lst}{sh}{terminal}
+make release-all                                  # i386 ISO, riscv32 and aarch64 kernels, one TurkFS image
+make ARCH=aarch64 run DISK=build/turkfs-2.0.img   # write /home/turk/from-arm
+fsck.minix -f build/turkfs-2.0.img
+make ARCH=riscv32 run DISK=build/turkfs-2.0.img   # read it, write /home/turk/from-riscv
+make ARCH=i386 run DISK=build/turkfs-2.0.img      # read both
+\end{lst}
+
+Run the Phase 15 benchmarks on all three and fill a table like the one below. \code{arch_cycles} counts different
+things on each machine (\code{rdtsc}, \code{rdtime}, \code{cntvct_el0}), so convert every result to nanoseconds with
+that counter's frequency, and remember that under QEMU you are comparing emulators, not processors. Explain the
+largest difference you find.
+
+\begin{center}
+\small\renewcommand{\arraystretch}{1.2}
+\begin{tabularx}{\linewidth}{@{}X r r r@{}}
+\toprule
+\tkth{Benchmark (median, ns)} & \tkth{i386} & \tkth{riscv32} & \tkth{aarch64} \\
+\midrule
+null system call (\code{getpid}) & & & \\
+context switch (two processes, two pipes) & & & \\
+\code{fork} + \code{exit} + \code{wait} & & & \\
+16\,MiB file write, then read with a warm cache & & & \\
+boot to the \code{tsh} prompt & & & \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+Then write: add a porting chapter to the Phase 15 design reflection (what leaked, what the interface looks like now,
+which port was hardest and why, what you would design differently from the start), update the architecture document
+with the AArch64 memory map and the \code{docs/porting.md} conclusions, add a 2.0 entry to the \code{CHANGELOG}, and
+check that \code{make release-all} works from a clean clone. Tag the commit \code{v2.0}.
+\verify{The image passes \code{fsck.minix -f} after each of the three boots, and every architecture reads the files
+the other two wrote. \code{make test} passes for \code{ARCH=i386}, \code{riscv32} and \code{aarch64} on the tagged
+commit.}
+
+\task{Optional: Raspberry Pi 4}
+The Pi 4's Cortex-A72 is the CPU you have been emulating, so the kernel is the same; the board around it is not.
+Write the image to the FAT boot partition of an SD card that already holds the Raspberry Pi firmware, next to this
+\code{config.txt}. Leave the SD card itself alone: an SD driver is out of scope, so the root is the initrd.
+
+\begin{lst}{plain}{config.txt}
+arm_64bit=1
+kernel=kernel8.img
+kernel_address=0x200000
+enable_uart=1
+dtoverlay=disable-bt
+initramfs initrd.tar followkernel
+\end{lst}
+
+On the Pi 4 the PL011 normally serves Bluetooth and the weaker mini UART is on the header pins; the
+\code{disable-bt} overlay puts the PL011 on GPIO 14 (pin 8, transmit) and GPIO 15 (pin 10, receive). Connect a
+3.3\,V USB serial adapter there and to a ground pin; never a 5\,V or RS-232 one. The firmware's stub starts core 0 at
+EL2 with \code{x0} pointing to the devicetree, which is why Task 18.2 already drops to EL1. Before you touch the card,
+boot QEMU with \code{-machine virt,virtualization=on}, which also starts at EL2.
+
+\begin{center}
+\small\renewcommand{\arraystretch}{1.2}
+\begin{tabularx}{\linewidth}{@{}l >{\raggedright\arraybackslash}X >{\raggedright\arraybackslash}X@{}}
+\toprule
+\tkth{} & \tkth{QEMU \code{virt}} & \tkth{Raspberry Pi 4 (from its devicetree)} \\
+\midrule
+entry & EL1 (EL2 with \code{virtualization=on}) & EL2 \\
+RAM, load address & from \code{0x40000000}; kernel at \code{0x40200000} & from 0; kernel at \code{0x200000}: a second link, \code{BOARD=rpi4} \\
+boot table & Device 0--1\,GiB, Normal 1--2\,GiB & Normal from 0, Device for the gigabyte holding the peripherals \\
+interrupt controller & GICv2 at \code{0x08000000} & GIC-400 (\code{arm,gic-400}), a GICv2, at \code{0xFF841000} \\
+console & PL011 at \code{0x09000000}, INTID 33, 24\,MHz & PL011 at \code{0xFE201000}, SPI 121 = INTID 153, clock from the tree \\
+timer & virtual timer, INTID 27 & the same \\
+root & TurkFS on virtio-blk & the initrd only \\
+other cores & powered off until PSCI & waiting in the firmware's spin loop \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+Honour the devicetree's \code{/memreserve/} entries and \code{/reserved-memory}: the firmware's stub and its spin
+table live at the bottom of RAM.
+\verify{The serial terminal (115200 baud) shows ``Merhaba from a Raspberry Pi 4, EL1'', the memory map from the
+firmware's devicetree, and finally \code{turk@os:/$} running from the initrd.}
+
+\section{Testing and debugging}
+
+Start QEMU with \code{-d int,guest_errors -D build/aarch64/qemu.log} to log every exception with its ESR, and use
+\code{gdb-multiarch build/aarch64/kernel.elf} with \code{target remote :1234}; \code{info registers} in the QEMU
+monitor shows the current level as \code{EL1h} or \code{EL0t}. When the machine stops dead right after the MMU is
+turned on, step through \code{enable_mmu} with \code{stepi} and check each system register with \code{p $tcr_el1}.
+
+\begin{pitfalls}
+Undefined instruction, EC \code{0x07}, in the first \code{memcpy} or \code{kprintf} & The compiler used SIMD registers and \code{CPACR_EL1.FPEN} traps them & Build the kernel and the userland with \code{-mgeneral-regs-only}; check \code{ARCH_CFLAGS} reaches every file. \\
+No output at all; \code{x0} holds no devicetree & The image has no arm64 header (QEMU then loads it at \code{0x40080000}), or an ELF was passed & Check the magic \code{0x644d5241} at offset 56 of \code{kernel8.img}; pass the raw image to \code{-kernel}. \\
+The machine hangs right after \code{SCTLR_EL1.M} is set & No \code{isb}, the code is not identity-mapped through \code{TTBR0_EL1}, or a wrong \code{TCR_EL1} (\code{TG1} must be \code{0b10}) & Step with GDB; compare \code{TCR_EL1} with the field list of Task 18.6. \\
+Devices stop responding once the MMU is on & MMIO mapped as Normal memory, or not mapped & Map every device with AttrIndx 0 (Device-nGnRnE). \\
+An access-flag fault on every page (fault status \code{0x09}--\code{0x0B}) & AF clear in the descriptors & Set \code{PTE_AF} in every block and page descriptor. \\
+A spinlock spins for ever, or faults, early in boot & Exclusives on Device memory: the MMU or the caches are still off & Turn the MMU on in \code{boot.S}, before the first lock. \\
+Random corruption after changing page tables & Missing \code{dsb ishst} before the \code{tlbi}, or \code{dsb ish} and \code{isb} after it & Use \code{arch_tlb_flush} for every live change. \\
+An exception loop, or handlers run for the wrong exception & \code{VBAR_EL1} not 2\,KiB aligned, or an entry longer than 0x80 bytes & Keep \code{.balign 0x800} and keep each slot at four instructions. \\
+Kernel exceptions arrive at the \code{SP_EL0} entries & The kernel runs in EL1t: \code{SPSel} is 0 & \texttt{msr spsel, \#1} in \code{boot.S}; \code{SPSR_EL2} must say EL1h (\code{0x3c5}). \\
+SP alignment fault, EC \code{0x26} & A trap frame or context size that is not a multiple of 16, or a misaligned user stack & Keep \code{TF_SIZE} 288 and the context 96; align \code{sp} in \code{arch_user_entry}. \\
+\code{eret} to EL0 faults at once & \code{SPSR_EL1} mode bits not 0, \code{ELR_EL1} wrong, or the text mapped with \code{UXN} & Dump the frame before \code{eret}; check the PTE of the entry point. \\
+GIC interrupts never arrive & Distributor or CPU interface not enabled, \code{GICC_PMR} still 0, the INTID not enabled, or \code{DAIF.I} set & Read back \code{GICD_CTLR}, \code{GICC_CTLR}, \code{GICC_PMR} and \code{GICD_ISENABLER}. \\
+An interrupt storm from the timer & \code{CNTV_TVAL_EL0} not reloaded, so the level-triggered PPI stays asserted & Reload the timer first in its handler. \\
+Pointers above 4\,GiB are corrupted & A 64-bit truncation: \code{uint32_t} or a 32-bit mask & See Task 18.7; build with \code{-Werror} on the generic code. \\
+\code{make test} ends with an undefined instruction at \code{arch_test_exit} & QEMU runs without semihosting, so \code{hlt} is undefined & Add \code{-semihosting-config enable=on,target=native} to the test flags. \\
+No output on the Raspberry Pi & PL011 not on the header pins, wrong UART clock, TX and RX swapped, or the EL2 path broken & Check \code{config.txt}; take the clock from the tree; test EL2 entry in QEMU first. \\
+\end{pitfalls}
+
+\section{Milestone}
+
+\begin{milestonebox}[Turk-OS 2.0: three architectures]
+\begin{checklist}
+  \item \code{qemu-system-aarch64 -machine virt -cpu cortex-a72} boots to the \code{tsh} prompt, from EL1 and with \code{virtualization=on} from EL2.
+  \item Exceptions are decoded from \code{ESR_EL1} with names in crash reports; \code{brk} returns; user faults become signals.
+  \item GICv2, the virtual timer at 100\,Hz from \code{CNTFRQ_EL0}, and PL011 receive interrupts work; the monitor runs over serial.
+  \item The MMU runs with \code{TTBR1_EL1} for the kernel and \code{TTBR0_EL1} per process, Device and Normal memory, and copy-on-write.
+  \item ELF64 programs run at EL0 with \code{svc} system calls and the Linux i386 numbers; the evil programs are contained.
+  \item \code{make ARCH=aarch64 test} passes through semihosting, and the fuzzer runs for an hour without a panic.
+  \item One TurkFS image is written and read on all three architectures and passes \code{fsck.minix -f}.
+  \item \code{make release-all} works from a clean clone, the benchmark table and the porting chapter are written, and \code{v2.0} is tagged.
+\end{checklist}
+\end{milestonebox}
+
+\begin{questionbox}
+\begin{enumerate}
+  \item x86 has one \code{CR3}; AArch64 has \code{TTBR0_EL1} and \code{TTBR1_EL1}. What does the second register save the kernel on every process creation and switch?
+  \item What does the access flag let an operating system do, and why does Turk-OS set it everywhere?
+  \item Why must device registers be mapped Device-nGnRnE? Describe one thing that would go wrong with Normal memory.
+  \item Where did 64 bits break Turk-OS despite Task 16.9, and why could the compiler not warn about it?
+  \item Why do \code{ldaxr} and \code{stlxr} need the MMU and the caches on?
+  \item After \code{svc}, the kernel does not add 4 to the return address; after \code{brk} it does. Why the difference, and how does RISC-V handle \code{ecall}?
+  \item Why does AArch64 need no TSS and no \code{sscratch} to find the kernel stack?
+  \item Which of the two ports was the most work, and what does that tell you about the architecture interface?
+  \item How can one TurkFS image serve three architectures, and what change to the format would break that?
+\end{enumerate}
+\end{questionbox}
+
+\section{Going further}
+
+Bring up the other cores: PSCI \code{CPU_ON} (a firmware call through \code{hvc} on QEMU's default \code{virt}),
+per-CPU data in \code{TPIDR_EL1}, SGIs for rescheduling and TLB shootdown, and your Phase 9 spinlocks finally spinning
+on real contention. Move to GICv3 (\code{gic-version=3}), whose CPU interface is a set of system registers instead of
+MMIO. Give each process an ASID in the top bits of \code{TTBR0_EL1}, set \code{nG} on user pages, and stop flushing the
+whole TLB on every switch; measure the context-switch benchmark before and after. Try the 16\,KiB and 64\,KiB granules
+and see how the walk changes. Run Turk-OS under KVM on an ARM machine. Port it to the Raspberry Pi~5, whose
+peripherals sit behind the RP1 chip and whose standard Linux kernel uses 16\,KiB pages. Or take Phase 15's Track D: now that the
+generic code is 64-bit clean, x86-64 is mostly a new \code{kernel/arch/x86_64}.
+
+\section{Closing}
+
+Fourteen months ago Turk-OS was a boot sector that printed one line. Now one source tree builds a kernel and a
+userland for three processor architectures, two of which you met only in this stage, and the same disk image boots
+on all of them. Porting showed you which parts of your kernel were ideas and which were accidents of the PC: the
+scheduler, the file system and the system call layer did not change, while the code that knew about descriptors,
+rings and port I/O moved into one directory per machine. That separation, more than any single feature, is what makes
+an operating system last. Keep the journal, keep the tests green, and if Timur-RV32IMC runs your kernel one day,
+write it down.
+
+\booklegend
+\portlegend
+\end{document}

@@ -8,7 +8,8 @@
 system call fuzzer that runs for an hour without a kernel panic, an audited user/kernel boundary, kernel stack
 protection and read-only kernel code, users and file permissions, a benchmark suite with one measured optimisation,
 an architecture document, a reproducible \code{make release} that produces a bootable ISO, the \code{v1.0} tag, and a
-written reflection on your design. After that, a choice of tracks beyond 100\,\%.}
+written reflection on your design. After that, a choice of tracks beyond 100\,\%, and Stage V: the RISC-V and ARM
+ports of Phases 16--18.}
 
 \section{Why this phase}
 
@@ -20,9 +21,9 @@ closing that gap.
 It is also a good moment to step back. \MOS chapter 12, written by an author who designed several operating systems,
 is about exactly the decisions you have been making for nine months: interfaces, structure, mechanism versus policy,
 performance, and managing a large software project. Reading it now, with your own kernel in mind, is very different
-from reading it at the start. The phase ends with a written comparison of Turk-OS against MINIX 3 and Linux, and with
-a list of optional tracks for going further, one of which connects Turk-OS to the RISC-V core you are building in
-hardware.
+from reading it at the start. The phase ends with a written comparison of Turk-OS against MINIX 3 and Linux, a list
+of optional tracks for going further, and a look ahead to Stage V, which ports Turk-OS to RISC-V (including the core
+you are building in hardware) and to ARM.
 
 \section{Concepts you need}
 
@@ -192,8 +193,10 @@ Presenting it to your advisor or classmates is the best test of whether you real
 
 \section{Beyond 100\,\%: choose a track}
 
-Turk-OS 1.0 is a complete small system. These tracks extend it in different directions; each is a project of several
-weeks to several months, and they can be combined. Pick by interest, not by size.
+Turk-OS 1.0 is a complete small system. The guided way on is Stage V (Phases 16--18), which ports it to two more
+architectures with tasks, checks and milestones like the ones you know. The tracks below are open-ended instead. They
+extend Turk-OS in different directions; each is a project of several weeks to several months, and they can be
+combined with each other and with Stage V. Pick by interest, not by size.
 
 \begin{center}
 \small\renewcommand{\arraystretch}{1.35}
@@ -211,16 +214,18 @@ weeks to several months, and they can be combined. Pick by interest, not by size
 A.\ Graphics and Turkish text & Request a linear framebuffer through the Multiboot video fields, draw text with a PSF font that covers the whole Turkish alphabet (ğ, ş, ı, İ, Ğ, Ş), add a PS/2 mouse (IRQ 12), then a simple window system & \MOS\,\S5.6 (user interfaces); OSDev Wiki (VESA, PSF, mouse) \\
 B.\ Multiprocessor (SMP) & Parse the ACPI MADT, program the local APIC and I/O APIC, start the other CPUs (INIT--SIPI--SIPI), per-CPU data and run queues, TLB shootdown; your Phase 9 spinlocks finally spin & \MOS\,\S8.1 (520--544); \OSTEP Ch.~10 (97--108); \OSC\,\S5.5 (220--227) \\
 C.\ Networking & PCI enumeration, an e1000 or RTL8139 driver in QEMU, Ethernet, ARP, IPv4, ICMP (\code{ping}), UDP, then a minimal TCP and a socket API & \OSC Ch.~19 (733--768); \MOS\,\S8.3 (566--587); OSDev Wiki and RFCs \\
-D.\ 64-bit port & Long mode, four-level paging, Multiboot2, \code{syscall}/\code{sysret}, the x86-64 calling convention & \OSC\,\S9.6 (379--383); Intel SDM Vol.~3A \\
-E.\ RISC-V port & Separate the architecture layer (boot, traps, context switch, page tables), port it to RISC-V with Sv32 paging (two levels, like x86), boot on QEMU's \code{virt} machine, then on your own Timur-RV32IMC core once it has supervisor mode and a timer & RISC-V Privileged Specification; xv6-riscv as a reference \\
+D.\ 64-bit port & Long mode, four-level paging, Multiboot2, \code{syscall}/\code{sysret}, the x86-64 calling convention. Much easier after Stage V: Phase 16 makes the generic code 64-bit clean, and Phase 18 builds a 64-bit MMU on AArch64 & \OSC\,\S9.6 (379--383); Intel SDM Vol.~3A \\
+E.\ RISC-V and ARM ports & No longer a track: Stage V of this plan (Phases 16--18) ports Turk-OS to RV32 on QEMU's \code{virt} board and then your own Timur-RV32IMC core, and to AArch64 on QEMU \code{virt} and optionally a Raspberry Pi 4 & The Phase 16, 17 and 18 documents \\
 F.\ Microkernel experiment & Move the ATA driver (or TurkFS) into a user-space server that talks to the kernel with synchronous messages, as MINIX does, and measure the cost & \OSDI\,\S2.5, \S3.4 (112--125, 252--261); \MOS\,\S1.7.3 (65--68) \\
 G.\ Virtualisation & Understand what QEMU and KVM do for you, run Turk-OS with \code{-enable-kvm}, and compare the benchmarks & \OSC Ch.~18 (701--729); \MOS Ch.~7 (471--516) \\
 \end{longtable}
 \end{center}
 
-Track E deserves a note. Porting forces you to find every place where x86 leaked into supposedly generic code, which
-improves the whole kernel. And running your own operating system on a processor you designed yourself is a rare
-thing to be able to say about a student project, and a natural thesis topic.
+Stage V deserves a note. Porting forces you to find every place where x86 leaked into supposedly generic code, and
+fixing those leaks improves the whole kernel, including the x86 version. Running your own operating system on a
+processor you designed yourself is a rare thing to be able to say about a student project, and a natural thesis
+topic. Stage V has its own progress scale, from 0 to 100\,\% toward Turk-OS 2.0, so the 100\,\% you reach in this
+phase stays what it is: Turk-OS 1.0, finished.
 
 \section{Milestone}
 
@@ -254,7 +259,8 @@ schedules them preemptively, manages virtual memory with copy-on-write, stores f
 a shell with pipes. More useful than the code is what you now understand: what happens between pressing a key and a
 character appearing, between \code{fork} and \code{exit}, between \code{write} and the disk. The five books on your
 shelf will read differently from now on, because every chapter describes something you have built or decided not to
-build. Keep the journal going, and pick a track.
+build. Keep the journal going, pick a track, or turn the page to Stage V.
 
+\nextphase{16}{Portability: an Architecture Layer}
 \booklegend
 \end{document}

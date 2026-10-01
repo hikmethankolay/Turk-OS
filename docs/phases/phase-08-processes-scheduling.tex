@@ -225,6 +225,14 @@ task_trampoline:
 \verify{In GDB, break on \code{task_trampoline}: when it is hit, EBX holds your entry function and ESI its
 argument.}
 
+\begin{tipbox}[Portability note]
+Apart from the few lines that touch the interrupt flag (Phase 9 wraps them in \code{irq_save} and
+\code{irq_restore}), \code{switch_context} and the first stack frame that \code{task_create} builds for it are the
+only parts of the scheduler that depend on the CPU. Keep both in \code{kernel/arch/i386}: move the five \code{*--sp}
+lines into a small function next to \code{switch.s}, so \code{task.c} and \code{sched.c} stay plain C. Phase 16
+renames the pair \code{arch_switch} and \code{arch_task_init}, and each port in Stage V writes its own.
+\end{tipbox}
+
 \task{Cooperative multitasking}
 Turn the code that is already running (\code{kmain}) into task 0 by giving it a \code{struct task}; its
 \code{esp} gets filled in at the first switch. Write \code{schedule()}, which moves the current task to the back of the

@@ -1,0 +1,776 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{turkos}
+
+\begin{document}
+\renewcommand{\progresslabel}{Stage V progress toward Turk-OS 2.0 (this phase in red)}
+\phaseheader{16}{Portability: an Architecture Layer}{Find every place where x86 leaked into the generic kernel, hide the CPU and the board behind one interface, and prove that x86 still behaves exactly as before}{0}{20}
+
+\ataglance{2--3 weeks}{3}{Phase 15 complete: Turk-OS 1.0 tagged, \code{make test} and the fuzzer pass}{The same Turk-OS on x86,
+with all x86 code behind \code{include/arch.h}: a written leak audit in \code{docs/porting.md}, one trap frame with
+accessors, \code{struct bootinfo} instead of Multiboot, the MMU behind \code{arch_mmu_*}, consoles and input that any
+board can provide, \code{make ARCH=}, a 64-bit-clean generic core that compiles for \code{riscv32} and \code{aarch64},
+a devicetree parser with host tests, and two more cross compilers ready for Phases 17 and 18.}
+
+\section{Why this phase}
+
+Turk-OS 1.0 is x86 from the first instruction to the last trap frame. Some of that is honest: \code{isr.s},
+\code{gdt.c} and \code{paging.c} live in \code{kernel/arch/i386} because they can't be anything but x86. Much of it
+leaked, though. The system call dispatcher reads \code{r->eax}, the page-fault handler reads CR2, \code{fork} writes
+\code{tf->eax = 0}, the frame allocator walks the Multiboot memory map, \code{irq_restore} tests bit \code{0x200} of
+EFLAGS, and \code{kmain} ends a test run by writing to port \code{0xF4}. Each of these lines works; it only shows up as
+a leak on a second machine.
+
+Stage V brings that second machine. Phase 17 ports Turk-OS to RISC-V (RV32 on QEMU's \code{virt} board, and optionally
+your own Timur-RV32IMC core), and Phase 18 to 64-bit ARM (AArch64 on QEMU's \code{virt} board, and optionally a
+Raspberry Pi~4). This phase writes no RISC-V or ARM code. It is a refactoring: it prepares the seams, and at its end
+Turk-OS on x86 does exactly what version 1.0 did, with the same tests passing and benchmarks within a few per cent.
+
+Porting sorts the kernel into three kinds of code. The \textbf{architecture} is the CPU: instruction set, privilege
+levels, traps, MMU, atomics. The \textbf{board}, or platform, is everything around it: the devices, the firmware, and
+how the kernel learns what memory and devices exist. Everything else is \textbf{generic}. \MOS\,\S12.3.1 draws the
+same split as layers: hide the hardware first, then interrupts, context switching and the MMU, and above that the code
+is mostly machine independent. The heart of this phase is the \textbf{leak audit} of Task~16.2, a written list of
+every place where x86 shows through; every later task fixes entries on it. Stage V has its own progress scale, from 0
+to 100\,\% toward Turk-OS 2.0; this phase takes you to 20\,\%.
+
+\section{Concepts you need}
+
+\subsection{Architecture, board and generic code}
+
+Figure~\ref{fig:layers16} shows where Stage V ends up. Generic code calls the functions of \code{include/arch.h} and a
+few inline helpers from per-architecture headers, and three implementations sit below that interface, each on its
+board. On a PC the architecture and the board are entangled (port I/O is an x86 instruction, the PIC is part of every
+PC), so Turk-OS keeps both in \code{kernel/arch/i386}. The ports separate them: their devices are found at boot, so
+their drivers can live in \code{kernel/drivers} and serve any board that has the device.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[every node/.style={font=\sffamily\scriptsize},
+  lab/.style={tknote, anchor=east, text width=1.15cm, align=right},
+  arch/.style={tkbox, text width=4.25cm, minimum height=1.95cm},
+  port/.style={arch, draw=tkViolet!85!black, fill=tkViolet!8},
+  board/.style={tkbox, fill=white, text width=4.25cm, minimum height=1.55cm}]
+  \node[tkok, text width=13.7cm, minimum height=1.0cm] (gen) at (0,0)
+    {\textbf{generic kernel}: scheduler, VMM and copy-on-write, system calls, signals, VFS, TurkFS, buffer cache, tty,
+     \code{kprintf}, ktests; drivers for devices that any board may have (16550 core, virtio-blk, RAM disk, block layer)};
+  \node[tkhi, text width=13.7cm, minimum height=0.8cm] (ifc) at (0,-1.25)
+    {\textbf{the interface}: \code{include/arch.h} (out-of-line functions), the inline headers \code{<arch/trapframe.h>},
+     \code{<arch/irq.h>}, \code{<arch/memlayout.h>}, \code{<arch/mmu.h>}, \code{<arch/atomic.h>}, and \code{struct bootinfo}};
+  \node[arch] (i386) at (-4.75,-2.95) {\textbf{kernel/arch/i386}\\GDT, IDT, \code{isr.s}, TSS, paging,\\\code{int 0x80}, PIC, PIT, VGA, ATA};
+  \node[port] (rv) at (0,-2.95) {\textbf{kernel/arch/riscv32}\\\code{stvec}, Sv32, SBI calls, PLIC,\\\code{ecall}\quad(Phase 17)};
+  \node[port] (a64) at (4.75,-2.95) {\textbf{kernel/arch/aarch64}\\\code{VBAR_EL1}, VMSAv8-64, GIC,\\generic timer, \code{svc}\quad(Phase 18)};
+  \node[board] (pc) at (-4.75,-4.95) {\textbf{PC} (\code{qemu-system-i386})\\BIOS, GRUB, Multiboot;\\fixed I/O ports and addresses};
+  \node[board] (rvb) at (0,-4.95) {\textbf{QEMU virt} (RISC-V)\\OpenSBI, devicetree; 16550, virtio\\later: Timur-RV32IMC};
+  \node[board] (a64b) at (4.75,-4.95) {\textbf{QEMU virt} (Arm)\\devicetree; PL011, GICv2, virtio\\later: Raspberry Pi 4};
+  \foreach \a in {i386,rv,a64} \draw[tkarrow] (\a.north) -- (\a.north |- ifc.south);
+  \foreach \a/\b in {pc/i386,rvb/rv,a64b/a64} \draw[tkarrow] (\a) -- (\b);
+  \node[lab] at (-6.95,0) {generic};
+  \node[lab] at (-6.95,-1.25) {interface};
+  \node[lab] at (-6.95,-2.95) {CPU};
+  \node[lab] at (-6.95,-4.95) {board};
+\end{tikzpicture}
+\caption{The layers after Stage V. This phase builds the red interface and moves x86 below it; the violet backends
+come in Phases 17 and 18.}
+\label{fig:layers16}
+\end{figure}
+
+\subsection{Three machines, side by side}
+
+Table~\ref{tab:three} is a map of what the interface hides; Phases 17 and 18 explain every RISC-V and ARM cell. What
+stays the same matters as much: all three are little-endian, use 4\,KiB pages, have one unprivileged mode for programs,
+and enter the kernel through one trap mechanism for system calls, faults and interrupts.
+
+\begin{table}[htbp]
+\centering\footnotesize\renewcommand{\arraystretch}{1.3}\setlength{\tabcolsep}{4pt}
+\begin{tabularx}{\linewidth}{@{}>{\raggedright\arraybackslash}p{0.15\linewidth} >{\raggedright\arraybackslash}X >{\raggedright\arraybackslash}X >{\raggedright\arraybackslash}X@{}}
+\toprule
+\tkth{Mechanism} & \tkth{i386 (Turk-OS 1.0)} & \tkth{riscv32 (Phase 17)} & \tkth{aarch64 (Phase 18)} \\
+\midrule
+Firmware, entry & BIOS and GRUB; Multiboot hands over in protected mode, paging off & OpenSBI runs in M-mode and jumps to the kernel in S-mode, with the hart ID in \code{a0} and the devicetree's address in \code{a1} & QEMU's loader (or board firmware) starts the kernel at EL1, or at EL2 when virtualisation is enabled \\
+Privilege levels & ring 0 and ring 3 & S-mode and U-mode, with M-mode (firmware) below & EL1 and EL0, with EL2 and EL3 above \\
+Trap entry, fault address & IDT, one gate per vector; CR2 & \code{stvec}, one entry point (direct mode), cause in \code{scause}; \code{stval} & \code{VBAR_EL1}, 16 entries of 128 bytes, cause in \code{ESR_EL1}; \code{FAR_EL1} \\
+Interrupt controller & two 8259 PICs & PLIC (claim and complete) & GIC (acknowledge and end of interrupt) \\
+Timer & 8254 PIT & SBI timer call (TIME extension) and the \code{time} counter & Arm generic timer, frequency in \code{CNTFRQ_EL0} \\
+Page tables & two levels, 32-bit entries, root in CR3 & Sv32: two levels, 32-bit entries, root in \code{satp} & VMSAv8-64, 4\,KiB granule, 39-bit addresses: three levels, roots in \code{TTBR0_EL1} and \code{TTBR1_EL1} \\
+TLB maintenance & \code{invlpg}, or reload CR3 & \code{sfence.vma} & \code{tlbi} between \code{dsb} barriers, then \code{isb} \\
+System call & \code{int 0x80}, number in EAX & \code{ecall}, number in \code{a7} & \texttt{svc \#0}, number in \code{x8} \\
+Atomics & \code{xchg}, \code{lock} prefix & A extension: \code{amoswap.w}, or LR/SC & \code{ldaxr}/\code{stlxr} pairs (LSE atomics only from Armv8.1; the Cortex-A72 is Armv8.0) \\
+Devices, discovery & port I/O and MMIO; Multiboot and fixed PC addresses & MMIO only; flattened devicetree & MMIO only; flattened devicetree \\
+Word size & 32-bit, ILP32 & 32-bit, ILP32 & 64-bit, LP64 \\
+\bottomrule
+\end{tabularx}
+\caption{The mechanisms behind the architecture interface, on the three targets of Stage V.}
+\label{tab:three}
+\end{table}
+
+\subsection{One interface, three implementations}
+
+There are two ways to keep one source tree for several machines. \MOS\,\S12.3.9 (\emph{Hiding the Hardware}) shows
+\textbf{conditional compilation}: \code{config.h} defines \code{CPU} and \code{WORD_LENGTH}, and \texttt{\#if} blocks
+select the code for each machine. Its lesson is orthogonality: test CPU-dependent things on the CPU macro and
+word-length-dependent things on the word-length macro, so that a new CPU with a known word length needs no change to
+the word-length code. A kernel full of \texttt{\#if (CPU == ...)} becomes hard to read, though, and every port touches
+every file. Linux and MINIX 3 use \textbf{separate files behind one header} instead: a header declares what every
+architecture provides, each architecture implements it in its own directory, and the build picks the directory.
+Turk-OS does the same, and keeps \texttt{\#if} only for orthogonal features in Tanenbaum's sense:
+\code{ARCH_HAS_ATOMICS} says whether atomic instructions exist, not which CPU this is.
+
+\begin{conceptbox}{The architecture interface}
+A fixed set of types, constants and functions that generic code may use and every architecture provides, in two
+parts. \textbf{Inline headers} in \code{kernel/arch/$(ARCH)/include/arch/} hold what hot paths use or what needs the
+architecture's types: the trap frame and its accessors, interrupt control, the memory layout, the PTE type. Being
+\code{static inline}, they cost nothing at run time. \textbf{Out-of-line functions}, declared once in
+\code{include/arch.h}, hold the rest: boot, the interrupt controller, the timer, context switching, page tables. A call
+costs a few nanoseconds, nothing next to what these functions do. Task~16.12 checks both claims.
+\end{conceptbox}
+
+\subsection{The devicetree}
+
+A PC kernel simply knows where things are: COM1 at port \code{0x3F8}, the disk at \code{0x1F0}, the PIC at
+\code{0x20}, and GRUB reports the memory. Other boards have no such conventions, so their firmware passes a
+\textbf{devicetree}: the machine as a tree of \textbf{nodes} with named \textbf{properties} (\SPEC Devicetree
+Specification, chapter~2). Here is part of the tree that QEMU~10.2 generates for its RISC-V \code{virt} board:
+
+\begin{lst}{plain}{QEMU riscv32 virt devicetree (excerpt in dtc's order; trimmed, comments added)}
+/ {
+    #address-cells = <0x02>;
+    #size-cells = <0x02>;
+    model = "riscv-virtio,qemu";
+    memory@80000000 {
+        device_type = "memory";
+        reg = <0x00 0x80000000 0x00 0x8000000>;   // base 0x80000000, size 128 MiB
+    };
+    cpus { ... timebase-frequency = <0x989680>; ... };   // the time counter runs at 10 MHz
+    chosen { stdout-path = "/soc/serial@10000000"; ... };
+    soc {
+        #address-cells = <0x02>;
+        #size-cells = <0x02>;
+        serial@10000000 {
+            interrupts = <0x0a>;                   // source 10 of ...
+            interrupt-parent = <0x03>;             // ... the node whose phandle is 3
+            reg = <0x00 0x10000000 0x00 0x100>;
+            compatible = "ns16550a";
+        };
+        plic@c000000 { phandle = <0x03>; compatible = "sifive,plic-1.0.0", "riscv,plic0"; ... };
+    };
+};
+\end{lst}
+
+\code{compatible} names the device, most specific first; a driver looks for a string it knows. \code{reg} lists
+(address, size) pairs made of 32-bit cells, and the \emph{parent's} \texttt{\#address-cells} and \texttt{\#size-cells}
+say how many cells each takes: two, 64 bits, even on this 32-bit board. \code{interrupts} is interpreted by the
+controller that \code{interrupt-parent} names through its \code{phandle}, a numeric node ID. A few nodes have fixed
+meanings (chapter~3): \code{/memory} lists RAM, \code{/reserved-memory} RAM the kernel must not touch, and
+\code{/chosen} the command line (\code{bootargs}) and the console (\code{stdout-path}).
+
+The firmware passes the tree as a \textbf{flattened devicetree} (FDT, or DTB), the binary format of chapter~5
+(Figure~\ref{fig:fdt}). A 40-byte header with the magic number \code{0xd00dfeed} gives the offsets of three blocks.
+The \textbf{structure block} is a stream of 32-bit tokens: \code{FDT_BEGIN_NODE} (1) and the node's name;
+\code{FDT_PROP} (3), the value's length, the offset of the property's name in the \textbf{strings block}, and the
+value; \code{FDT_END_NODE} (2); \code{FDT_NOP} (4); and \code{FDT_END} (9), all padded to four bytes. The
+\textbf{memory reservation block} lists 64-bit (address, size) pairs to keep away from, ending with two zeros. Every
+number is \textbf{big-endian}, and all three Turk-OS targets are little-endian, so every cell is byte-swapped as it is
+read.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[blk/.style={cell, minimum height=0.9cm, text width=#1, fill=tkLight},
+  tok/.style={cell, fill=white, minimum height=0.55cm, inner xsep=3pt}, every node/.style={font=\sffamily\scriptsize}]
+  \node[blk=2.5cm, anchor=west, fill=tkRed!8] (h) at (0,0) {\textbf{header}, 40 bytes\\magic \code{0xd00dfeed}};
+  \node[blk=3.3cm, anchor=west] (r) at (h.east) {\textbf{memory reservation}\\(address, size) pairs, then 0, 0};
+  \node[blk=4.3cm, anchor=west, fill=tkBlue!8] (s) at (r.east) {\textbf{structure block}\\a stream of tokens (below)};
+  \node[blk=3.0cm, anchor=west, fill=tkAmber!12] (t) at (s.east) {\textbf{strings block}\\property names, NUL-terminated};
+  \node[tok, anchor=west] (k1) at (0,-1.45) {BEGIN\_NODE ""};
+  \node[tok, anchor=west] (k2) at (k1.east) {PROP};
+  \node[tok, anchor=west] (k3) at (k2.east) {\dots};
+  \node[tok, anchor=west, fill=tkBlue!8] (k4) at (k3.east) {BEGIN\_NODE "memory@80000000"};
+  \node[tok, anchor=west] (k5) at (k4.east) {PROP};
+  \node[tok, anchor=west, fill=tkRed!8] (k6) at (k5.east) {PROP};
+  \node[tok, anchor=west, fill=tkBlue!8] (k7) at (k6.east) {END\_NODE};
+  \node[tok, anchor=west] (k8) at (k7.east) {\dots};
+  \node[tok, anchor=west] (k9) at (k8.east) {END\_NODE};
+  \node[tok, anchor=west] (k10) at (k9.east) {END};
+  \draw[tkarrow, dashed] (s.south) -- (s.south |- k1.north);
+  \node[tok, anchor=north west, fill=tkRed!8] (p1) at ([xshift=-1.6cm, yshift=-0.55cm]k6.south west) {3};
+  \node[tok, anchor=west] (p2) at (p1.east) {len = 16};
+  \node[tok, anchor=west] (p3) at (p2.east) {nameoff};
+  \node[tok, anchor=west, text width=3.3cm] (p4) at (p3.east) {value: \code{00000000 80000000}\\\phantom{value: }\code{00000000 08000000}};
+  \draw[tkarrow] (k6.south) -- (k6.south |- p1.north);
+  \node[tknote, anchor=east] at (p1.west) {the \code{reg} property, one FDT\_PROP token:};
+  \node[tknote, anchor=north east, align=right] at (p3.south east) {offset of "reg"\\in the strings block};
+  \node[tknote, anchor=north west, align=left] at ([xshift=2pt]p4.south west) {base 0x80000000, size 128 MiB};
+\end{tikzpicture}
+\caption{The layout of a flattened devicetree, and the token sequence of the \code{reg} property of
+\code{/memory@80000000}.}
+\label{fig:fdt}
+\end{figure}
+
+\subsection{Word size: ILP32 and LP64}
+
+i386 and riscv32 use the \textbf{ILP32} model: \code{int}, \code{long} and pointers are 32 bits. AArch64 uses
+\textbf{LP64}: \code{int} stays at 32 bits, while \code{long}, pointers, \code{size_t} and \code{uintptr_t} grow to 64.
+A pointer kept in a \code{uint32_t} or printed with \texttt{\%x} worked by accident on x86 and breaks on AArch64.
+Table~\ref{tab:abi} lists the differences that bite; the last two even differ between the two 32-bit targets.
+
+\begin{table}[htbp]
+\centering\small\renewcommand{\arraystretch}{1.25}
+\begin{tabularx}{\linewidth}{@{}>{\raggedright\arraybackslash}X c c c@{}}
+\toprule
+\tkth{Question} & \tkth{i386} & \tkth{riscv32} & \tkth{aarch64} \\
+\midrule
+\code{sizeof(long)}, \code{sizeof(void *)}, \code{sizeof(size_t)} & 4 & 4 & 8 \\
+\code{sizeof(int)}; \code{sizeof(long long)} & 4; 8 & 4; 8 & 4; 8 \\
+offset of \code{b} in \code{struct { uint32_t a; uint64_t b; }}, and the struct's size & 4, 12 & 8, 16 & 8, 16 \\
+is plain \code{char} signed? & yes & no & no \\
+\bottomrule
+\end{tabularx}
+\caption{The C data model on the three targets (checked with the compilers' output).}
+\label{tab:abi}
+\end{table}
+
+What must \emph{not} change is what leaves the machine. TurkFS has only 8-, 16- and 32-bit fields, which all three
+little-endian targets lay out the same way, so one disk image works everywhere; a \code{_Static_assert} on each
+on-disk structure's size keeps it so. Elsewhere, use \code{uintptr_t} for an address in an integer, \code{size_t} for a
+size, \code{uint64_t} for physical addresses and lengths from the firmware, and \code{uint8_t} for raw bytes. The best
+auditor is the compiler: build the generic code for a target with another data model, and it reports every truncation
+and format mismatch (Task~16.9).
+
+\section{Reading plan}
+
+\begin{readingplan}
+\must & \MOS & \S12.3.9 \emph{Useful Techniques}: \emph{Hiding the Hardware}, \emph{Indirection} & 1005--1008 & Conditional compilation, orthogonal macros, indirection. \\
+\must & \SPEC & Devicetree Specification (release v0.4), ch.~2 \emph{The Devicetree}: \S2.2 structure and conventions, \S2.3 standard properties, \S2.4 interrupts & -- & Nodes, \code{compatible}, \code{reg}, cells, \code{phandle}. \\
+\must & \SPEC & Devicetree Specification, ch.~5 \emph{Flattened Devicetree (DTB) Format} & -- & The exact blob layout for the parser of Task~16.10. \\
+\should & \SPEC & Devicetree Specification, ch.~3 \emph{Device Node Requirements}: \S3.4 \code{/memory}, \S3.5 \code{/reserved-memory}, \S3.6 \code{/chosen} & -- & What replaces the Multiboot information. \\
+\should & \MOS & \S12.3.1 \emph{System Structure} (layered systems, Fig.~12-2) & 993--997 & Where the hardware-dependent layers belong. \\
+\should & \OSDI & \S2.6.11 \emph{Hardware-Dependent Kernel Support} & 185--190 & How MINIX 3 kept x86-specific C code in a few files. \\
+\should & \OSC & \S9.6 \emph{Example: Intel 32- and 64-bit Architectures}; \S9.7 \emph{Example: ARMv8 Architecture} & 379--384 & A preview of the MMUs of Stage V. \\
+\could & \XVSIX & Ch.~1 \emph{Operating system interfaces}; ch.~2 \emph{Operating system organization} & -- & Meet xv6-riscv, Phase 17's reference kernel. \\
+\end{readingplan}
+
+For devicetree practice, the Linux kernel documentation page \emph{Linux and the Devicetree}
+(\url{https://docs.kernel.org/devicetree/usage-model.html}) explains how a kernel uses the tree at boot.
+
+\begin{minixbox}[Real-system lens: MINIX 3 on ARM, and Linux's arch/ tree]
+The MINIX 3 of \OSDI (version 3.1) ran only on 32-bit x86, but \S2.6.11 explains that its hardware-dependent C code
+was kept in a few files (\code{exception.c}, \code{i8259.c}, \code{protect.c}) to make porting easier. MINIX 3.3.0
+(2014) was the first release with ARM support, for the BeagleBoard-xM and the BeagleBone (Cortex-A8, 32-bit ARMv7).
+In its tree, \code{minix/kernel/arch/earm} stands next to \code{minix/kernel/arch/i386} with the same file names
+(\code{head.S}, \code{mpx.S}, \code{klib.S}, \code{exception.c}, \code{protect.c}, \code{memory.c},
+\code{arch_clock.c}, \code{kernel.lds}); \code{i8259.c} exists only on the x86 side, the TI board support only in
+\code{earm/bsp/ti}. Linux does the same at scale: \code{arch/x86}, \code{arch/riscv} and \code{arch/arm64} each provide
+headers under \code{include/asm}, and \code{include/asm-generic} supplies a default for whatever an architecture
+doesn't override.
+\end{minixbox}
+
+\section{Build it}
+
+\task{Two more cross compilers, two QEMU boards, dtc and a multi-architecture GDB}
+Follow section~9 of \code{docs/setup.md}, \emph{Toolchains for the ports}. Section~9.2 installs the two emulators,
+\code{dtc} and a GDB that knows all three architectures. Section~9.3 builds \code{riscv32-elf} and \code{aarch64-elf}
+exactly like the \code{i686-elf} compiler of Phase~0, with the same binutils and GCC versions, the same prefix and one
+build folder per target. Only GCC for RISC-V gets two more \code{configure} options,
+\code{--with-arch=rv32imac_zicsr_zifencei} and \code{--with-abi=ilp32}, which make RV32IMAC and the \code{ilp32} ABI
+its defaults. Run the checks of sections 9.5 and 9.6, then keep both boards' devicetrees for Task~16.10:
+
+\begin{lst}{sh}{terminal}
+mkdir -p tests/data
+qemu-system-riscv32 -machine virt,dumpdtb=tests/data/virt-riscv32.dtb
+qemu-system-aarch64 -machine virt,dumpdtb=tests/data/virt-aarch64.dtb -cpu cortex-a72
+dtc -I dtb -O dts tests/data/virt-riscv32.dtb | less
+\end{lst}
+\verify{\code{riscv32-elf-gcc -v} shows \code{--with-arch=rv32imac_zicsr_zifencei --with-abi=ilp32} in its configure
+line; \code{readelf -h} on a compiled object reports \code{ELF32} and \code{RISC-V} for one compiler, \code{ELF64} and
+\code{AArch64} for the other. \code{qemu-system-riscv32 -machine virt -nographic -bios default} prints the OpenSBI
+banner with \code{Domain0 Next Mode : S-mode}, and \code{dtc} decodes both blobs.}
+
+\task{Find every place x86 leaked}
+This is the heart of the phase. Before you move a single file, write down every place where code outside
+\code{kernel/arch/i386} knows it runs on x86. Search for the usual suspects, then read every hit.
+
+\begin{lst}{sh}{terminal}
+grep -rnE --include='*.[ch]' -e 'struct regs|->(eax|ebx|ecx|edx|esi|edi|ebp|eip|cs|useresp)\b' \
+  -e '\bcr[234]\b|invlpg|\b(inb|outb|inl|outl|insw|outsw)\(|\b(cli|sti|hlt)\b|pushf|0x200\b' \
+  -e '0xC0000000|KERNEL_VMA|multiboot|rdtsc|pde_t|PG_[A-Z]|0xB8000|vga_|pic_|pit_|0xF4\b' \
+  kernel lib include tests | grep -v '^kernel/arch/i386/'
+grep -rnE --include='*.[ch]' '\(uint32_t\) *[&a-z_]|uint32_t +[a-z_]*(addr|ptr|len|size)\b' \
+  kernel lib include | grep -v '^kernel/arch/i386/'
+\end{lst}
+
+Record each leak in \code{docs/porting.md}, a working document like the journal, with its kind: \textbf{arch} (a
+register, an instruction, the page-table format), \textbf{board} (a device, a firmware structure, a fixed address) or
+\textbf{word} size (a 32-bit type holding an address or a length), and the task that fixes it.
+
+\begin{lst}{plain}{docs/porting.md (the first rows of a typical audit)}
+| file:line                   | leak (kind)                          | fix (task)                 | done |
+|-----------------------------|--------------------------------------|----------------------------|------|
+| kernel/syscall/syscall.c:31 | arch: reads r->eax, r->ebx, ...      | tf_sysno, tf_arg (16.5)    | [ ]  |
+| kernel/mm/pmm.c:40          | board: walks the Multiboot map       | struct bootinfo (16.6)     | [ ]  |
+| kernel/syscall/uaccess.c:6  | word: uint32_t end = start + n       | uintptr_t (16.9)           | [ ]  |
+\end{lst}
+
+Some assumptions have no keyword for grep to find: the stack grows down, pages are 4\,KiB, the CPU is little-endian.
+List them in a second table, \emph{assumptions kept}, and check that all three targets share each one (these three do).
+\verify{Every hit of the two searches is in \code{porting.md}, with a kind and a fix, or marked there as a false
+positive.}
+
+\task{Move x86 into its corner}
+Move everything that is x86 or PC into \code{kernel/arch/i386} with \code{git mv}, so the history follows each file:
+the boot code and linker script (Phase~1's \code{boot/loader.s} and \code{link.ld} become \code{boot.s} and
+\code{kernel.ld}), descriptor tables, interrupt stubs, PIC, PIT, TSS, paging, the context switch, and the drivers that
+only exist on a PC (VGA text, PS/2 keyboard, ATA through ports). The x86 headers move from \code{include/arch/} to
+\code{kernel/arch/i386/include/arch/}, and \code{include/} keeps only generic headers.
+
+Generic code needs no change for this, thanks to the include path. Generic files keep writing
+\texttt{\#include <arch/irq.h>}, and \code{CFLAGS += -Iinclude -Ikernel/arch/$(ARCH)/include} makes the compiler find
+the header of whichever architecture is being built.
+\verify{\code{include/arch/} no longer exists, \code{make clean && make test} passes, and
+\code{grep -rn 'arch/i386' kernel lib include --include='*.c'} finds nothing outside \code{kernel/arch/}.}
+
+\task{The architecture interface}
+Write \code{include/arch.h}, the contract between the generic kernel and every port; Phases 17 and 18 implement
+exactly these names. Most functions already exist on x86 under other names: rename them, and let generic code call
+only these.
+
+\begin{lst}{c}{include/arch.h}
+#pragma once
+#include <stdint.h>
+#include <stdbool.h>
+#include <bootinfo.h>
+#include <arch/trapframe.h>    /* struct trapframe and the inline tf_ accessors */
+#include <arch/mmu.h>          /* pte_t, paddr_t and struct arch_space          */
+
+struct task;
+struct context;                /* callee-saved registers, on the kernel stack */
+struct addrspace;              /* include/vm.h                                 */
+struct fault_info { uintptr_t addr; bool write, user, present, exec; };
+
+/* boot, interrupts, time */
+void     arch_early_init(struct bootinfo *bi);   /* console up, bootinfo filled */
+void     arch_init(void);                        /* traps, interrupt controller  */
+void     arch_irq_unmask(unsigned irq);
+void     arch_irq_mask(unsigned irq);
+void     arch_timer_init(unsigned hz);
+uint64_t arch_cycles(void);                      /* TSC, time CSR, CNTVCT_EL0    */
+uint64_t arch_entropy(void);                     /* seed for the stack canary    */
+void     arch_fault_info(const struct trapframe *tf, struct fault_info *fi);
+
+/* tasks, user mode, signals */
+void     arch_task_init(struct task *t, void (*entry)(void *), void *arg);
+void     arch_switch(struct context **save, struct context *load);
+void     arch_user_entry(struct trapframe *tf, uintptr_t entry, uintptr_t sp);
+_Noreturn void arch_return_to_user(struct trapframe *tf);
+int      arch_signal_frame(struct trapframe *tf, int sig, uintptr_t handler, uintptr_t restorer);
+int      arch_sigreturn(struct trapframe *tf);
+
+/* address spaces; flags are VM_READ, VM_WRITE, VM_EXEC, VM_USER, VM_COW */
+int      arch_mmu_init_space(struct addrspace *as);
+void     arch_mmu_free_space(struct addrspace *as);
+int      arch_mmu_map(struct addrspace *as, uintptr_t va, paddr_t pa, unsigned flags);
+void     arch_mmu_unmap(struct addrspace *as, uintptr_t va);
+bool     arch_mmu_lookup(struct addrspace *as, uintptr_t va, paddr_t *pa, unsigned *flags);
+int      arch_mmu_protect(struct addrspace *as, uintptr_t va, unsigned flags);
+void     arch_mmu_switch(struct addrspace *as);
+void     arch_tlb_flush(uintptr_t va);
+
+/* leaving */
+_Noreturn void arch_test_exit(int failed);
+_Noreturn void arch_halt(void);
+\end{lst}
+
+The inline headers complete the interface. \code{<arch/irq.h>} provides \code{unsigned long irq_save(void)},
+\code{void irq_restore(unsigned long flags)}, \code{irq_enable()}, \code{irq_disable()} and \code{cpu_idle()}
+(\code{sti; hlt} on x86); the flags type changes from Phase~9's \code{uint32_t} to \code{unsigned long}, the register
+size everywhere. \code{<arch/atomic.h>} provides \code{atomic_xchg()} and \code{ARCH_HAS_ATOMICS} (1 on x86).
+Phase~8's \code{switch_context(&prev->esp, next->esp)} becomes \code{arch_switch(&prev->ctx, next->ctx)} with a
+\code{struct context *ctx}. The x86 assembly doesn't change: the saved ESP already points at the pushed EDI, ESI, EBX,
+EBP and return address, which is all \code{struct context} is. \code{arch_task_init} builds a new task's first context
+on its kernel stack: at the top, or just below \code{t->tf} when generic code has already put a trap frame there, as
+\code{fork} does in Task~16.5. Keep the header small: a function joins it only when generic code really needs it.
+\verify{\code{grep -rn 'switch_context\|qemu_exit\|enter_user_mode' kernel --include='*.c' | grep -v '^kernel/arch/'}
+finds nothing, and \code{make test} passes.}
+
+\task{One trap frame for generic code}
+Rename Phase~3's \code{struct regs} to \code{struct trapframe}, with the same layout (\code{isr.s} builds it), and add
+the accessors. From now on only code in \code{kernel/arch/i386} may name a field.
+
+\begin{lst}{c}{kernel/arch/i386/include/arch/trapframe.h}
+struct trapframe {                       /* was struct regs (Phase 3): same layout */
+    uint32_t ds;
+    uint32_t edi, esi, ebp, esp_at_pusha, ebx, edx, ecx, eax;
+    uint32_t int_no, err_code;
+    uint32_t eip, cs, eflags;
+    uint32_t useresp, ss;                /* valid only for a trap from ring 3 */
+};
+_Static_assert(sizeof(struct trapframe) == 64, "isr.s depends on this layout");
+
+static inline unsigned long tf_sysno(const struct trapframe *tf) { return tf->eax; }
+static inline unsigned long tf_arg(const struct trapframe *tf, int n)
+{
+    const uint32_t r[6] = { tf->ebx, tf->ecx, tf->edx, tf->esi, tf->edi, tf->ebp };
+    return r[n];                         /* the Linux i386 order */
+}
+static inline void tf_set_ret(struct trapframe *tf, long v) { tf->eax = (uint32_t)v; }
+static inline bool tf_from_user(const struct trapframe *tf) { return (tf->cs & 3) == 3; }
+/* tf_pc, tf_set_pc and tf_sp in the same style: eip, eip and useresp */
+\end{lst}
+
+Then rewrite the generic users. \code{syscall_dispatch(tf)}, which each port's trap code calls, sets
+\code{current->tf}, checks \code{tf_sysno(tf)} against the table, calls the entry with six \code{unsigned long}
+arguments, \code{tf_arg(tf, 0)} to \code{tf_arg(tf, 5)} (enough for every call on every port), and stores the result
+with \code{tf_set_ret}. \code{fork} no longer needs Phase~11's \code{isr_return} label. It copies the parent's frame to
+the top of the child's kernel stack, sets \code{child->tf} to it, calls \code{tf_set_ret(tf, 0)}, and then
+\code{arch_task_init(child, fork_return, tf)}, where \code{fork_return(void *tf)} only calls
+\code{arch_return_to_user(tf)}. The child starts as an ordinary kernel task whose first function returns to user mode.
+
+The page-fault handler gets the same treatment: \code{arch_fault_info} fills a \code{struct fault_info} from CR2 and
+the error code, and generic code decides what to do (Task~16.7). \code{exec} stays false on x86, because the error
+code reports instruction fetches only with NX or SMEP, which Turk-OS doesn't use.
+\verify{\code{grep -rnE -- '->(eax|ebx|eip|cs|useresp)' kernel lib --include='*.c' | grep -v '^kernel/arch/'} finds
+nothing. The \code{fork_values} test and all seven evil programs of Task~10.9 behave as before.}
+
+\task{Boot information without Multiboot}
+Generic code must stop reading the Multiboot structure. Define what the kernel learns at boot, whatever the firmware,
+and let each architecture fill it in. Addresses and lengths are \code{uint64_t} even on 32-bit targets: physical
+memory can be larger than the address space, and the RISC-V devicetree uses 64-bit values too.
+
+\begin{lst}{c}{include/bootinfo.h}
+#define BOOTINFO_MAX_MEM  32
+#define BOOTINFO_MAX_MODS 16
+
+enum mem_type { MEM_USABLE = 1, MEM_RESERVED = 2 };
+
+struct mem_region  { uint64_t base, length; enum mem_type type; };
+struct boot_module { uint64_t start, end; char name[32]; };  /* physical; end is exclusive */
+
+struct bootinfo {
+    struct mem_region  mem[BOOTINFO_MAX_MEM];   unsigned nmem;
+    struct boot_module mods[BOOTINFO_MAX_MODS]; unsigned nmods;   /* initrd and other modules */
+    uint64_t           kernel_start, kernel_end;    /* physical range of the kernel image   */
+    char               cmdline[256];
+    const void        *fdt;                         /* the devicetree on the ports, or NULL */
+    const char        *console;                     /* a hint: "com1", or /chosen stdout-path */
+};
+\end{lst}
+
+On x86, \code{arch_early_init} calls \code{bootinfo_from_multiboot(bi, magic, mbi)} in
+\code{kernel/arch/i386/multiboot.c}, which does what Phases~2, 5 and 10 did inline: it checks the magic
+\code{0x2BADB002}, copies the memory map (flags bit~6) with type~1 as \code{MEM_USABLE} and everything else as
+\code{MEM_RESERVED}, then the modules (bit~3) and the command line (bit~2), all read through \code{P2V}. It takes the
+kernel's range from the linker symbols through \code{V2P}, sets \code{console} to \code{"com1"} and leaves \code{fdt}
+\code{NULL}. The PMM becomes \code{pmm_init(const struct bootinfo *bi)}, and \code{kmain(struct bootinfo *bi)} never
+sees Multiboot again.
+\verify{The \code{mem} command prints the same regions and free-frame count as in version 1.0, with \code{-m 128} and
+with \code{-m 512}. \code{grep -rln multiboot kernel lib include} lists only files under \code{kernel/arch/i386/}.}
+
+\task{Memory layout and the MMU behind an interface}
+Move the layout constants into \code{<arch/memlayout.h>}: \code{KERNEL_BASE} (\code{0xC0000000}, Phase~6's
+\code{KERNEL_VMA} renamed), \code{USER_BASE} (\code{0x00400000}), \code{USER_STACK_TOP} (\code{KERNEL_BASE} on x86),
+\code{PAGE_SIZE} (moved from \code{pmm.h}), \code{DIRECT_MAP_SIZE}, and \code{P2V} and \code{V2P} unchanged.
+
+Then split the VMM. Generic code keeps the policy: \code{struct addrspace} (\code{include/vm.h}, holding the
+\code{struct arch_space} of \code{<arch/mmu.h>}, on x86 the page directory), the ELF loader, \code{brk}, stack growth
+and copy-on-write. Each architecture provides the mechanism, the \code{arch_mmu_*} functions, and translates the
+generic flags into its PTE bits. On x86, \code{VM_WRITE} and \code{VM_USER} become \code{PG_WRITE} and
+\code{PG_USER}, \code{VM_COW} becomes Phase~11's \code{0x200} (a bit left to the OS), and \code{VM_READ} and
+\code{VM_EXEC} need no bit, because 32-bit paging has neither a read bit nor an NX bit. Every \code{arch_mmu_} call
+leaves the TLB correct for the address it changed; \code{arch_mmu_init_space} copies the kernel half (PDEs
+768--1023), and \code{arch_mmu_switch} replaces the CR3 load in \code{schedule()}. The copy-on-write case of
+Phase~11 now reads as generic code, and Phases 17 and 18 inherit it unchanged:
+
+\begin{lst}{c}{kernel/mm/fault.c (copy-on-write)}
+static bool cow_fault(struct addrspace *as, uintptr_t va)    /* va: page-aligned */
+{
+    paddr_t old, copy;
+    unsigned fl;
+    if (!arch_mmu_lookup(as, va, &old, &fl) || !(fl & VM_COW))
+        return false;
+    fl = (fl & ~VM_COW) | VM_WRITE;
+    if (pmm_refcount(old) == 1)                       /* last user: just take it back */
+        return arch_mmu_protect(as, va, fl) == 0;
+    if (!(copy = pmm_alloc_frame()))
+        return false;
+    memcpy(P2V(copy), P2V(old), PAGE_SIZE);
+    arch_mmu_unmap(as, va);
+    arch_mmu_map(as, va, copy, fl);
+    pmm_unref(old);
+    return true;
+}
+\end{lst}
+
+\code{page_fault(tf)}, called by each port's trap code, gets a \code{struct fault_info} from \code{arch_fault_info},
+tries \code{cow_fault} for a write to a present page below \code{KERNEL_BASE}, then Phase~11's lazy heap and stack
+growth for a page that isn't present. Only then does it print the report (address, access, mode, \code{tf_pc(tf)}) and
+send \code{SIGSEGV}, or panic for a fault in the kernel.
+\verify{\code{grep -rnE 'pde_t|PG_[A-Z]|invlpg|cr3' kernel lib include | grep -v '^kernel/arch/i386/'} finds
+nothing. The Phase~6 VMM tests, \code{cow_frames} and the \code{brk} test pass, and \code{crash null} still prints a
+decoded report.}
+
+\task{Consoles and input that any board can provide}
+Phase~2's console layer called the VGA and serial drivers by name. Make it a registry, and give input one entry point:
+the PS/2 keyboard's handler (x86 only) and a UART's receive interrupt (every board) both call \code{tty_input_char},
+which feeds Phase~14's line discipline. Then split the serial driver, as the portability note of Task~2.6 suggested.
+Everything about the 16550 (init, transmit, receive) moves to \code{kernel/drivers/uart16550.c} and reaches the
+registers only through two accessors. The RISC-V \code{virt} board has the same chip, memory-mapped, so Phase~17 reuses
+the file with a base address from the devicetree.
+
+\begin{lst}{c}{include/console.h and kernel/drivers/uart16550.c (core)}
+struct console {
+    const char     *name;                        /* "vga", "com1", "uart0"          */
+    void          (*putc)(struct console *c, char ch);
+    struct console *next;
+};
+void console_register(struct console *c);        /* kprintf now also prints here    */
+void tty_input_char(char c);                     /* every input device ends up here */
+
+enum { UART_DATA = 0, UART_IER = 1, UART_FCR = 2, UART_LCR = 3, UART_MCR = 4, UART_LSR = 5 };
+
+struct uart16550 {
+    struct console con;
+    uintptr_t      base;               /* an I/O port, or the registers' virtual address */
+    unsigned       shift;              /* register n is at base + (n << shift)           */
+    uint8_t      (*read)(const struct uart16550 *u, unsigned reg);
+    void         (*write)(const struct uart16550 *u, unsigned reg, uint8_t val);
+};
+
+uint8_t uart_mmio_read(const struct uart16550 *u, unsigned reg)
+{
+    return *(volatile uint8_t *)(u->base + (reg << u->shift));
+}
+
+void uart16550_irq(struct uart16550 *u)          /* the port's IRQ handler calls this  */
+{
+    while (u->read(u, UART_LSR) & 0x01)          /* data ready: drain the receive FIFO */
+        tty_input_char((char)u->read(u, UART_DATA));
+}
+\end{lst}
+
+\code{uart_putc}, the \code{con.putc} of every 16550, waits for bit~5 of the line status register and writes the data
+register, both through the accessors. The x86 side supplies port I/O accessors (\code{inb} and \code{outb} on
+\code{base + reg}) in \code{kernel/arch/i386/uart_pio.c} and registers COM1 at \code{0x3F8}. Turn on serial
+\emph{input} on x86 too, because it is the path the ports depend on: set bit~0 of the interrupt enable register
+(received data available), write \code{0x0B} instead of Phase~2's \code{0x03} to the modem control register (OUT2
+connects the UART's interrupt line to the PIC on a PC), unmask IRQ~4, and call \code{uart16550_irq} from its handler.
+\verify{Boot output appears on the screen and in the \code{-serial stdio} terminal exactly as before. Keys typed into
+the terminal reach \code{tsh} through IRQ~4, with editing and Ctrl+C working as on the PS/2 keyboard.}
+
+\task{Make the generic code 64-bit clean}
+Compile with \code{-Wall -Wextra -Wformat=2}, and mark \code{kprintf} with
+\code{__attribute__((format(printf, 1, 2)))} so every format string is checked. GCC warns about casts between pointers
+and integers of a different size by default (\code{-Wpointer-to-int-cast}, \code{-Wint-to-pointer-cast}). Teach
+\code{kvprintf} the \code{l}, \code{ll} and \code{z} modifiers (\texttt{\%lx}, \texttt{\%llx}, \texttt{\%zu}). Fix what
+the warnings show with the rules of the concepts section, and watch plain \code{char}: \code{if (c < 0)} is always
+false on both ports (\code{-Wextra} says so, through \code{-Wtype-limits}), and a byte above \code{0x7F} used as an
+index goes negative on x86.
+
+On x86 alone, half of these mistakes stay silent, so add a target that compiles every generic file with both new
+compilers and \code{-Werror}. Nothing is linked; the point is to let a 64-bit compiler read every line.
+
+\begin{lst}{make}{Makefile (check-generic)}
+CHECK_CFLAGS := -std=gnu11 -ffreestanding -O2 -Wall -Wextra -Werror -Wformat=2 \
+                -Iinclude -Ikernel/arch/none/include
+GENERIC_SRCS := $(filter-out kernel/arch/%,$(wildcard kernel/*.c kernel/*/*.c lib/*.c))
+
+build/check/riscv32/%.o: %.c
+	@mkdir -p $(dir $@)
+	riscv32-elf-gcc -march=rv32imac_zicsr_zifencei -mabi=ilp32 $(CHECK_CFLAGS) -c $< -o $@
+build/check/aarch64/%.o: %.c
+	@mkdir -p $(dir $@)
+	aarch64-elf-gcc -mgeneral-regs-only $(CHECK_CFLAGS) -c $< -o $@
+
+check-generic: $(foreach t,riscv32 aarch64,$(patsubst %.c,build/check/$(t)/%.o,$(GENERIC_SRCS)))
+	@echo "generic code compiles for riscv32 and aarch64"
+.PHONY: check-generic
+\end{lst}
+
+\begin{decisionbox}{Which arch/ headers does check-generic use?}
+The real RISC-V and ARM headers don't exist until Phases 17 and 18, so create \code{kernel/arch/none/include/arch/}:
+compile-only stubs with plausible types (a trap frame of \code{unsigned long} registers, a 64-bit high-half
+\code{KERNEL_BASE} when pointers are 64 bits, accessors that compile but mean nothing). Only \code{check-generic} uses
+them, and nothing links against them. Writing the real port headers now would mean designing the RISC-V trap frame
+before reading the privileged specification. Phase~17 switches the \code{riscv32} rule to its real headers; Phase~18
+does the same for \code{aarch64} and deletes \code{arch/none}.
+\end{decisionbox}
+\verify{\code{make check-generic} ends with its message and no warnings. Put \code{uint32_t x = (uint32_t)ptr;} into
+any generic file: the aarch64 rule now fails with GCC's \code{cast from pointer to integer of different size}. Take it
+out again, and \code{make ARCH=i386 test} still passes.}
+
+\task{Read a devicetree}
+Write \code{lib/fdt.c}, a small read-only parser that both ports call from \code{arch_early_init} to fill
+\code{struct bootinfo} and find their devices. Keep it free of kernel dependencies (only \code{<stdint.h>},
+\code{<stddef.h>} and string functions that both \code{lib/string.c} and the host C library have), so it can be tested
+on Linux as Phase~0 tested the warm-up library.
+
+Its interface in \code{include/fdt.h} is \code{fdt_check(fdt)}, \code{fdt_next_node(fdt, node, &depth)},
+\code{fdt_find_node(fdt, path)}, \code{fdt_getprop(fdt, node, name, &len)},
+\code{fdt_next_compatible(fdt, after, compat)}, \code{fdt_reg(fdt, node, i, &base, &size)} and \code{fdt_be32(p)};
+nodes are \code{int} offsets and $-1$ means ``none''. \code{fdt_check} compares the magic number, refuses a
+\code{last_comp_version} above 17 (the version this parser knows), and checks that every block lies inside
+\code{totalsize}. A node is the offset of its \code{FDT_BEGIN_NODE} token in the structure block, and everything else
+is built on one walker that steps from node to node, keeps track of the depth, and never trusts a length:
+
+\begin{lst}{c}{lib/fdt.c (the core)}
+#define FDT_MAGIC 0xd00dfeedu
+enum { FDT_BEGIN_NODE = 1, FDT_END_NODE = 2, FDT_PROP = 3, FDT_NOP = 4, FDT_END = 9 };
+
+uint32_t fdt_be32(const void *p)                 /* byte by byte: any alignment, any CPU */
+{
+    const uint8_t *b = p;
+    return (uint32_t)b[0] << 24 | (uint32_t)b[1] << 16 | (uint32_t)b[2] << 8 | b[3];
+}
+static uint32_t hdr(const void *fdt, int i) { return fdt_be32((const uint8_t *)fdt + 4 * i); }
+static uint32_t align4(uint32_t n) { return (n + 3) & ~3u; }
+
+int fdt_next_node(const void *fdt, int node, int *depth)
+{
+    const uint8_t *s = (const uint8_t *)fdt + hdr(fdt, 2);   /* off_dt_struct  */
+    uint32_t end = hdr(fdt, 9), off, len;                    /* size_dt_struct */
+    if (node < 0) {                                          /* the root node  */
+        *depth = 0;
+        return fdt_be32(s) == FDT_BEGIN_NODE ? 0 : -1;
+    }
+    off = node + 4 + align4(strlen((const char *)s + node + 4) + 1);   /* token, name */
+    while (off + 4 <= end) {
+        switch (fdt_be32(s + off)) {
+        case FDT_BEGIN_NODE: (*depth)++; return (int)off;
+        case FDT_END_NODE:   (*depth)--; off += 4; break;
+        case FDT_NOP:        off += 4; break;
+        case FDT_PROP:                                       /* len, nameoff, value */
+            if (end - off < 12 || (len = fdt_be32(s + off + 4)) > end - off - 12)
+                return -1;
+            off += 12 + align4(len);
+            break;
+        default:             return -1;                      /* FDT_END, or corrupt */
+        }
+    }
+    return -1;
+}
+\end{lst}
+
+\code{fdt_getprop} walks the properties after a node's name up to its first child. \code{fdt_find_node} matches a
+path one component per depth. \code{fdt_reg} reads the \emph{parent's} \texttt{\#address-cells} and
+\texttt{\#size-cells} (the defaults are 2 and 1) and joins one or two cells into each 64-bit value. Test it in
+\code{tests/host/test_fdt.c}, compiled with the host \code{gcc} and \code{-fsanitize=address,undefined} as in Phase~0,
+against facts from the \code{dtc} output of the riscv32 blob: \code{/memory@80000000} has base \code{0x80000000} and
+size 128\,MiB (QEMU's default \code{-m}); the first \code{ns16550a} node has base \code{0x10000000} and
+\code{interrupts} 10; \code{/cpus} has a \code{timebase-frequency} of 10\,000\,000; there are eight
+\code{virtio,mmio} nodes; and \code{/chosen} has a \code{stdout-path}. Write the same kind of test for the aarch64 blob
+(its memory node, the PL011, the timer). Finally, try to break the parser: flip a byte of the magic, make
+\code{off_dt_struct} plus \code{size_dt_struct} point past \code{totalsize}, set a property's length to
+\code{0xFFFFFFF0}. Each must give an error, never a crash or an endless loop.
+\verify{The host tests pass on both blobs under the address and undefined-behaviour sanitizers, the corrupted blobs
+are rejected, and \code{lib/fdt.c} also compiles in \code{make check-generic}.}
+
+\task{One Makefile, three architectures}
+Make the architecture a build variable. What differs per architecture moves into \code{kernel/arch/$(ARCH)/arch.mk}:
+cross prefix, extra flags, sources, linker script, debugger, how to run QEMU, and how a test run reports success. The
+\code{GDB} line from \code{docs/setup.md}, section~4, moves there too (section~9.4). Output goes to
+\code{build/$(ARCH)/}, so objects of different architectures never mix.
+
+\begin{lst}{make}{Makefile (the parts that change), then kernel/arch/i386/arch.mk}
+ARCH     ?= i386
+ARCH_DIR := kernel/arch/$(ARCH)
+BUILD    := build/$(ARCH)
+ifeq ($(wildcard $(ARCH_DIR)/arch.mk),)
+$(error unknown ARCH '$(ARCH)': there is no $(ARCH_DIR)/arch.mk)
+endif
+include $(ARCH_DIR)/arch.mk
+CC     := $(CROSS)gcc
+CFLAGS += $(ARCH_CFLAGS) -Iinclude -I$(ARCH_DIR)/include
+OBJS   := $(addprefix $(BUILD)/,$(addsuffix .o,$(basename $(GENERIC_SRCS) $(ARCH_SRCS))))
+# run, debug and test use $(QEMU) $(QEMU_FLAGS); test adds $(QEMU_TEST_FLAGS)
+# and compares QEMU's exit status with $(TEST_PASS_STATUS)
+
+# ---- kernel/arch/i386/arch.mk ----
+CROSS            := i686-elf-
+ARCH_SRCS        := $(wildcard kernel/arch/i386/*.c kernel/arch/i386/*.s)
+LDSCRIPT         := kernel/arch/i386/kernel.ld
+GDB              := $(call find_tool,i386-elf-gdb gdb)
+QEMU             := qemu-system-i386
+QEMU_FLAGS       := -kernel $(BUILD)/kernel.elf -serial stdio
+QEMU_TEST_FLAGS  := -append "test" -display none -no-reboot \
+                    -device isa-debug-exit,iobase=0xf4,iosize=0x04
+# isa-debug-exit: QEMU exits with 2 * value + 1, and a passing run writes 0
+TEST_PASS_STATUS := 1
+# ... plus the NASM pattern rule for the .s files, which only x86 has
+\end{lst}
+
+Do the same for user space: \code{crt0.s} and the system call stubs move to \code{user/arch/i386/}, and user programs
+get their own flags without \code{-Ikernel}. Phases 17 and 18 add the \code{arch.mk} files for \code{riscv32-elf-}
+and \code{aarch64-elf-}; until then \code{make ARCH=riscv32} stops with the error.
+\verify{\code{make} and \code{make ARCH=i386} build the same \code{build/i386/kernel.elf}; \code{make ARCH=i386 run},
+\code{debug} and \code{test} work; \code{make ARCH=sparc} prints the error; nothing is written to \code{build/} outside
+\code{build/i386/} and \code{build/check/}.}
+
+\task{Prove that nothing broke}
+A refactoring is finished when the behaviour is provably the same. Run Phase~15's safety net against the new tree
+and compare with your v1.0 benchmark table.
+
+\begin{enumerate}
+  \item \code{make clean && make ARCH=i386 test}: every ktest and user-space test passes.
+  \item Four fuzzers and the stress script of Task~15.1 for ten minutes: no panic, no growth in memory use.
+  \item The benchmarks of Task~15.5, above all the null system call (now through \code{syscall_dispatch} and six
+        \code{tf_arg} calls) and the context switch (now \code{arch_switch}).
+  \item \code{make check-generic} and the FDT host tests, from now on before every commit.
+\end{enumerate}
+
+If the null system call got slower, read the machine code before guessing:
+\code{i686-elf-objdump -d build/i386/kernel/syscall/syscall.o} must show no \code{call} to a \code{tf_} function (an
+accessor declared without \code{static inline} ends up out of line). Record the numbers in \code{docs/porting.md}.
+\verify{All four items pass, and every benchmark is within a few per cent of its Phase~15 value (repeat the runs and
+compare medians before deciding that a difference is real).}
+
+\section{Testing and debugging}
+
+\begin{pitfalls}
+A change to an x86 header has no effect, or two definitions clash & A stale \code{include/arch/} directory, or a leftover \code{-Iinclude/arch}, is found before \code{kernel/arch/$(ARCH)/include} & Delete the old directory; print the search path with \code{i686-elf-gcc -E -v} and check its order. \\
+The child of \code{fork} crashes or returns garbage & \code{arch_task_init} built the first context over the trap frame at the top of the kernel stack, or code still writes \code{tf->eax} & Build the context below \code{t->tf} when it is set; grep for field names outside \code{kernel/arch}. \\
+\code{fdt_check} fails; the magic reads \code{0xedfe0dd0} & The header was read as a little-endian \code{uint32_t} & Read every cell through \code{fdt_be32}. \\
+RAM above 4\,GiB, or a large region, is missing or wrong on one target & A \code{uint64_t} base or length passed through a \code{uint32_t} or \code{uintptr_t} on the way into \code{bootinfo} & Keep firmware values 64-bit until the PMM clips them to what it can map. \\
+Benchmarks several per cent slower & Accessors became function calls, or \code{arch_switch} gained work & Look for \code{call} in \code{objdump -d}; keep hot helpers \code{static inline}. \\
+\end{pitfalls}
+
+\section{Milestone}
+
+\begin{milestonebox}[Portable core]
+\begin{checklist}
+  \item Generic code is free of x86: every row of the audit in \code{docs/porting.md} is done, and the searches of
+        Task~16.2 find nothing outside \code{kernel/arch/i386}.
+  \item \code{make ARCH=i386 test} passes; ten minutes of fuzzing cause no panic; the benchmarks are within a few
+        per cent of Phase~15.
+  \item \code{make check-generic} compiles every generic file for \code{riscv32} and \code{aarch64} without warnings.
+  \item The FDT parser passes its host tests on both QEMU blobs under the sanitizers.
+  \item \code{include/arch.h}, the trap frame accessors, \code{struct bootinfo}, \code{arch_mmu_*},
+        \code{console_register} and \code{tty_input_char} are in place; serial input works on x86.
+  \item Both new cross compilers, both QEMU boards, \code{dtc} and a GDB for all three architectures are installed and
+        smoke-tested.
+\end{checklist}
+\end{milestonebox}
+
+\begin{questionbox}
+\begin{enumerate}
+  \item What is the difference between the architecture and the board? Why does x86 keep both in one directory?
+  \item Why are some parts of the interface inline headers and others functions in \code{include/arch.h}? What would
+        happen to the null system call if \code{tf_arg} were a function?
+  \item Where in Turk-OS was an \texttt{\#ifdef} most tempting, and what did you do instead?
+  \item The devicetree is big-endian, and all three targets are little-endian. What would go wrong without
+        \code{fdt_be32}, and how would you notice?
+  \item Why can one TurkFS image work on all three targets, and which kinds of change to its structures would break
+        that?
+  \item Which subsystems needed no change at all, and what does that say about their design?
+\end{enumerate}
+\end{questionbox}
+
+\section{Going further}
+
+Add a fourth architecture that is not a machine: \code{kernel/arch/host} runs the generic kernel as a Linux process,
+with \code{mmap} standing in for page tables, so the ktests of the heap, the scheduler and TurkFS run in a second under
+the sanitizers (User-Mode Linux does this for all of Linux). Run \code{make check-generic} and the host tests from a
+Git pre-commit hook. Generate the system call table, the user stubs of every architecture and \code{docs/syscalls.md}
+from one list. Or add Clang to \code{check-generic}: \code{clang --target=riscv32-unknown-elf} and
+\code{--target=aarch64-unknown-elf} need no toolchain build, and a second compiler finds different mistakes.
+
+\nextphase{17}{The RISC-V Port}
+\booklegend
+\portlegend
+\end{document}

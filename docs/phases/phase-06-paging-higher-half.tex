@@ -352,6 +352,15 @@ void vmm_map(pde_t *pd, uintptr_t va, uintptr_t pa, uint32_t flags)
 \code{P2V} of the frame's physical address. After \code{vmm_unmap}, \code{vmm_virt_to_phys} returns 0 and an access
 page-faults with ``page not present''.}
 
+\begin{tipbox}[Portability note]
+Page tables are where architectures differ most. Once this task works, keep everything that knows the x86 format
+(\code{pde_t}, \code{pte_t}, the \code{PG_} bits, CR3 and \code{invlpg}) in \code{kernel/arch/i386/paging.c}, and let
+the rest of the kernel call only \code{vmm_map}, \code{vmm_unmap} and \code{vmm_virt_to_phys}, with generic flags of
+your own (\code{VM_WRITE}, \code{VM_USER}) that \code{paging.c} translates into PTE bits. Phase 16 puts these calls
+behind the architecture interface as \code{arch_mmu_map} and friends, and the Sv32 tables of Phase 17 and the AArch64
+tables of Phase 18 plug in behind them.
+\end{tipbox}
+
 \task{Pre-allocate the kernel's page tables}
 In Phase 10 every process gets its own page directory, created by copying PDEs 768--1023 from the kernel's. If the
 kernel later creates a new page table in its own directory (say, because the heap grew into a new 4\,MiB region),

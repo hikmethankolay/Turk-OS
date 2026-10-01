@@ -1,7 +1,8 @@
 # Turk-OS documentation
 
 This folder holds the **Turk-OS study plan**, a roadmap and one document per phase that take the project from an empty
-folder to Turk-OS 1.0. It also holds the working documents that the plan asks you to keep while building.
+folder to Turk-OS 1.0 on x86, then port it to RISC-V and ARM for Turk-OS 2.0. It also holds the working documents
+that the plan asks you to keep while building.
 For the project overview, see the [main README](../README.md).
 
 ## Contents
@@ -20,12 +21,12 @@ For the project overview, see the [main README](../README.md).
 
 | File | What it is |
 |---|---|
-| [`setup.md`](setup.md) | Development environment setup for Arch, Fedora, Ubuntu/Debian, macOS and Windows (WSL2): host packages, the cross compiler, editor, verification |
+| [`setup.md`](setup.md) | Development environment setup for Arch, Fedora, Ubuntu/Debian, macOS and Windows (WSL2): host packages, the cross compiler, editor, verification, and the toolchains for the ports (section 9) |
 | [`journal.md`](journal.md) | The lab journal: one entry per work session (started in Phase 0) |
 | [`pdf/`](pdf/) | The study plan as PDFs, ready to read (committed to Git) |
 | [`00-roadmap.tex`](00-roadmap.tex) | Source of the roadmap |
-| [`phases/`](phases/) | Sources of the sixteen phase documents |
-| [`common/turkos.sty`](common/turkos.sty) | Shared LaTeX style: colours, title banner, boxes, tables, code listings |
+| [`phases/`](phases/) | Sources of the nineteen phase documents |
+| [`common/turkos.sty`](common/turkos.sty) | Shared LaTeX style: colours, title banner, boxes, tables, code listings, book and reference chips |
 | [`Makefile`](Makefile), [`.latexmkrc`](.latexmkrc) | Build rules for the PDFs |
 
 ---
@@ -33,10 +34,11 @@ For the project overview, see the [main README](../README.md).
 ## The study plan
 
 Start with the roadmap, then read one phase at a time. Don't start a phase until the previous milestone is fully met.
+Phases 0–15 (Stages I–IV) lead to Turk-OS 1.0; Stage V (Phases 16–18) ports it to RISC-V and ARM.
 
 | Document | Stage | Topic | Weeks | Difficulty | Progress |
 |---|---|---|:---:|:---:|:---:|
-| [Roadmap](pdf/00-roadmap.pdf) · [source](00-roadmap.tex) | | How to use the plan, the five books, technical decisions, phase map, timeline, final architecture, risks, master tracker | | | |
+| [Roadmap](pdf/00-roadmap.pdf) · [source](00-roadmap.tex) | | How to use the plan, the five books and the Stage V references, technical decisions, phase map, timeline, the 1.0 and 2.0 architectures, risks, master tracker | | | |
 | [Phase 0](pdf/phase-00-foundations.pdf) · [source](phases/phase-00-foundations.tex) | I · Bare metal | Foundations and toolchain | 2–3 | 1/5 | 0 → 5 % |
 | [Phase 1](pdf/phase-01-assembly-and-boot.pdf) · [source](phases/phase-01-assembly-and-boot.tex) | I · Bare metal | x86 assembly and the boot process | 2–3 | 3/5 | 5 → 10 % |
 | [Phase 2](pdf/phase-02-output-drivers.pdf) · [source](phases/phase-02-output-drivers.tex) | I · Bare metal | Getting to C: screen, serial and `kprintf` | 1–2 | 2/5 | 10 → 16 % |
@@ -53,9 +55,14 @@ Start with the roadmap, then read one phase at a time. Don't start a phase until
 | [Phase 13](pdf/phase-13-file-systems.pdf) · [source](phases/phase-13-file-systems.tex) | IV · Persistence | File systems: VFS, initrd and TurkFS | 3–4 | 5/5 | 83 → 90 % |
 | [Phase 14](pdf/phase-14-userland-shell.pdf) · [source](phases/phase-14-userland-shell.tex) | IV · Persistence | Userland: libc, shell and utilities | 3 | 4/5 | 90 → 96 % |
 | [Phase 15](pdf/phase-15-hardening-release.pdf) · [source](phases/phase-15-hardening-release.tex) | IV · Persistence | Hardening, polish and release: Turk-OS 1.0 | 3–4+ | 4/5 | 96 → 100 % |
+| [Phase 16](pdf/phase-16-portability-layer.pdf) · [source](phases/phase-16-portability-layer.tex) | V · Ports | Portability: an architecture layer | 2–3 | 3/5 | V: 0 → 20 % |
+| [Phase 17](pdf/phase-17-riscv-port.pdf) · [source](phases/phase-17-riscv-port.tex) | V · Ports | The RISC-V port | 5–6+ | 4/5 | V: 20 → 60 % |
+| [Phase 18](pdf/phase-18-arm-port.pdf) · [source](phases/phase-18-arm-port.tex) | V · Ports | The ARM port, and Turk-OS 2.0 | 5–6+ | 5/5 | V: 60 → 100 % |
 
 The progress column estimates how much of the whole journey is behind you when that phase's milestone is met.
-Durations assume 10–12 hours a week, about 43 weeks in total.
+Stage V has its own scale, marked V, measured toward Turk-OS 2.0; the 1.0 scale of Phases 0–15 does not change.
+Durations assume 10–12 hours a week: about 43 weeks to Turk-OS 1.0 and about 58 weeks to Turk-OS 2.0. A + means
+optional work on top of the estimate (the tracks of Phase 15 and the hardware milestones of Phases 17 and 18).
 
 ### What each phase covers
 
@@ -107,6 +114,17 @@ Durations assume 10–12 hours a week, about 43 weeks in total.
 
 </details>
 
+<details>
+<summary><b>Stage V: Ports (Phases 16–18)</b>. An architecture layer, then Turk-OS on RISC-V and on ARM: Turk-OS 2.0.</summary>
+
+| Phase | Tasks |
+|---|---|
+| **16** Portability | Two more cross compilers, two QEMU boards, dtc and a multi-architecture GDB · find every place x86 leaked · move x86 into its corner · the architecture interface · one trap frame for generic code · boot information without Multiboot · memory layout and the MMU behind an interface · consoles and input that any board can provide · make the generic code 64-bit clean · read a devicetree · one Makefile, three architectures · prove that nothing broke |
+| **17** RISC-V | Meet the board · the first instructions · the 16550 again, memory-mapped · traps · time and interrupts · memory from the devicetree · Sv32 and the higher half · tasks and locks · into user mode and back · a disk on virtio · userland for RV32 · `make test` on RISC-V · optional: Turk-OS on Timur-RV32IMC |
+| **18** ARM | Meet the board · the first instructions · a new UART: the PL011 · exception vectors · interrupts and time · the MMU, carefully · sixty-four bits everywhere · tasks and locks · into EL0 and back · virtio again, and the whole userland · Turk-OS 2.0 · optional: Raspberry Pi 4 |
+
+</details>
+
 ---
 
 ## How a phase document is organised
@@ -115,18 +133,18 @@ Every phase document has the same sections in the same order, so you always know
 
 | Section | What you find there |
 |---|---|
-| **Title banner and progress bar** | Phase number, title, one-line goal, and the overall progress this phase covers (in red) |
+| **Title banner and progress bar** | Phase number, title, one-line goal, and the overall progress this phase covers (in red). Stage V documents show their own bar, *Stage V progress toward Turk-OS 2.0* |
 | **At a glance** | Duration, difficulty (1–5 stars), what you need before starting, and what you will have at the end |
 | **Why this phase** | Where the phase fits and what problem it solves |
 | **Concepts you need** | The ideas to understand *before* writing code, with diagrams. Blue *concept* boxes hold key definitions |
 | **Reading plan** | Book chapters with printed page numbers, each marked REQUIRED, RECOMMENDED or OPTIONAL, and why to read it |
-| **Real-system lens** | How MINIX 3 does the same thing, with pointers into the printed source |
+| **Real-system lens** | How MINIX 3 does the same thing, with pointers into the printed source. Stage V documents look at xv6-riscv, Linux and MINIX's ARM port instead |
 | **Build it** | Numbered tasks (Task 3.4 is phase 3, task 4) with starter code. Each ends with a green **Verify** line: the task isn't finished until that check passes |
 | **Testing and debugging** | A table of symptom → likely cause → fix for the bugs this phase usually produces |
 | **Milestone** | The exit criteria as a checklist. The phase is done when every box is ticked |
 | **Self-check questions** | Answer them without looking. If you can't, go back to the reading |
 | **Going further** | Stretch goals for when you finish early |
-| **Books used** | The legend of book codes at the end of every document |
+| **Books used** | The legend of book codes at the end of every document; Stage V documents add a second legend for the port references |
 
 Coloured boxes appear throughout:
 
@@ -135,7 +153,7 @@ Coloured boxes appear throughout:
 | Concept (blue) | A definition or idea you must understand |
 | Hint (green) | A tip, a shortcut or a way out when something fails |
 | Watch out (amber) | A common trap, or a command that can do damage |
-| Real-system lens (MINIX) | How MINIX 3 solves the same problem |
+| Real-system lens (MINIX) | How MINIX 3 solves the same problem (or, in Stage V, xv6-riscv or Linux) |
 | Decision (navy) | A design choice and the reasoning behind it |
 | Exit criteria (red) | The milestone checklist |
 | Self-check questions | Questions to test your understanding |
@@ -168,6 +186,16 @@ the MINIX lens.
 The books are not part of this repository. The ISBNs of the editions the plan cites are in the
 [main README](../README.md#books-and-references) and in the roadmap.
 
+Stage V (Phases 16–18) also cites free references, with chips of their own. Specifications are revised often, so
+those rows give the chapter or section title and `--` in the Pages column.
+
+| Code | Reference | Used for | Where to get it |
+|---|---|---|---|
+| **XV6** | Cox, Kaashoek and Morris, *xv6: a simple, Unix-like teaching operating system*, RISC-V edition | A small UNIX kernel on RISC-V, chapter by chapter | Free at [pdos.csail.mit.edu/6.1810](https://pdos.csail.mit.edu/6.1810/), source at [github.com/mit-pdos/xv6-riscv](https://github.com/mit-pdos/xv6-riscv) |
+| **RISCV** | *The RISC-V Instruction Set Manual*, Volumes I and II; the *RISC-V Supervisor Binary Interface Specification* | Instructions, CSRs, traps, Sv32 paging, SBI calls | Free at [riscv.org](https://riscv.org/specifications/ratified/) and [github.com/riscv-non-isa/riscv-sbi-doc](https://github.com/riscv-non-isa/riscv-sbi-doc) |
+| **ARM** | *Arm Architecture Reference Manual for A-profile architecture* (DDI 0487); Arm's *Learn the architecture* guides | Exception levels, the MMU, the generic timer, the GIC | Free at [developer.arm.com/documentation](https://developer.arm.com/documentation) |
+| **SPEC** | *Devicetree Specification*; OASIS *Virtio*; QEMU's documentation of the `virt` boards | The devicetree parser, the virtio-blk driver, the boards | Free at [devicetree.org](https://www.devicetree.org/specifications/), [docs.oasis-open.org/virtio](https://docs.oasis-open.org/virtio/virtio/), [qemu.org](https://www.qemu.org/docs/master/system/) |
+
 Three conventions matter when you look things up:
 
 - **Page numbers are printed page numbers** of the editions above, not PDF page indices. A PDF viewer's page box
@@ -192,7 +220,8 @@ The plan asks you to keep these files in `docs/`, next to the plan itself. Creat
 | Boundary audit table | Phase 15 | Every system call argument and how it is validated |
 | Benchmark results | Phase 15 | The benchmark table, with one optimisation measured before and after |
 | Architecture document | Phase 15 | Overview diagram, each subsystem, memory maps, system call table, lock order, TurkFS format, how to build, run, test and debug, known limitations (LaTeX next to the plan, or Markdown) |
-| Design reflection | Phase 15 | Three to five pages comparing each Turk-OS subsystem with MINIX 3 and Linux |
+| Design reflection | Phase 15 | Three to five pages comparing each Turk-OS subsystem with MINIX 3 and Linux; Phase 18 adds a porting chapter |
+| `porting.md` | Phase 16 | The x86 leak audit (file, line, leak, fix) and notes on the architecture interface; Phases 17 and 18 add what each port taught you |
 
 The lock order itself lives in code, in a comment block in `include/locks.h` (Phase 9).
 
@@ -265,8 +294,10 @@ file in `phases/` automatically. Start from this skeleton:
 \usepackage{turkos}
 
 \begin{document}
+% Stage V only: label the bar with its own scale, before \phaseheader
+% \renewcommand{\progresslabel}{Stage V progress toward Turk-OS 2.0 (this phase in red)}
 % number, title, one-line goal, overall progress from, to (percent)
-\phaseheader{16}{Title}{One-line goal of the phase}{100}{100}
+\phaseheader{19}{Title}{One-line goal of the phase}{100}{100}
 
 % duration, difficulty 1-5, prerequisites, outcome
 \ataglance{2 weeks}{3}{What you need first}{What you will have at the end}
@@ -309,24 +340,33 @@ Symptom & Likely cause & Fix. \\
 \end{document}
 ```
 
+A Stage V document also ends with `\portlegend` after `\booklegend`.
+
 The commands and environments `common/turkos.sty` provides:
 
 | Name | Use |
 |---|---|
 | `\phaseheader{n}{title}{goal}{from}{to}` | Title banner with the overall progress bar |
+| `\progresslabel` | The text under the progress bar; Stage V documents redefine it with `\renewcommand` before `\phaseheader` |
 | `\ataglance{duration}{difficulty}{prerequisites}{outcome}` | The *at a glance* box; difficulty is 1–5 stars |
 | `\task{title}`, `\verify{text}` | A numbered build task and its check |
-| `\begin{lst}{language}{caption}` | A code listing with a file name or caption (`c`, `asm`, `make`, `sh`, `plain`) |
+| `\begin{lst}{language}{caption}` | A code listing with a file name or caption (`c`, `asm` for NASM, `rvasm` and `a64asm` for GNU as on RISC-V and AArch64, `make`, `sh`, `plain`) |
 | `\code{text}` | Inline code |
 | `readingplan`, `\must`, `\should`, `\could` | The reading plan table and its REQUIRED / RECOMMENDED / OPTIONAL markers |
 | `\LOB`, `\OSTEP`, `\OSC`, `\MOS`, `\OSDI` | Coloured book chips |
+| `\XVSIX`, `\RVSPEC`, `\ARMDOC`, `\SPEC` | Chips for the Stage V references (printed as XV6, RISCV, ARM, SPEC) |
 | `pitfalls` | The symptom / cause / fix table |
 | `conceptbox{title}`, `tipbox[title]`, `warnbox[title]`, `decisionbox{title}`, `minixbox[title]` | Concept, hint, warning, decision and MINIX boxes |
 | `milestonebox[title]`, `checklist`, `questionbox` | Exit criteria, tick-box list and self-check questions |
 | `\tkth{text}` | A table header cell in the house style |
 | `\tkprogress{from}{to}` | A stand-alone progress bar |
-| `\nextphase{n}{title}`, `\booklegend` | The "next phase" link and the book legend at the end |
+| `\nextphase{n}{title}`, `\booklegend`, `\portlegend` | The "next phase" link, the book legend at the end, and the Stage V reference legend |
 
-Colours are defined once in the style: `tkNavy`, `tkRed`, `tkBlue`, `tkGreen`, `tkAmber`, `tkGray`, the backgrounds
-`tkLight` and `tkCode`, and one colour per book (`bkLOB`, `bkOSTEP`, `bkOSC`, `bkMOS`, `bkOSDI`). Use these names instead of new colours so every document looks
-the same.
+Colours are defined once in the style: `tkNavy`, `tkRed`, `tkBlue`, `tkGreen`, `tkAmber`, `tkGray`, `tkViolet` (the
+Stage V colour), the backgrounds `tkLight` and `tkCode`, one colour per book (`bkLOB`, `bkOSTEP`, `bkOSC`, `bkMOS`,
+`bkOSDI`) and one per Stage V reference (`bkXV`, `bkRV`, `bkARM`, `bkSPEC`). Use these names instead of new colours
+so every document looks the same.
+
+Two LaTeX traps to avoid: `%` inside `\code{...}` starts a comment when the code sits in the
+argument of another command such as `\verify`, so write `\texttt{\%lx}` there; and a TikZ style must not be called
+`x` or `y`, which are built-in TikZ keys.

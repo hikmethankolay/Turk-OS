@@ -12,11 +12,11 @@
   \fill[tkRed, rounded corners=5pt] (0,0) rectangle (0.2\linewidth,4.2cm);
   \fill[tkRed] (0.15\linewidth,0) rectangle (0.2\linewidth,4.2cm);
   \node[font=\sffamily\bfseries\footnotesize, text=white, anchor=north] at (0.1\linewidth,3.85cm) {PHASES};
-  \node[font=\sffamily\bfseries\fontsize{34}{34}\selectfont, text=white] at (0.1\linewidth,2.05cm) {0--15};
+  \node[font=\sffamily\bfseries\fontsize{34}{34}\selectfont, text=white] at (0.1\linewidth,2.05cm) {0--18};
   \node[font=\sffamily\bfseries\fontsize{26}{28}\selectfont, text=white, anchor=north west] at (0.23\linewidth,3.8cm) {Turk-OS};
   \node[font=\sffamily\bfseries\Large, text=white, anchor=north west] at (0.23\linewidth,2.65cm) {Roadmap: from zero to a working OS};
   \node[font=\sffamily\small, text=white!78!tkNavy, anchor=south west, text width=0.74\linewidth, align=left] at (0.23\linewidth,0.35cm)
-    {A 16-phase study and build plan for a UNIX-like 32-bit x86 kernel, based on five operating-system textbooks};
+    {A 19-phase study and build plan for a UNIX-like 32-bit x86 kernel and its RISC-V and ARM ports, based on five operating-system textbooks};
 \end{tikzpicture}
 
 \vspace{0.4em}
@@ -31,18 +31,23 @@ starting point: the authors of \LOB were in a similar position when they wrote i
 folder to \textbf{Turk-OS 1.0}, a small UNIX-like operating system for 32-bit x86 PCs. It boots with GRUB, runs
 preemptive multitasking with separate address spaces, loads ELF programs from its own on-disk file system, and drops
 you into a shell with pipes and redirection. Everything runs in QEMU first. Real hardware is optional.
+A fifth stage then ports Turk-OS to two more architectures, 32-bit RISC-V and 64-bit ARM, and ends at
+\textbf{Turk-OS 2.0}: one source tree whose kernel and userland boot on all three.
 
-The route has sixteen phases, numbered 0 to 15. Each phase has its own PDF in \texttt{docs/pdf/} and ends with a
-concrete, testable milestone. The percentages in each phase header (``0\,\% $\rightarrow$ 5\,\%'') estimate how much of
-the whole journey is behind you when that milestone is met. Phase 15 ends at 100\,\%, and it also lists optional
-tracks for going further.
+The route has nineteen phases, numbered 0 to 18, in five stages. Each phase has its own PDF in \texttt{docs/pdf/}
+and ends with a concrete, testable milestone. The percentages in the headers of Phases 0--15 (``0\,\% $\rightarrow$
+5\,\%'') estimate how much of the road to Turk-OS 1.0 is behind you when that milestone is met. Phase 15 ends at
+100\,\%, tags version 1.0, and also lists optional tracks for going further. The three Stage V documents (Phases
+16--18) show a second bar, \emph{Stage V progress toward Turk-OS 2.0}, on its own scale: Phase 16 takes it from
+0\,\% to 20\,\%, Phase 17 from 20\,\% to 60\,\%, and Phase 18 from 60\,\% to 100\,\%.
 
 Every phase document follows the same layout, so you always know where to look. An \emph{at a glance} box gives the
 duration, difficulty, prerequisites and result. \emph{Why this phase} explains where it fits. \emph{Concepts} explains
 the ideas you must understand before you write code. The \emph{reading plan} lists book chapters with printed page
 numbers, each marked \must, \should or \could. \emph{Build it} breaks the work into numbered tasks with starter
 snippets and a way to verify each one. The document ends with a debugging table, the milestone checklist, self-check
-questions, and stretch goals.
+questions, and stretch goals. The Stage V documents also cite free specifications and the xv6 book; their chips
+are explained in a second legend at the end of those documents, and of this one.
 
 \subsection{The study loop}
 
@@ -52,6 +57,7 @@ The same loop works in every phase. Keep to it, because skipping the reading mak
   \item \textbf{Read the theory first}, usually \OSTEP, then the \must items from the other books.
   \item \textbf{Read the practical chapter} in \LOB (when there is one) to see the concrete x86 steps.
   \item \textbf{Look at a real system.} The MINIX lens box points to the matching \OSDI section and source file.
+    In Stage V the same box looks at xv6-riscv or Linux instead.
   \item \textbf{Build in small steps.} One task at a time, boot after each change, commit when it works.
   \item \textbf{Verify.} Every task has a \emph{Verify} line. A task is not finished until you have checked it.
   \item \textbf{Write it down.} Keep a lab journal (\texttt{docs/journal.md}) with what you tried, what broke and why.
@@ -60,9 +66,11 @@ The same loop works in every phase. Keep to it, because skipping the reading mak
 
 \subsection{Time budget}
 
-The estimates assume about 10--12 hours a week, which adds up to roughly 43 weeks (about ten months). Some phases
-will go faster than planned and some much slower; paging (Phase 6) and processes (Phase 8) are where most people get
-stuck. What counts is meeting each phase's exit criteria. Never start a phase while the previous milestone is still
+The estimates assume about 10--12 hours a week, which adds up to roughly 43 weeks (about ten months) to Turk-OS
+1.0. Stage V adds about 15 weeks, so the whole plan takes about 58 weeks, roughly fourteen months. Some phases will
+go faster than planned and some much slower; paging (Phase 6) and processes (Phase 8) are where most people get
+stuck, and in Stage V it is the traps and the virtio disk of the RISC-V port (Phase 17) and the AArch64 MMU
+(Phase 18). What counts is meeting each phase's exit criteria. Never start a phase while the previous milestone is still
 shaky, because every later phase builds on top of it.
 
 \section{Your five books and how each one is used}
@@ -140,18 +148,34 @@ Specification 0.6.96} defines the contract between GRUB and your kernel. The \te
 syntax. The MIT \textbf{xv6} teaching kernel is a good optional companion: it is small and UNIX-like, and \OSTEP
 refers to it.
 
+Stage V leaves x86, so the Intel manual, Multiboot and NASM no longer apply there. Its documents cite four more
+free references, each with its own chip. \XVSIX is the xv6 book, RISC-V edition, read together with the
+\texttt{xv6-riscv} source: the closest small kernel to what you build in Phase 17. \RVSPEC is the RISC-V
+Instruction Set Manual, Volume I (unprivileged) and Volume II (privileged architecture), plus the RISC-V
+Supervisor Binary Interface (SBI) specification. \ARMDOC is the Arm Architecture Reference Manual for A-profile
+(DDI~0487) together with Arm's shorter \emph{Learn the architecture} guides. \SPEC covers the Devicetree and Virtio
+specifications and QEMU's documentation for its \texttt{virt} boards. The port legend at the end of this document
+gives the full titles and links.
+
 \section{Key technical decisions}
 
-These choices hold for the whole plan. Each one follows from the five books, which keeps your reading and your
-code in step.
+These choices hold for the whole plan. The first eight follow from the five books, which keeps your reading and
+your code in step. The last five add the ports of Stage V and follow from the free specifications instead.
 
-\begin{table}[htbp]
-\centering\small\renewcommand{\arraystretch}{1.4}
-\begin{tabularx}{\linewidth}{@{}>{\raggedright\arraybackslash}p{0.17\linewidth} >{\raggedright\arraybackslash}p{0.27\linewidth} X@{}}
+{\small\renewcommand{\arraystretch}{1.4}
+\begin{xltabular}{\linewidth}{@{}>{\raggedright\arraybackslash}p{0.17\linewidth} >{\raggedright\arraybackslash}p{0.27\linewidth} X@{}}
 \toprule
 \tkth{Decision} & \tkth{Choice} & \tkth{Why} \\
 \midrule
-Target CPU & IA-32 (i386), 32-bit protected mode, BIOS boot & \LOB, \OSDI (MINIX 3) and the Intel examples in \OSC\,\S9.6 are all 32-bit x86. Two-level paging is the simplest real MMU to learn. A 64-bit port is a Phase 15 track. \\
+\endfirsthead
+\toprule
+\tkth{Decision} & \tkth{Choice} & \tkth{Why} \\
+\midrule
+\endhead
+\bottomrule
+\caption{Technical decisions for Turk-OS.}\\
+\endlastfoot
+Target CPU & IA-32 (i386), 32-bit protected mode, BIOS boot & \LOB, \OSDI (MINIX 3) and the Intel examples in \OSC\,\S9.6 are all 32-bit x86. Two-level paging is the simplest real MMU to learn. A 64-bit x86 port stays a Phase 15 track; the RISC-V and ARM ports are Stage V. \\
 Boot loader & GRUB via Multiboot~1; \texttt{qemu -kernel} for quick runs & Writing a boot loader is a detour. You write one 512-byte boot sector in Phase 1 to learn how booting works, then let GRUB do the job. \\
 Languages & C (gnu11) plus NASM (Intel syntax) & Assembly only where C cannot work: the entry point, descriptor table loads, interrupt stubs, context switch and entering user mode. That is under 5\,\% of the code. \\
 Toolchain & \texttt{i686-elf} cross GCC and binutils, GNU Make, Git & A cross compiler never assumes a Linux target, which prevents a family of confusing bugs (Phase 0). \\
@@ -159,10 +183,16 @@ Emulator, debugger & QEMU and GDB (remote stub); Bochs is optional & QEMU is fas
 Kernel structure & Monolithic, modular source tree & Simplest to get right for a first kernel. MINIX's microkernel is studied as a contrast, with an optional experiment in Phase 15. \\
 On-disk file system & MINIX V3 layout with 1\,KiB blocks, named TurkFS & The format described in \OSDI\,\S5.6, with source. Linux's \texttt{mkfs.minix -3} and \texttt{fsck.minix} create and check your images, and Linux can even mount them. \\
 Testing & In-kernel \texttt{ktest} suites, headless QEMU, \texttt{isa-debug-exit} & \texttt{make test} boots, runs every test and exits with a pass or fail code, so regressions show up at once (Phase 7). \\
-\bottomrule
-\end{tabularx}
-\caption{Technical decisions for Turk-OS.}
-\end{table}
+Port targets & RV32 (\texttt{rv32imac}) with Sv32 paging on QEMU \texttt{virt}, then optionally your own Timur-RV32IMC core; AArch64 (ARMv8-A) at EL1 with 39-bit virtual addresses on QEMU \texttt{virt}, then optionally a Raspberry Pi 4 &
+  Sv32 is two-level 4\,KiB paging like x86, so the RISC-V kernel can stay at \texttt{0xC0000000}. AArch64 then changes the instruction set and the word size together: 4\,KiB pages, three-level tables, the kernel in the \texttt{TTBR1} high half (Phases 17, 18). \\
+Port firmware and discovery & OpenSBI in M-mode (the kernel runs in S-mode); QEMU or the Pi firmware on ARM; a flattened devicetree instead of Multiboot &
+  The firmware hands over a devicetree that says where RAM and devices are. \texttt{lib/fdt.c} reads it into \texttt{struct bootinfo}, so generic code never knows which firmware booted it (Phase 16). \\
+System calls on the ports & The same Linux i386 numbers everywhere; \texttt{ecall} with the number in \texttt{a7}, \texttt{svc \#0} with it in \texttt{x8} &
+  One table and one libc for three architectures; only the trap instruction and the registers change. Linux itself uses a different, generic table on RISC-V and arm64 (\texttt{write} is 64 and there is no \texttt{fork}), so don't copy numbers from its headers. \\
+Port toolchain & \texttt{riscv32-elf} and \texttt{aarch64-elf} cross GCC and binutils; GNU \texttt{as} for port assembly & Built exactly like \texttt{i686-elf} in Phase 0, with the same versions (Task 16.1). NASM only knows x86, so it stays for the i386 code; port assembly lives in preprocessed \texttt{.S} files. \\
+Port devices & 16550 or PL011 console, PLIC or GICv2, SBI or Arm generic timer, virtio-blk disk, \texttt{sifive\_test} or semihosting for \texttt{make test} &
+  The \texttt{virt} boards have no PS/2 keyboard, VGA text screen or IDE disk by default. One virtio-blk driver serves both ports. All three targets are little-endian and TurkFS uses fixed-width fields, so the same disk image works everywhere. \\
+\end{xltabular}}
 
 \begin{decisionbox}{Why monolithic, when one of your books is about a microkernel?}
 In a monolithic kernel, drivers, the file system and the scheduler all run in ring 0 and call each other as plain C
@@ -173,9 +203,21 @@ the path from idea to running code short. You will still read the MINIX code in 
 two designs differ is one of the best ways to understand both.
 \end{decisionbox}
 
+\begin{decisionbox}{Why port after 1.0, and why RISC-V before ARM?}
+The practical books, \LOB and \OSDI with MINIX, are both x86, and one architecture learned deeply comes first.
+Porting afterwards is not wasted effort: every place where x86 leaked into generic code shows up the moment you try
+to compile it for another machine, and fixing those leaks is the best way to learn what is really generic. RISC-V
+comes first because RV32 keeps the 32-bit word size, Sv32 paging has the same two-level, 4\,KiB shape as x86, so
+the kernel can stay at \texttt{0xC0000000}, and the privileged architecture is small enough to read in full. It
+also leads to your own processor core, Timur-RV32IMC. AArch64 then changes the instruction set and the word size
+(LP64) at the same time and brings a richer exception and memory model. That is harder, which is why it comes
+second, and it prepares you for the 64-bit x86 track of Phase 15.
+\end{decisionbox}
+
 \section{The phase map}
 
-The sixteen phases fall into four stages. Arrows show the build order. Each phase depends on everything before it.
+The nineteen phases fall into five stages. Arrows show the build order. Each phase depends on everything before it.
+The first four stages lead to Turk-OS 1.0; the fifth ports it and leads to Turk-OS 2.0.
 
 \begin{figure}[H]
 \centering
@@ -186,6 +228,9 @@ The sixteen phases fall into four stages. Arrows show the build order. Each phas
   s2/.style={ph, draw=tkAmber!90!black, fill=tkAmber!9},
   s3/.style={ph, draw=tkBlue!80!black, fill=tkBlue!7},
   s4/.style={ph, draw=tkGreen!80!black, fill=tkGreen!8},
+  s5/.style={ph, draw=tkViolet!80!black, fill=tkViolet!8},
+  rel/.style={draw=tkViolet!80!black, dashed, rounded corners=3pt, line width=0.7pt, minimum width=2.2cm,
+    minimum height=1.3cm, align=center, font=\sffamily\scriptsize, text=tkViolet!80!black, inner sep=3pt},
   flow/.style={-{Stealth[length=2mm]}, line width=0.8pt, draw=tkNavy!70},
 ]
 \node[s1] (p0) at (0,0)      {\textbf{P0\enspace Foundations}\\toolchain, C for kernels};
@@ -204,8 +249,13 @@ The sixteen phases fall into four stages. Arrows show the build order. Each phas
 \node[s4] (p13) at (8.2,-6)  {\textbf{P13\enspace File systems}\\VFS, initrd, TurkFS};
 \node[s4] (p14) at (4.1,-6)  {\textbf{P14\enspace Userland}\\libc, shell, pipes};
 \node[s4] (p15) at (0,-6)    {\textbf{P15\enspace Turk-OS 1.0}\\hardening, release};
-\foreach \a/\b in {p0/p1,p1/p2,p2/p3,p3/p4,p4/p5,p5/p6,p6/p7,p7/p8,p8/p9,p9/p10,p10/p11,p11/p12,p12/p13,p13/p14,p14/p15}
+\node[s5] (p16) at (0,-8)    {\textbf{P16\enspace Portability}\\arch layer, devicetree};
+\node[s5] (p17) at (4.1,-8)  {\textbf{P17\enspace RISC-V port}\\Sv32, SBI, virtio};
+\node[s5] (p18) at (8.2,-8)  {\textbf{P18\enspace ARM port}\\AArch64, GIC, MMU};
+\node[rel] (v2) at (11.85,-8) {\textbf{v2.0}\\three architectures};
+\foreach \a/\b in {p0/p1,p1/p2,p2/p3,p3/p4,p4/p5,p5/p6,p6/p7,p7/p8,p8/p9,p9/p10,p10/p11,p11/p12,p12/p13,p13/p14,p14/p15,p15/p16,p16/p17,p17/p18}
   \draw[flow] (\a) -- (\b);
+\draw[flow, draw=tkViolet!80!black, dashed] (p18) -- (v2);
 \end{tikzpicture}
 
 \vspace{0.6em}
@@ -214,9 +264,10 @@ The sixteen phases fall into four stages. Arrows show the build order. Each phas
 \tikz\fill[tkRed!60] (0,0) rectangle (0.25,0.25); Stage I: Bare metal (0--28\,\%) &
 \tikz\fill[tkAmber!70] (0,0) rectangle (0.25,0.25); Stage II: Memory (28--48\,\%) \\[2pt]
 \tikz\fill[tkBlue!60] (0,0) rectangle (0.25,0.25); Stage III: Processes and protection (48--77\,\%) &
-\tikz\fill[tkGreen!60] (0,0) rectangle (0.25,0.25); Stage IV: Persistence and userland (77--100\,\%) \\
+\tikz\fill[tkGreen!60] (0,0) rectangle (0.25,0.25); Stage IV: Persistence and userland (77--100\,\%) \\[2pt]
+\tikz\fill[tkViolet!60] (0,0) rectangle (0.25,0.25); Stage V: Ports (own scale toward 2.0) & \\
 \end{tabular}}
-\caption{The sixteen phases, grouped into four stages.}
+\caption{The nineteen phases, grouped into five stages. The percentages of Stages I--IV measure progress toward Turk-OS 1.0.}
 \end{figure}
 
 \textbf{Stage I, Bare metal (Phases 0--4).} You learn the tools, enough assembly to be dangerous, and how a PC boots.
@@ -235,6 +286,13 @@ copy-on-write, \texttt{exec}, \texttt{wait} and \texttt{exit}.
 \textbf{Stage IV, Persistence and userland (Phases 12--15).} A disk driver and buffer cache give you storage, a VFS
 and TurkFS give you files, and a C library, shell and utilities give you a usable system. The last phase hardens,
 measures and documents it, tags version 1.0, and lays out the optional tracks.
+
+\textbf{Stage V, Ports (Phases 16--18).} First you separate the architecture layer: everything x86 moves behind
+one interface, the generic code learns to compile for other machines, and the kernel learns to read a devicetree
+instead of Multiboot (16). Then you port Turk-OS to 32-bit RISC-V on QEMU's \texttt{virt} board, with OpenSBI as
+the firmware, and optionally onto your own Timur-RV32IMC core (17). Finally you port it to 64-bit ARM (AArch64) on
+QEMU's \texttt{virt} board, and optionally to a Raspberry Pi 4. The stage ends with Turk-OS 2.0: the same kernel,
+userland and TurkFS image on three architectures (18).
 
 \section{Phase summary}
 
@@ -267,22 +325,32 @@ measures and documents it, tags version 1.0, and lays out the optional tracks.
 13 & File systems & VFS, file descriptors, tar initrd, writable TurkFS & 3--4 & 83\,\%\,$\rightarrow$\,90\,\% \\
 14 & Userland & Turk-libc, pipes, tty line discipline, \texttt{tsh} shell, coreutils & 3 & 90\,\%\,$\rightarrow$\,96\,\% \\
 15 & Hardening and release & Fuzzing, permissions, benchmarks, docs, v1.0 ISO; optional tracks & 3--4+ & 96\,\%\,$\rightarrow$\,100\,\% \\
+\midrule
+16 & Portability: an architecture layer & x86 moved to \texttt{kernel/arch/i386}, \texttt{include/arch.h}, \texttt{struct bootinfo}, a host-tested devicetree parser, one Makefile for three \texttt{ARCH} values & 2--3 & V:\,0\,\%\,$\rightarrow$\,20\,\% \\
+17 & The RISC-V port & Turk-OS on \texttt{qemu-system-riscv32 -machine virt}: OpenSBI, Sv32, PLIC, virtio-blk, boot to \texttt{tsh}; optionally your Timur-RV32IMC core & 5--6+ & V:\,20\,\%\,$\rightarrow$\,60\,\% \\
+18 & The ARM port & Turk-OS on \texttt{qemu-system-aarch64 -machine virt}: EL1, GICv2, generic timer, MMU, LP64 userland; v2.0 on three architectures; optionally a Raspberry Pi 4 & 5--6+ & V:\,60\,\%\,$\rightarrow$\,100\,\% \\
 \end{longtable}
 \end{center}
 
+{\small Stage V percentages (marked V) are measured toward Turk-OS 2.0, on their own scale; the 1.0 scale of
+Phases 0--15 does not change. A + after the weeks means optional work on top of the estimate: the tracks of
+Phase 15 and the hardware milestones of Phases 17 and 18.\par}
+
 \section{Timeline}
 
-The bars in Figure~\ref{fig:timeline} place each phase on a calendar at 10--12 hours a week. Stage colors match the phase map. Expect
-Phases 6, 8 and 13 to run over; that is normal, and the rest of the schedule usually absorbs it.
+The bars in Figure~\ref{fig:timeline} place each phase on a calendar at 10--12 hours a week. Stage colors match the phase map.
+Turk-OS 1.0 is due around week 43 and Turk-OS 2.0 around week 58. Expect Phases 6, 8, 13 and 18 to run over; that is
+normal, and the rest of the schedule usually absorbs it. The optional hardware milestones of Phases 17 and 18 are not
+on the calendar.
 
 \begin{figure}[htbp]
 \centering
-\begin{tikzpicture}[x=0.265cm, y=0.37cm]
-  \foreach \w in {0,4,...,44} {
-    \draw[tkGray!25] (\w,0.7) -- (\w,-15.6);
+\begin{tikzpicture}[x=0.2cm, y=0.37cm]
+  \foreach \w in {0,4,...,60} {
+    \draw[tkGray!25] (\w,0.7) -- (\w,-18.6);
     \node[tknote, above] at (\w,0.7) {\w};
   }
-  \node[tknote, anchor=south west] at (45,0.7) {weeks};
+  \node[tknote, anchor=south west] at (61,0.7) {weeks};
   \foreach \n/\s/\e/\c [count=\i from 0] in {
       P0 Foundations/0/3/tkRed, P1 Assembly and boot/3/6/tkRed, P2 Getting to C/6/8/tkRed,
       P3 GDT and IDT/8/10/tkRed, P4 Hardware IRQs/10/12/tkRed,
@@ -290,20 +358,24 @@ Phases 6, 8 and 13 to run over; that is normal, and the rest of the schedule usu
       P8 Processes/19/22/tkBlue, P9 Synchronization/22/24/tkBlue, P10 User mode/24/27/tkBlue,
       P11 Process API/27/30/tkBlue,
       P12 Storage/30/32/tkGreen, P13 File systems/32/36/tkGreen, P14 Userland/36/39/tkGreen,
-      P15 Turk-OS 1.0/39/43/tkGreen} {
+      P15 Turk-OS 1.0/39/43/tkGreen,
+      P16 Portability/43/46/tkViolet, P17 RISC-V port/46/52/tkViolet, P18 ARM port/52/58/tkViolet} {
     \node[font=\sffamily\scriptsize, anchor=east] at (-0.4,-\i) {\n};
     \fill[\c!70, rounded corners=1pt] (\s,-\i-0.32) rectangle (\e,-\i+0.32);
   }
-  \draw[tkRed, line width=0.8pt, dashed] (43,0.7) -- (43,-15.6) node[below, font=\sffamily\scriptsize\bfseries, text=tkRed] {v1.0};
+  \draw[tkRed, line width=0.8pt, dashed] (43,0.7) -- (43,-18.6) node[below, font=\sffamily\scriptsize\bfseries, text=tkRed] {v1.0};
+  \draw[tkViolet, line width=0.8pt, dashed] (58,0.7) -- (58,-18.6) node[below, font=\sffamily\scriptsize\bfseries, text=tkViolet] {v2.0};
 \end{tikzpicture}
-\caption{Planned timeline at 10--12 hours per week. Treat it as a guide, not a deadline.}
+\caption{Planned timeline at 10--12 hours per week: about 43 weeks to Turk-OS 1.0 and 58 weeks to Turk-OS 2.0. Treat it as a guide, not a deadline.}
 \label{fig:timeline}
 \end{figure}
 
-\section{What Turk-OS 1.0 looks like}
+\section{What Turk-OS 1.0 and 2.0 look like}
 
-Figure~\ref{fig:arch} shows the finished system and the phase that builds each part. It is worth coming back to this
-picture whenever you lose track of where a piece fits.
+Figure~\ref{fig:arch} shows the finished 1.0 system and the phase that builds each part. It is worth coming back to
+this picture whenever you lose track of where a piece fits. Figure~\ref{fig:arch2} shows what Stage V changes: the
+generic kernel stays one body of code, and everything that depends on the processor or the board moves below
+\texttt{include/arch.h}, with one backend per architecture.
 
 \begin{figure}[htbp]
 \centering
@@ -338,29 +410,81 @@ picture whenever you lose track of where a piece fits.
 \label{fig:arch}
 \end{figure}
 
-The source tree grows into the layout below. You don't need to create it all on day one; each phase document says
-which folders it adds.
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  layer/.style={draw=tkNavy!60, rounded corners=2pt, font=\sffamily\scriptsize, align=center, inner sep=2pt,
+    line width=0.6pt, anchor=north west, execute at begin node={\hyphenpenalty=10000\exhyphenpenalty=10000\relax}},
+  wide/.style={layer, minimum width=13cm, text width=12.8cm, minimum height=0.9cm},
+  col/.style={layer, minimum width=4.2cm, text width=4.0cm, minimum height=1.6cm},
+]
+\node[wide, fill=tkGreen!10] at (0,0)
+  {\textbf{User space}, rebuilt for each architecture: init, \texttt{tsh}, coreutils, Turk-libc\\\texttt{crt0} and system-call stubs in \texttt{user/arch/<arch>/}\quad{\color{tkRed}\bfseries P17, P18}};
+\node[wide, fill=tkBlue!7] at (0,-1.05)
+  {\textbf{Generic kernel}, one source for all three architectures\\system calls, processes and scheduler, memory, VFS, TurkFS, buffer cache, tty, \texttt{ktest}\quad{\color{tkRed}\bfseries P16}};
+\node[wide, fill=tkAmber!10] at (0,-2.1)
+  {\textbf{Drivers}: the 16550 core with port-I/O or MMIO accessors, ATA (x86), PL011 (ARM)\\virtio-mmio and virtio-blk, shared by both ports; the devicetree parser \texttt{lib/fdt.c}\quad{\color{tkRed}\bfseries P16--P18}};
+\node[wide, fill=tkRed!8] at (0,-3.15)
+  {\textbf{Architecture interface}: \texttt{include/arch.h} and the \texttt{<arch/*.h>} headers\\\texttt{struct trapframe}, \texttt{struct bootinfo}, \texttt{arch\_switch}, \texttt{arch\_mmu\_*}, \texttt{arch\_irq\_*}\quad{\color{tkRed}\bfseries P16}};
+\node[col, fill=tkLight] at (0,-4.25)
+  {\textbf{\texttt{kernel/arch/i386}}\\Multiboot entry, GDT, IDT\\8259 PIC, PIT, two-level paging\\\texttt{int 0x80}\quad{\color{tkRed}\bfseries P1--P10, P16}};
+\node[col, fill=tkViolet!8, draw=tkViolet!70] at (4.4,-4.25)
+  {\textbf{\texttt{kernel/arch/riscv32}}\\entry from OpenSBI, \texttt{stvec} traps\\PLIC, SBI timer, Sv32 paging\\\texttt{ecall}\quad{\color{tkRed}\bfseries P17}};
+\node[col, fill=tkViolet!8, draw=tkViolet!70] at (8.8,-4.25)
+  {\textbf{\texttt{kernel/arch/aarch64}}\\EL1 entry, \texttt{VBAR\_EL1} vectors\\GICv2, generic timer, MMU\\\texttt{svc \#0}\quad{\color{tkRed}\bfseries P18}};
+\node[col, fill=tkGray!12] at (0,-6.0)
+  {PC in \texttt{qemu-system-i386}\\8259 PIC, 8254 PIT, IDE disk\\16550 UART by port I/O\\{\color{tkGray}(or a real PC)}};
+\node[col, fill=tkGray!12] at (4.4,-6.0)
+  {QEMU riscv32 \texttt{virt}\\PLIC, virtio-mmio\\16550 UART at \texttt{0x10000000}\\{\color{tkGray}(optionally your Timur-RV32IMC)}};
+\node[col, fill=tkGray!12] at (8.8,-6.0)
+  {QEMU aarch64 \texttt{virt}, Cortex-A72\\GICv2, virtio-mmio\\PL011 UART\\{\color{tkGray}(optionally a Raspberry Pi 4)}};
+\draw[decorate, decoration={brace, amplitude=5pt, mirror}, tkGray, line width=0.7pt] (-0.15,0) -- (-0.15,-0.9)
+  node[midway, left=6pt, font=\sffamily\scriptsize\bfseries, text=tkGray, align=right] {user\\space};
+\draw[decorate, decoration={brace, amplitude=5pt, mirror}, tkGray, line width=0.7pt] (-0.15,-1.05) -- (-0.15,-4.05)
+  node[midway, left=6pt, font=\sffamily\scriptsize\bfseries, text=tkGray, align=right] {generic\\kernel};
+\draw[decorate, decoration={brace, amplitude=5pt, mirror}, tkGray, line width=0.7pt] (-0.15,-4.25) -- (-0.15,-5.85)
+  node[midway, left=6pt, font=\sffamily\scriptsize\bfseries, text=tkGray, align=right] {one\\backend\\per arch};
+\draw[decorate, decoration={brace, amplitude=5pt, mirror}, tkGray, line width=0.7pt] (-0.15,-6.0) -- (-0.15,-7.6)
+  node[midway, left=6pt, font=\sffamily\scriptsize\bfseries, text=tkGray, align=right] {boards};
+\end{tikzpicture}
+\caption{Turk-OS 2.0 after Stage V: one generic kernel, one architecture interface, three backends and three boards.}
+\label{fig:arch2}
+\end{figure}
 
-\begin{lst}{plain}{Turk-OS/ (final layout)}
+The source tree grows into the layout below. You don't need to create it all on day one; each phase document says
+which folders it adds. The entries marked \texttt{(Stage V)} arrive in Phases 16--18.
+
+\begin{lst}{plain}{Turk-OS/ (layout at 1.0, plus the Stage V additions)}
 Turk-OS/
-|-- docs/                 this study plan (LaTeX), journal.md, architecture notes
+|-- docs/                  this study plan (LaTeX), journal.md, architecture notes
+|   `-- porting.md         the leak audit and architecture-interface notes        (Stage V)
 |-- boot/                  loader.s (Multiboot entry), grub.cfg
 |-- kernel/
 |   |-- arch/i386/         gdt.c idt.c isr.s irq.c pic.c pit.c tss.c paging.c switch.s
+|   |   `-- include/arch/  the x86 headers behind the architecture interface      (Stage V)
+|   |-- arch/riscv32/      boot.S entry.S trap.c sbi.c plic.c timer.c sv32.c      (Stage V)
+|   |                      switch.S user.S arch.mk kernel.ld include/arch/
+|   |-- arch/aarch64/      boot.S vectors.S trap.c gic.c timer.c mmu.c            (Stage V)
+|   |                      switch.S user.S arch.mk kernel.ld include/arch/
 |   |-- mm/                pmm.c vmm.c heap.c
 |   |-- proc/              task.c sched.c fork.c exec.c signal.c
 |   |-- sync/              spinlock.c mutex.c semaphore.c waitq.c
 |   |-- fs/                vfs.c file.c tarfs.c turkfs.c devfs.c pipe.c
 |   |-- drivers/           vga.c serial.c keyboard.c tty.c ata.c ramdisk.c blockdev.c bcache.c
+|   |                      + uart16550.c pl011.c virtio_mmio.c virtio_blk.c       (Stage V)
 |   |-- syscall/           syscall.c uaccess.c
 |   `-- kmain.c
 |-- lib/                   libk: string.c printf.c bitmap.c ringbuf.c list.h
+|                          + fdt.c, the devicetree parser                         (Stage V)
 |-- include/               kernel headers
+|                          + arch.h and bootinfo.h                                (Stage V)
 |-- user/
 |   |-- libc/              Turk-libc
+|   |-- arch/<arch>/       crt0 and system call stubs for each architecture       (Stage V)
 |   |-- init/ sh/ bin/     init, tsh, coreutils
 |   `-- user.ld
 |-- tests/                 ktest suites
+|   `-- data/              devicetree blobs dumped from QEMU, for the FDT tests   (Stage V)
 |-- tools/                 mkturkfs.c and helper scripts
 |-- link.ld
 `-- Makefile
@@ -392,6 +516,12 @@ Scope creep (GUI or networking too early) & Medium & Exit criteria are the defin
 Toolchain trouble (cross-GCC build, Flatpak sandbox) & Medium & Phase 0 checklist, a host terminal, documented fallback compiler flags. \\
 Outdated instructions in \LOB & High & The phase docs give current equivalents (\texttt{grub2-mkrescue}, QEMU); the OSDev Wiki has errata. \\
 Losing motivation & Medium & A visible milestone every 2--3 weeks. Record a short demo at each milestone and keep the journal. \\
+\midrule
+Stage V: x86 habits carried into the ports (a forgotten \texttt{sfence.vma}, missing TLB maintenance or barriers) & High & Check every step against the specification, single-step in GDB, and compare with xv6-riscv or Linux. \\
+Stage V: QEMU is more forgiving than real hardware (caches, alignment, uninitialised registers) & Medium & Keep real hardware optional and last: the QEMU milestone comes first and counts on its own. \\
+Stage V: toolchain trouble with new targets (multilib, \texttt{-march} strings with \texttt{\_zicsr}) & Medium & Section~9 of \texttt{docs/setup.md}, \emph{Toolchains for the ports}, and the Phase 16 checklist (Task 16.1). \\
+Stage V: your own core lacks a feature Turk-OS needs (S-mode, an MMU, a timer) & Medium & Task 17.13's requirements checklist. The QEMU milestone stands on its own without the core. \\
+Stage V: scope creep (SMP, graphics on the ports) & Medium & The Stage V exit criteria are the definition of done. \\
 \end{longtable}
 \end{center}
 
@@ -400,7 +530,7 @@ Losing motivation & Medium & A visible milestone every 2--3 weeks. Record a shor
   \item \textbf{Reproduce it reliably}, then make it smaller: comment code out until you find the shortest path to the bug.
   \item \textbf{Look, don't guess.} Use the serial log, \texttt{-d int}, the QEMU monitor (\texttt{info registers}, \texttt{info mem}), and GDB breakpoints.
   \item \textbf{Write the hypothesis down} in your journal before you change code. Change one thing at a time.
-  \item \textbf{Re-read the section} of the Intel manual or the book chapter for the exact hardware rule involved.
+  \item \textbf{Re-read the section} of the Intel manual (in Stage V, the RISC-V or Arm specification) or the book chapter for the exact hardware rule involved.
   \item \textbf{Compare with MINIX} (\OSDI source) or xv6: how does a working kernel do the same step?
   \item \textbf{After two sessions without progress}, ask for help (OSDev forum, a classmate, your advisor) and include your journal notes. Explaining the problem often solves it.
 \end{enumerate}
@@ -427,7 +557,11 @@ Print this page and tick each box when that phase's exit criteria are fully met.
   \item \textbf{P13}\enspace Files written by Turk-OS pass \texttt{fsck.minix} on the host; file descriptor semantics tested.
   \item \textbf{P14}\enspace Boots to the \texttt{tsh} prompt; pipes, redirection and Ctrl+C work; coreutils present.
   \item \textbf{P15}\enspace One hour of fuzzing without a panic; benchmarks and docs written; v1.0 tagged.
+  \item \textbf{P16}\enspace Generic code free of x86 (audit in \texttt{docs/porting.md}); \texttt{make ARCH=i386 test} passes; generic code compiles for riscv32 and aarch64 without warnings; FDT parser passes its host tests.
+  \item \textbf{P17}\enspace \texttt{qemu-system-riscv32 -machine virt} boots to the \texttt{tsh} prompt; \texttt{make ARCH=riscv32 test} passes; a TurkFS image written on RISC-V passes \texttt{fsck.minix}.
+  \item \textbf{P18}\enspace \texttt{qemu-system-aarch64 -machine virt} boots to the \texttt{tsh} prompt; \texttt{make ARCH=aarch64 test} passes; the same TurkFS image works on all three; v2.0 tagged.
 \end{checklist}
 
 \booklegend
+\portlegend
 \end{document}

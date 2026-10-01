@@ -24,11 +24,17 @@
 \definecolor{tkGreen}{HTML}{1E7B4F}
 \definecolor{tkAmber}{HTML}{B7791F}
 \definecolor{tkBlue}{HTML}{1F4E9C}
+\definecolor{tkViolet}{HTML}{5B3F8C}
 \definecolor{bkLOB}{HTML}{D35400}
 \definecolor{bkOSTEP}{HTML}{1E8449}
 \definecolor{bkOSC}{HTML}{1F5FAD}
 \definecolor{bkMOS}{HTML}{7D3C98}
 \definecolor{bkOSDI}{HTML}{117A65}
+% references used by the Stage V port documents (Phases 16-18)
+\definecolor{bkXV}{HTML}{A93226}
+\definecolor{bkRV}{HTML}{1A5276}
+\definecolor{bkARM}{HTML}{0E6655}
+\definecolor{bkSPEC}{HTML}{566573}
 
 % ---------------------------------------------------------------- packages
 \RequirePackage{graphicx}
@@ -102,6 +108,10 @@
 \newcommand{\OSC}{\tkchip{bkOSC}{OSC}\xspace}
 \newcommand{\MOS}{\tkchip{bkMOS}{MOS}\xspace}
 \newcommand{\OSDI}{\tkchip{bkOSDI}{OSDI}\xspace}
+\newcommand{\XVSIX}{\tkchip{bkXV}{XV6}\xspace}
+\newcommand{\RVSPEC}{\tkchip{bkRV}{RISCV}\xspace}
+\newcommand{\ARMDOC}{\tkchip{bkARM}{ARM}\xspace}
+\newcommand{\SPEC}{\tkchip{bkSPEC}{SPEC}\xspace}
 \newcommand{\must}{\tkchip{tkRed}{REQUIRED}\xspace}
 \newcommand{\should}{\tkchip{tkAmber}{RECOMMENDED}\xspace}
 \newcommand{\could}{\tkchip[tkGray]{tkGray!15}{OPTIONAL}\xspace}
@@ -126,14 +136,17 @@
   \noindent\tkprogress{#4}{#5}\par\vspace{0.2em}%
 }
 
-% \tkprogress{from}{to} -- overall progress bar, this phase highlighted in red
+% \tkprogress{from}{to} -- overall progress bar, this phase highlighted in red.
+% Stage V documents (Phases 16-18) measure toward Turk-OS 2.0 instead: put
+% \renewcommand{\progresslabel}{...} before \phaseheader.
+\newcommand{\progresslabel}{Overall progress toward Turk-OS 1.0 (this phase in red)}
 \newcommand{\tkprogress}[2]{%
   \begin{tikzpicture}
     \path[use as bounding box] (0cm,-0.45cm) rectangle (\linewidth,0.25cm);
     \fill[tkGray!18, rounded corners=1.5pt] (0cm,0cm) rectangle (\linewidth,0.22cm);
     \ifdim #1pt>0pt \fill[tkNavy!65, rounded corners=1.5pt] (0cm,0cm) rectangle ({#1/100*\linewidth},0.22cm);\fi
     \fill[tkRed] ({#1/100*\linewidth},0cm) rectangle ({#2/100*\linewidth},0.22cm);
-    \node[font=\sffamily\scriptsize, text=tkGray, anchor=north west, inner sep=0pt] at (0cm,-0.12cm) {Overall progress toward Turk-OS 1.0 (this phase in red)};
+    \node[font=\sffamily\scriptsize, text=tkGray, anchor=north west, inner sep=0pt] at (0cm,-0.12cm) {\progresslabel};
     \node[font=\sffamily\scriptsize\bfseries, text=tkRed, anchor=north east, inner sep=0pt] at (\linewidth,-0.12cm) {#1\,\% $\rightarrow$ #2\,\%};
   \end{tikzpicture}}
 
@@ -196,6 +209,49 @@
   morestring=[b]",
   morestring=[b]',
 }
+% GNU as, RISC-V (Phase 17): .S files, # or // line comments, /* */ blocks
+\lstdefinelanguage{rvgas}{
+  alsoletter={.,\%},
+  morekeywords={li,la,lui,auipc,addi,add,sub,and,andi,or,ori,xor,xori,not,neg,sll,slli,srl,srli,sra,srai,
+    slt,sltu,lw,sw,lh,lhu,sh,lb,lbu,sb,beq,bne,blt,bge,bltu,bgeu,beqz,bnez,bgtz,blez,j,jal,jalr,jr,ret,
+    call,tail,mv,nop,mul,div,divu,rem,remu,ecall,ebreak,sret,mret,wfi,csrr,csrw,csrs,csrc,csrrw,csrrs,
+    csrrc,csrwi,csrsi,csrci,sfence.vma,fence,fence.i,lr.w,sc.w,amoswap.w,amoadd.w,amoor.w,amoand.w,
+    amoswap.w.aq,amoswap.w.rl,amoswap.w.aqrl,rdtime,rdcycle,unimp},
+  morekeywords=[2]{zero,ra,sp,gp,tp,fp,t0,t1,t2,t3,t4,t5,t6,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,
+    a0,a1,a2,a3,a4,a5,a6,a7,sstatus,sie,sip,stvec,sepc,scause,stval,sscratch,satp,scounteren,
+    mstatus,mepc,mcause,mtval,mtvec,mie,mip,medeleg,mideleg,mhartid,time,cycle},
+  morekeywords=[3]{.section,.text,.data,.rodata,.bss,.global,.globl,.extern,.align,.balign,.p2align,
+    .word,.half,.byte,.dword,.space,.zero,.equ,.set,.macro,.endm,.rept,.endr,.irp,.endr,.option,.type,
+    .size,.asciz,.string,\%hi,\%lo,\%pcrel_hi,\%pcrel_lo,\#include,\#define},
+  sensitive=true,
+  morecomment=[l]{//},
+  morecomment=[s]{/*}{*/},
+  morestring=[b]",
+}
+% GNU as, AArch64 (Phase 18): .S files, // line comments, /* */ blocks
+\lstdefinelanguage{a64gas}{
+  alsoletter={.,\#,:},
+  morekeywords={mov,movz,movk,mvn,adr,adrp,add,adds,sub,subs,and,ands,orr,eor,bic,lsl,lsr,asr,ror,
+    mul,udiv,sdiv,ldr,ldrb,ldrh,ldrsw,str,strb,strh,ldp,stp,ldxr,stxr,ldaxr,stlxr,ldar,stlr,swp,swpal,
+    cas,casal,cbz,cbnz,tbz,tbnz,b,bl,br,blr,ret,b.eq,b.ne,b.lt,b.le,b.gt,b.ge,b.lo,b.hs,b.hi,b.ls,
+    cmp,cmn,tst,csel,cset,ubfx,bfi,msr,mrs,isb,dsb,dmb,eret,svc,hvc,smc,wfi,wfe,sev,sevl,tlbi,ic,dc,
+    at,nop,brk,hlt,clrex},
+  morekeywords=[2]{x0,x1,x2,x3,x4,x5,x6,x7,x8,x9,x10,x11,x12,x13,x14,x15,x16,x17,x18,x19,x20,x21,
+    x22,x23,x24,x25,x26,x27,x28,x29,x30,w0,w1,w2,w3,w4,w5,w6,w7,w8,w9,w10,w11,w12,w13,w14,w15,w16,
+    w17,w18,w19,w20,w21,w22,w23,w24,w25,w26,w27,w28,w29,w30,sp,xzr,wzr,lr,fp,
+    elr_el1,spsr_el1,esr_el1,far_el1,vbar_el1,sctlr_el1,tcr_el1,mair_el1,ttbr0_el1,ttbr1_el1,
+    sp_el0,sp_el1,tpidr_el1,cpacr_el1,currentel,daif,daifset,daifclr,spsel,mpidr_el1,
+    cntfrq_el0,cntvct_el0,cntpct_el0,cntv_ctl_el0,cntv_tval_el0,cntv_cval_el0,cntp_ctl_el0,
+    cntp_tval_el0,cntp_cval_el0,hcr_el2,spsr_el2,elr_el2,sctlr_el2,cnthctl_el2,cntvoff_el2,
+    vmalle1,vmalle1is,vae1,vae1is,ish,ishst,sy},
+  morekeywords=[3]{.section,.text,.data,.rodata,.bss,.global,.globl,.extern,.align,.balign,.p2align,
+    .word,.hword,.byte,.quad,.xword,.space,.zero,.equ,.set,.macro,.endm,.rept,.endr,.irp,.type,.size,
+    .asciz,.string,\#include,\#define,:lo12:},
+  sensitive=false,
+  morecomment=[l]{//},
+  morecomment=[s]{/*}{*/},
+  morestring=[b]",
+}
 \lstdefinestyle{tkcode}{
   basicstyle=\ttfamily\footnotesize,
   keywordstyle=\color{tkBlue}\bfseries,
@@ -210,7 +266,10 @@
   morekeywords={uint8_t,uint16_t,uint32_t,uint64_t,int8_t,int16_t,int32_t,int64_t,size_t,
     uintptr_t,bool,true,false,inline,__attribute__,__asm__,asm,NULL}}
 \lstdefinestyle{asm}{style=tkcode, language=nasm}
-\lstdefinestyle{sh}{style=tkcode, language=bash, morekeywords={sudo,dnf,make,nasm,qemu-system-i386,gdb}}
+\lstdefinestyle{rvasm}{style=tkcode, language=rvgas}
+\lstdefinestyle{a64asm}{style=tkcode, language=a64gas}
+\lstdefinestyle{sh}{style=tkcode, language=bash, morekeywords={sudo,dnf,make,nasm,qemu-system-i386,
+  qemu-system-riscv32,qemu-system-aarch64,gdb,gdb-multiarch,dtc}}
 \lstdefinestyle{make}{style=tkcode, language=make}
 \lstdefinestyle{plain}{style=tkcode}
 
@@ -287,6 +346,20 @@
   Page numbers are the \emph{printed} page numbers of these editions, not PDF page indices. With another edition, or with the free
   \OSTEP chapters (each one starts at page~1), find the reading by its chapter and section numbers.
   MINIX source references like \texttt{kernel/proc.c (07400)} give the file and its starting line in \OSDI Appendix B.
+  \end{tcolorbox}}
+
+% \portlegend -- the references beyond the five books, for the Stage V documents (Phases 16-18).
+% Use it after \booklegend.
+\newcommand{\portlegend}{%
+  \begin{tcolorbox}[tkbase, unbreakable, colback=white, colframe=tkGray!60, title={\faMicrochip\enspace Port references used in Stage V}]
+  \footnotesize\renewcommand{\arraystretch}{1.25}%
+  \begin{tabularx}{\linewidth}{@{}l X@{}}
+  \XVSIX & Russ Cox, Frans Kaashoek, Robert Morris. \emph{xv6: a simple, Unix-like teaching operating system}, RISC-V edition. The companion book to MIT's xv6-riscv kernel. Free at \url{https://pdos.csail.mit.edu/6.1810/}; source at \url{https://github.com/mit-pdos/xv6-riscv}. \\
+  \RVSPEC & \emph{The RISC-V Instruction Set Manual}, Volume I (Unprivileged ISA) and Volume II (Privileged Architecture); \emph{RISC-V Supervisor Binary Interface Specification}. Free at \url{https://riscv.org/specifications/ratified/} and \url{https://github.com/riscv-non-isa/riscv-sbi-doc}. \\
+  \ARMDOC & \emph{Arm Architecture Reference Manual for A-profile architecture} (DDI~0487), and Arm's \emph{Learn the architecture} guides: AArch64 exception model, AArch64 memory management, Generic Timer, GIC. Free at \url{https://developer.arm.com/documentation}. \\
+  \SPEC & \emph{Devicetree Specification} (\url{https://www.devicetree.org/specifications/}); \emph{Virtual I/O Device (VIRTIO)}, OASIS (\url{https://docs.oasis-open.org/virtio/virtio/}); the QEMU documentation for the RISC-V and Arm \code{virt} boards (\url{https://www.qemu.org/docs/master/system/}). \\
+  \end{tabularx}\par\smallskip
+  All four are free. Specifications are revised often, so the reading plans cite them by chapter and section title rather than by page.
   \end{tcolorbox}}
 
 % \nextphase{number}{title}
